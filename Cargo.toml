@@ -10,6 +10,7 @@ crossbeam-channel = "0.5"
 glam = "0.27"
 opencraft-core = { path = "crates/opencraft-core" }
 opencraft-gfx = { path = "crates/opencraft-gfx" }
+opencraft-physics = { path = "crates/opencraft-physics" }
 rayon = "1.10"
 rustc-hash = "1.1"
 wgpu = "0.19"

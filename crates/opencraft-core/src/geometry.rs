@@ -1,11 +1,14 @@
-//! Axis-aligned boxes and slab-method ray intersection.
+//! Axis-aligned boxes, the box-vs-solid predicate and slab-method ray
+//! intersection.
 //!
 //! Neutral geometry only: `Aabb` stores explicit `min`/`max` corners and its
-//! constructors take dimensions from the caller, so player-sized constants
-//! stay in the game crate. The game's `crate::player::physics::Aabb` and
+//! constructors take dimensions from the caller, so body-sized constants stay
+//! in the game crate. The game's `crate::player::physics::Aabb` and
 //! `crate::player::melee::ray_aabb` paths re-export these symbols unchanged.
 
 use glam::Vec3;
+
+use crate::block::BlockQuery;
 
 /// Axis-aligned bounding box in world coordinates.
 #[derive(Copy, Clone, Debug)]
@@ -42,6 +45,43 @@ impl Aabb {
             && self.max.z > bz as f32 + eps
             && self.min.z < (bz + 1) as f32 - eps
     }
+}
+
+/// Whether the axis-aligned box `[aabb.min, aabb.max]` overlaps any solid
+/// cell in `world`.
+///
+/// This is the single epsilon/flooring predicate shared by every moving body:
+/// expand the box by a tiny epsilon inward on `min`, shrink it inward on
+/// `max`, floor both, and walk the inclusive block range (y, then z, then x).
+/// A cell that is not solid (empty or liquid) never counts.
+///
+/// The epsilon (`1e-4`) means a box whose face sits exactly on a cell boundary
+/// does not overlap the neighbouring cell, while a box pushed `1e-3` into it
+/// does. Non-finite corners and inverted boxes (any `min > max` axis) are
+/// rejected before the loop.
+pub fn solid_overlaps(aabb: Aabb, world: &impl BlockQuery) -> bool {
+    if !aabb.min.is_finite() || !aabb.max.is_finite() {
+        return false;
+    }
+
+    let eps = 1e-4;
+    let min_x = (aabb.min.x + eps).floor() as i32;
+    let max_x = (aabb.max.x - eps).floor() as i32;
+    let min_y = (aabb.min.y + eps).floor() as i32;
+    let max_y = (aabb.max.y - eps).floor() as i32;
+    let min_z = (aabb.min.z + eps).floor() as i32;
+    let max_z = (aabb.max.z - eps).floor() as i32;
+
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                if world.block_kind(x, y, z).is_solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Axis-parallel epsilon below which a ray component is treated as parallel to
@@ -102,6 +142,83 @@ pub fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::BlockKind;
+
+    fn solid_at_origin(x: i32, y: i32, z: i32) -> BlockKind {
+        if x == 0 && y == 0 && z == 0 {
+            BlockKind::Solid
+        } else {
+            BlockKind::Empty
+        }
+    }
+
+    #[test]
+    fn a_box_resting_exactly_on_a_solid_top_face_does_not_overlap() {
+        // Cell (0,0,0) spans y in [0, 1]; feet exactly at y = 1.0.
+        let min = Vec3::new(0.2, 1.0, 0.2);
+        let max = Vec3::new(0.8, 2.8, 0.8);
+        assert!(!solid_overlaps(Aabb::new(min, max), &solid_at_origin));
+    }
+
+    #[test]
+    fn a_box_one_thousandth_inside_does_overlap() {
+        let min = Vec3::new(0.2, 0.999, 0.2);
+        let max = Vec3::new(0.8, 2.8, 0.8);
+        assert!(solid_overlaps(Aabb::new(min, max), &solid_at_origin));
+    }
+
+    #[test]
+    fn an_empty_region_returns_false() {
+        let min = Vec3::new(5.0, 5.0, 5.0);
+        let max = Vec3::new(5.6, 6.8, 5.6);
+        assert!(!solid_overlaps(Aabb::new(min, max), &solid_at_origin));
+    }
+
+    #[test]
+    fn non_solid_blocks_never_collide() {
+        for kind in [BlockKind::Empty, BlockKind::Liquid] {
+            let world = |x: i32, y: i32, z: i32| {
+                if x == 0 && y == 0 && z == 0 {
+                    kind
+                } else {
+                    BlockKind::Empty
+                }
+            };
+            let min = Vec3::new(-0.2, -0.2, -0.2);
+            let max = Vec3::new(0.2, 0.2, 0.2);
+            assert!(
+                !solid_overlaps(Aabb::new(min, max), &world),
+                "{kind:?} is passable"
+            );
+        }
+    }
+
+    #[test]
+    fn a_box_spanning_several_cells_catches_any_solid_cell() {
+        // Solid at the far +X/+Y/+Z corner of the swept range only.
+        let world = |x: i32, y: i32, z: i32| {
+            if x == 2 && y == 2 && z == 2 {
+                BlockKind::Solid
+            } else {
+                BlockKind::Empty
+            }
+        };
+        let min = Vec3::new(0.5, 0.5, 0.5);
+        let max = Vec3::new(2.5, 2.5, 2.5);
+        assert!(solid_overlaps(Aabb::new(min, max), &world));
+    }
+
+    #[test]
+    fn non_finite_and_inverted_boxes_do_not_overlap() {
+        let nan_min = Vec3::new(f32::NAN, 0.0, 0.0);
+        assert!(!solid_overlaps(
+            Aabb::new(nan_min, Vec3::new(1.0, 1.0, 1.0)),
+            &solid_at_origin
+        ));
+
+        let inverted = Aabb::new(Vec3::new(2.0, 2.0, 2.0), Vec3::new(1.0, 1.0, 1.0));
+        assert!(!solid_overlaps(inverted, &solid_at_origin));
+    }
 
     #[test]
     fn from_feet_builds_the_requested_dimensions() {

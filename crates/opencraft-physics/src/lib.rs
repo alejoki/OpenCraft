@@ -1,7 +1,7 @@
-//! Voxel collision and movement resolution for OpenCraft.
+//! Neutral physics primitives for OpenCraft.
 //!
-//! Swept AABB tests against the neutral `BlockQuery` contract live here; the
-//! crate builds on `opencraft-core` and never depends on the `opencraft` game
-//! crate.
+//! Box-vs-solid collision and swept AABB tests against the neutral
+//! `BlockQuery` contract live here; the crate builds on `opencraft-core` and
+//! never depends on the `opencraft` game crate.
 
-pub use opencraft_core as core;
+pub use opencraft_core::geometry::solid_overlaps;

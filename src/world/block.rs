@@ -1,4 +1,4 @@
-use opencraft_core::block::BlockKind;
+use opencraft_core::block::{BlockKind, BlockQuery};
 
 /// Stable block identity for built-in terrain plus registry-local modded
 /// content.
@@ -479,9 +479,34 @@ impl BlockId {
     }
 }
 
+/// Adapter from the game's block-identity lookup to the neutral
+/// [`BlockQuery`] contract consumed by the engine crates.
+pub struct BlockIdQuery<F>(pub F);
+
+impl<F: Fn(i32, i32, i32) -> BlockId> BlockQuery for BlockIdQuery<F> {
+    #[inline]
+    fn block_kind(&self, x: i32, y: i32, z: i32) -> BlockKind {
+        self.0(x, y, z).kind()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_id_query_adapter_maps_identity_to_kind() {
+        let world = |x: i32, y: i32, z: i32| match (x, y, z) {
+            (0, 0, 0) => BlockId::Air,
+            (1, 0, 0) => BlockId::Water,
+            (2, 0, 0) => BlockId::Stone,
+            _ => BlockId::Air,
+        };
+        let query = BlockIdQuery(world);
+        assert_eq!(query.block_kind(0, 0, 0), BlockKind::Empty);
+        assert_eq!(query.block_kind(1, 0, 0), BlockKind::Liquid);
+        assert_eq!(query.block_kind(2, 0, 0), BlockKind::Solid);
+    }
 
     /// One row of the frozen built-in contract: raw id, display name, six face
     /// texture layers, hardness, and mined drop.
