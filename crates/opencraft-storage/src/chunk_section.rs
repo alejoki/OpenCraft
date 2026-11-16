@@ -135,10 +135,7 @@ impl ChunkSection {
 /// `edits` are `(local_index, content_index)` pairs in any order. Duplicate
 /// local indices, local indices at or above [`CHUNK_VOLUME`] and empty input
 /// are rejected, and `out` is left untouched when they are.
-pub fn encode_chunk_section(
-    out: &mut Vec<u8>,
-    edits: &[(u16, u16)],
-) -> Result<(), StorageError> {
+pub fn encode_chunk_section(out: &mut Vec<u8>, edits: &[(u16, u16)]) -> Result<(), StorageError> {
     if edits.is_empty() {
         return Err(StorageError::InvalidEditCount(0));
     }
@@ -290,10 +287,7 @@ mod tests {
         assert_eq!(sorted, interleaved);
         let section = ChunkSection::decode(&reversed).expect("decode");
         assert_eq!(section.palette(), &[1_u16, 7, 9][..]);
-        assert_eq!(
-            section.edits(),
-            &[(2_u16, 2_u16), (4, 0), (5, 1)][..]
-        );
+        assert_eq!(section.edits(), &[(2_u16, 2_u16), (4, 0), (5, 1)][..]);
     }
 
     #[test]

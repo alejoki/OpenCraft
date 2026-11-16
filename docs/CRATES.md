@@ -24,7 +24,10 @@ The repository has two layers:
 | `crates/opencraft-gfx` | `opencraft-gfx` | `0.1.0` | GPU frame layer over a game-created surface: buffers, meshes, texture arrays, models, sky, weather and frame passes. |
 | `crates/opencraft-physics` | `opencraft-physics` | `0.1.0` | AABB collision, raycast/sweep and the movement solver over `BlockQuery`. |
 | `crates/opencraft-pathfinding` | `opencraft-pathfinding` | `0.1.0` | Steering primitives plus deterministic nav-grid A* over `BlockQuery`. |
-| `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the four engine crates; proves reuse without the game. |
+| `crates/opencraft-storage` | `opencraft-storage` | `0.1.0` | Neutral sectioned save archive, canonical chunk-section codec and bounded file I/O; depends on `opencraft-core` only. |
+| `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Skeleton; M018/S04-S05 will add pack/content. |
+| `crates/opencraft-worldgen` | `opencraft-worldgen` | `0.1.0` | Skeleton; M018/S06-S07 will add worldgen. |
+| `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the engine crates; proves reuse without the game. |
 
 Workspace rules:
 
@@ -47,13 +50,18 @@ opencraft (game)
 ├── opencraft-core
 ├── opencraft-gfx ───────> opencraft-core
 ├── opencraft-physics ───> opencraft-core
-└── opencraft-pathfinding ──> opencraft-core
+├── opencraft-pathfinding ──> opencraft-core
+└── opencraft-storage ───> opencraft-core
+
+opencraft-content    (skeleton: no crate dependencies yet)
+opencraft-worldgen   (skeleton: no crate dependencies yet)
 
 engine-reuse-proof
 ├── opencraft-core
 ├── opencraft-gfx
 ├── opencraft-physics
-└── opencraft-pathfinding
+├── opencraft-pathfinding
+└── opencraft-storage
 ```
 
 - `opencraft-core` depends on `glam` only. It has no GPU, windowing or game
@@ -65,7 +73,14 @@ engine-reuse-proof
   adapter, device, queue, surface configuration and depth attachment.
 - `opencraft-physics` and `opencraft-pathfinding` depend on `opencraft-core`
   plus `glam`. They query blocks only through `BlockQuery -> BlockKind`.
-- `engine-reuse-proof` depends only on the four engine crates plus `glam 0.27`.
+- `opencraft-storage` depends on `opencraft-core` only. It has no game, GPU or
+  windowing dependency and no `opencraft-content`, `opencraft-worldgen`, `toml`
+  or `png` edge.
+- `opencraft-content` and `opencraft-worldgen` are dependency-free skeletons for
+  now. `opencraft-content` must not depend on `opencraft-storage` or
+  `opencraft-worldgen`; `opencraft-worldgen` must not depend on
+  `opencraft-storage` (it may depend on `opencraft-content` once S06 lands).
+- `engine-reuse-proof` depends only on the five engine crates plus `glam 0.27`.
   Its manifest has no direct GPU, windowing, serialization or temp-file
   dependency. Its `wgpu` edge is transitive through `opencraft-gfx` and is never
   called: the consumer is device-free.
@@ -126,7 +141,7 @@ cargo metadata --locked --no-deps --format-version 1
 cargo tree --locked -p <crate> --edges normal,build,dev
 ```
 
-- `scripts/check_engine_boundaries.sh` covers the four `opencraft-*` crates and
+- `scripts/check_engine_boundaries.sh` covers every `opencraft-*` crate and
   `engine-reuse-proof`. It checks manifests for `publish = false` and
   `version.workspace`, checks dependency trees for a game-package edge and for
   forbidden GPU/windowing dependencies, runs an unconditional synthetic-tree
@@ -160,15 +175,17 @@ are re-reported against their existing budgets. A capture-time figure moving is
 not automatically a failure, but a budget crossing is a regression until proven
 environmental.
 
-## M018 documented-only scope
+## M018 member and format scope
 
-Storage and chunk streaming, the pack/content registry, and
-worldgen/prefab/village extraction remain game-side after M017. M018 may
-consider moving them, but this document records intent and gate pressure only:
-it defines no traits, no signatures and no format changes for that work.
+The three M018 members now exist in the workspace. `opencraft-storage`'s
+neutral archive container, canonical chunk-section codec and bounded file I/O
+surface landed in S01. Save v10, content/pack extraction and
+worldgen/prefab/village extraction remain future M018 slices (S02-S07) with S08
+closure; none of that work is implemented yet.
 
-A future move needs a recorded decision and its own boundary/gate work. It must
-not change save, pack or worldgen formats by accident, and it must keep the
+The `.mcvx`, pack and worldgen formats stay frozen at their current versions.
+Those extractions need a recorded decision and their own boundary/gate work,
+must not change save, pack or worldgen formats by accident, and must keep the
 neutral-API rules above intact.
 
 ## Failure and recovery

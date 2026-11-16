@@ -264,6 +264,9 @@ The workspace also contains the engine crates and their external reuse proof und
 *   `opencraft-gfx`: The `wgpu` frame layer over a game-created surface: buffers, meshes, texture arrays, models, sky/weather and frame passes. Does not depend on `winit`.
 *   `opencraft-physics`: AABB collision, raycasting, and movement solvers over the `BlockQuery` trait.
 *   `opencraft-pathfinding`: Steering plus nav-grid A*. Not yet wired into mobs.
-*   `engine-reuse-proof`: An external, device-free consumer of the four engine crates. It runs headless, prints a deterministic 15-line report, has no `opencraft` dependency, and never creates a GPU adapter.
+*   `opencraft-storage`: The neutral sectioned save archive, canonical chunk-section codec, and bounded file I/O. Depends on `opencraft-core` only.
+*   `opencraft-content`: Skeleton for the pack/content registry; M018/S04-S05 will add the content layer.
+*   `opencraft-worldgen`: Skeleton for world generation; M018/S06-S07 will add worldgen.
+*   `engine-reuse-proof`: An external, device-free consumer of the engine crates. It runs headless, prints a deterministic 18-line report, has no `opencraft` dependency, and never creates a GPU adapter.
 
 See [the engine crate guide](docs/CRATES.md) for the workspace layout, neutral-API rules, gate commands and M018 scope.
