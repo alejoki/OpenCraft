@@ -12,5 +12,6 @@
 //! `BlockKind` cells, so the consumer never names a game block identity.
 
 pub mod gfx;
+pub mod motion;
 pub mod physics;
 pub mod world;
