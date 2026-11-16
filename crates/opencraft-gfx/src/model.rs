@@ -10,7 +10,7 @@
 use crate::context::{RenderContext, DEPTH_FORMAT};
 
 /// Bytes in one [`ModelVertex`]. Pinned so the WGSL layout cannot drift.
-pub const MODEL_VERTEX_SIZE: usize = 32;
+pub const MODEL_VERTEX_BYTES: usize = 32;
 
 /// The five vertex attributes of [`ModelVertex`], in shader-location order.
 /// Offsets are 0 / 12 / 20 / 24 / 28 and depend on the `#[repr(C)]` field
@@ -50,7 +50,7 @@ pub struct ModelVertex {
 /// The model vertex buffer layout (stride 32, one vertex per step).
 pub fn model_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: MODEL_VERTEX_SIZE as wgpu::BufferAddress,
+        array_stride: MODEL_VERTEX_BYTES as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Vertex,
         attributes: &MODEL_VERTEX_ATTRIBUTES,
     }
@@ -194,8 +194,8 @@ mod tests {
 
     #[test]
     fn model_vertex_is_32_bytes_with_the_pinned_attribute_offsets() {
-        assert_eq!(std::mem::size_of::<ModelVertex>(), MODEL_VERTEX_SIZE);
-        assert_eq!(MODEL_VERTEX_SIZE, 32);
+        assert_eq!(std::mem::size_of::<ModelVertex>(), MODEL_VERTEX_BYTES);
+        assert_eq!(MODEL_VERTEX_BYTES, 32);
 
         let expected = [
             (wgpu::VertexFormat::Float32x3, 0u64, 0u32),
@@ -218,7 +218,7 @@ mod tests {
     #[test]
     fn model_vertex_layout_is_one_32_byte_vertex_per_step() {
         let layout = model_vertex_layout();
-        assert_eq!(layout.array_stride, MODEL_VERTEX_SIZE as u64);
+        assert_eq!(layout.array_stride, MODEL_VERTEX_BYTES as u64);
         assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
         assert_eq!(layout.attributes.len(), 5);
         assert_eq!(layout.attributes, &MODEL_VERTEX_ATTRIBUTES);
