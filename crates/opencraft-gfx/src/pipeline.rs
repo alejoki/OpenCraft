@@ -2,21 +2,15 @@ use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3};
 use wgpu::util::DeviceExt;
 
+use crate::buffer::{ChunkRenderStore, QUAD_VERTICES};
+use crate::context::{RenderContext, DEPTH_FORMAT};
 use crate::mesh::quad::PackedQuad;
-use crate::player::camera::{visible_face_mask, Camera, Frustum};
-use crate::player::inventory::HOTBAR_SLOTS;
-use crate::render::buffer::{ChunkRenderStore, QUAD_VERTICES};
-use crate::render::context::{RenderContext, DEPTH_FORMAT};
-use crate::render::mob::{create_mob_pipeline, MobVertex};
-use crate::render::sky;
-use crate::render::texture::{
-    block_array_layers_match_shape, create_block_texture_array, upload_block_layer_at,
-    upload_block_layers,
-};
-use crate::render::weather;
-use crate::world::chunk::CHUNK_SIZE;
-use crate::world::daycycle;
-use crate::world::season::Weather;
+use crate::model::{create_model_pipeline, ModelVertex};
+use crate::sky::{self, SkyGeometry, SkyUniform};
+use crate::texture::TextureArraySpec;
+use crate::weather::{self, Precipitation};
+use opencraft_core::camera::{visible_face_mask, Camera, Frustum};
+use opencraft_core::chunk::CHUNK_SIZE;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -27,15 +21,14 @@ pub struct CameraUniform {
     pub fog_start_end: [f32; 4],
 }
 
-/// Per-frame sky inputs for the world pass, derived from
-/// [`crate::world::daycycle::sky_palette`].
+/// Per-frame sky inputs for the world pass, supplied by the host.
 ///
 /// Grouped into one type so `render_frame`'s long signature grows by a single
 /// parameter rather than four. The day factor rides in the otherwise unused
 /// `CameraUniform::fog_start_end.z` slot, so the 112-byte uniform layout and the
 /// WGSL struct stay untouched; the celestial inputs (sun/moon direction,
-/// brightness fades, star visibility and rotation) travel in the separate
-/// 48-byte [`sky::SkyUniform`] derived from `time_of_day`.
+/// brightness fades, star visibility and rotation) travel as the host-supplied
+/// 48-byte [`SkyUniform`] in [`SkyParams::celestial`].
 #[derive(Copy, Clone, Debug)]
 pub struct SkyParams {
     /// Multiplier applied to terrain light: 1.0 at noon down to the moonlit
@@ -45,33 +38,33 @@ pub struct SkyParams {
     pub fog_color: [f32; 4],
     /// Background clear color for the sky pass (and thus the horizon).
     pub clear_color: wgpu::Color,
-    /// Game time in day-cycle ticks (`0..DAY_TICKS`), the input the pure
-    /// [`daycycle`] helpers turn into sun/moon/star placement.
-    pub time_of_day: u32,
+    /// Precomputed 48-byte celestial state for this frame. The host's pure
+    /// day-cycle math fills it; `render_frame` only uploads it verbatim.
+    pub celestial: SkyUniform,
     /// True when the camera's eye is inside a liquid block. The world pass
     /// then swaps the palette fog for the fixed deep-water shift below. This
     /// is a plain flag so `SkyParams` stays `Copy` and `render_frame`'s
     /// signature does not grow.
     pub underwater: bool,
-    /// The day's weather, derived purely from the persisted calendar. It
-    /// selects the precipitation pattern in [`weather::WeatherUniform`] and
-    /// gates the precip *draw* (never a pass). `Clear` disables that draw and
-    /// is the identity everywhere else.
-    pub weather: Weather,
-    /// Rust-side multiplier applied to the fog start/end range
-    /// ([`daycycle::weather_fog_range_factor`]). Exactly `1.0` for Clear, so
-    /// the dry path stays byte-identical; precipitation pulls fog closer.
-    /// Submersion takes precedence and ignores this factor entirely.
+    /// The precipitation state the host resolved for this frame. It selects
+    /// the pattern in [`weather::WeatherUniform`] and gates the precip *draw*
+    /// (never a pass). `Clear` disables that draw and is the identity
+    /// everywhere else. It is a neutral crate enum so `SkyParams` carries no
+    /// game type.
+    pub weather: Precipitation,
+    /// Host-side multiplier applied to the fog start/end range. Exactly `1.0`
+    /// for Clear, so the dry path stays byte-identical; precipitation pulls fog
+    /// closer. Submersion takes precedence and ignores this factor entirely.
     pub fog_range_factor: f32,
-    /// Continuous day-cycle phase from [`daycycle::GameClock::cycle_phase`]
-    /// (game time, never wall clock) that drives the fall animation.
+    /// Host-supplied continuous day-cycle phase (game time, never wall clock)
+    /// that drives the fall animation.
     pub weather_phase: f32,
 }
 
 /// Deep-water fog color while the camera's eye is submerged. Uses the same
-/// sRGB-value convention as [`daycycle::SkyPalette::fog_color`] (plain 0..1
-/// channel values written straight into the camera uniform), just darker and
-/// bluer than any palette keyframe.
+/// sRGB-value convention as the host's palette fog (plain 0..1 channel values
+/// written straight into the camera uniform), just darker and bluer than any
+/// palette keyframe.
 pub const UNDERWATER_FOG_COLOR: [f32; 4] = [0.05, 0.18, 0.32, 1.0];
 /// Fog start distance (blocks) while submerged: visibility collapses fast.
 pub const UNDERWATER_FOG_START: f32 = 8.0;
@@ -100,7 +93,7 @@ pub fn effective_fog(
             UNDERWATER_FOG_END,
         )
     } else {
-        // Weather only compresses the range, so the factor is clamped to
+        // Precipitation only compresses the range, so the factor is clamped to
         // `0.0..=1.0`; a non-finite input falls back to the identity. A factor
         // of exactly `1.0` returns the caller's values bit-for-bit
         // (`x * 1.0 == x`), keeping Clear weather byte-identical.
@@ -123,17 +116,17 @@ pub fn effective_fog(
 ///
 /// `stage_present` is passed explicitly (rather than `&self`) so the decision
 /// stays pure and testable without a `wgpu::Device`.
-pub fn weather_draw_visible(weather: Weather, stage_present: bool) -> bool {
-    stage_present && !matches!(weather, Weather::Clear)
+pub fn weather_draw_visible(precipitation: Precipitation, stage_present: bool) -> bool {
+    stage_present && !matches!(precipitation, Precipitation::Clear)
 }
 
 /// GPU resources for the precipitation stage, built once at renderer
 /// construction.
 ///
-/// Weather owns a static fixed-seed vertex buffer (both the rain and snowfall
-/// segments), one 32-byte per-frame uniform, and an alpha-blended,
-/// depth-write-disabled pipeline. Holding the whole stage in one `Option`
-/// makes the fail-soft contract explicit: no stage means no draw.
+/// The precipitation stage owns a static fixed-seed vertex buffer (both the
+/// rain and snowfall segments), one 32-byte per-frame uniform, and an
+/// alpha-blended, depth-write-disabled pipeline. Holding the whole stage in
+/// one `Option` makes the fail-soft contract explicit: no stage means no draw.
 struct WeatherStage {
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
@@ -537,30 +530,6 @@ fn fs_main(in: OverlayOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
-/// Layout of hotbar slot `index` in normalised device coordinates.
-///
-/// Returns `(x0, y0, x1, y1)` with y pointing up in NDC. The bar is centered
-/// on x = 0 at the bottom of the screen. `index >= HOTBAR_SLOTS` returns a
-/// zero-sized rect at the bar's left edge instead of panicking, so defensive
-/// callers can use it without a bounds check.
-pub fn hotbar_slot_rect_ndc(index: usize, aspect: f32) -> (f32, f32, f32, f32) {
-    let aspect = aspect.max(0.5);
-    let slot_w = 0.09 / aspect;
-    let slot_h = 0.085;
-    let gap = 0.012 / aspect;
-    let total_w = HOTBAR_SLOTS as f32 * slot_w + (HOTBAR_SLOTS - 1) as f32 * gap;
-    let start_x = -total_w * 0.5;
-    let y0 = -0.92;
-    let y1 = y0 + slot_h;
-
-    if index >= HOTBAR_SLOTS {
-        return (start_x, y0, start_x, y0);
-    }
-
-    let x0 = start_x + index as f32 * (slot_w + gap);
-    (x0, y0, x0 + slot_w, y1)
-}
-
 /// Push the 12 edges (24 vertices) of an axis-aligned world-space box.
 ///
 /// Shared by the opaque-block target wireframe and the capture selection
@@ -633,6 +602,7 @@ pub fn build_overlay_line_vertices(
     aspect: f32,
     target_block: Option<IVec3>,
     selection_box: Option<(IVec3, IVec3)>,
+    hotbar_rects: &[[f32; 4]],
     selected_slot: usize,
     show_overlays: bool,
 ) -> Vec<OverlayVertex> {
@@ -690,11 +660,12 @@ pub fn build_overlay_line_vertices(
         color: white,
     });
 
-    // 3. 9-Slot Block Hotbar at bottom of screen. Geometry comes from the
-    // same helper the HUD count labels use, so outlines and labels cannot
-    // drift with aspect ratio or resolution.
-    for i in 0..HOTBAR_SLOTS {
-        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(i, aspect);
+    // 3. Hotbar outlines, in NDC, precomputed by the host from its own
+    // layout. An empty slice draws nothing; the host's own icon/label helper
+    // consumes the same rects, so outlines and labels cannot drift with aspect
+    // ratio or resolution.
+    for (i, rect) in hotbar_rects.iter().enumerate() {
+        let (x0, y0, x1, y1) = (rect[0], rect[1], rect[2], rect[3]);
         let is_sel = i == selected_slot;
         let color = if is_sel {
             [1.0, 0.92, 0.25, 1.0]
@@ -747,6 +718,9 @@ pub struct VoxelRenderer {
     /// Nearest-filtered sampler matching the block array; shared with the
     /// icon pipeline so icons read texels exactly like the world does.
     pub block_texture_sampler: wgpu::Sampler,
+    /// Host-supplied shape of the retained texture array. Every upload and
+    /// shape check goes through it so the content identity stays host-side.
+    block_array_spec: TextureArraySpec,
     pub voxel_pipeline: wgpu::RenderPipeline,
     /// Opaque, depth-writing pipeline for the batched box-model mob batch.
     /// Drawn inside the main pass strictly between the opaque chunk loop and
@@ -789,6 +763,9 @@ pub struct FrameView<'a> {
     pub selection_box: Option<(IVec3, IVec3)>,
     /// Selected hotbar slot, drawn as the selection outline.
     pub selected_slot: usize,
+    /// Hotbar slot outlines in NDC, precomputed by the host from its own
+    /// layout; may be empty.
+    pub hotbar_rects: &'a [[f32; 4]],
 }
 
 /// Presentation switches for one [`Renderer::render_frame`] invocation.
@@ -805,9 +782,23 @@ pub struct FramePresentation<'a> {
 }
 
 impl VoxelRenderer {
-    pub fn new(ctx: &RenderContext) -> Self {
-        let (block_texture, tex_view, sampler) =
-            create_block_texture_array(&ctx.device, &ctx.queue);
+    pub fn new(
+        ctx: &RenderContext,
+        block_array_spec: TextureArraySpec,
+        sky_geometry: SkyGeometry,
+    ) -> Self {
+        let block_texture = block_array_spec.create_texture(&ctx.device);
+        let tex_view = block_array_spec.create_view(&block_texture);
+        let sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("block_sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -878,12 +869,12 @@ impl VoxelRenderer {
             ],
         });
 
-        // Mob pipeline (M009/S01-T04, D136): one batched draw for every visible
-        // mob, built on the camera bind group alone. Constructed here because
+        // Model pipeline (M009/S01-T04, D136): one batched draw for every
+        // visible box-model instance, built on the camera bind group alone. Constructed here because
         // this is the only place the camera bind group layout is in hand; the
         // pipeline layout borrows it, so nothing else can be reordered above
         // it without re-creating the layout.
-        let mob_pipeline = create_mob_pipeline(ctx, &camera_bgl);
+        let mob_pipeline = create_model_pipeline(ctx, &camera_bgl);
 
         let chunk_bind_group_layout =
             ctx.device
@@ -901,16 +892,19 @@ impl VoxelRenderer {
                     }],
                 });
 
-        // Sky pass resources: the pipeline reused the camera bind group for
+        // Sky pass resources: the pipeline reuses the camera bind group for
         // group 0 and a small dedicated 48-byte uniform for group 1. The
-        // billboard geometry (sun, moon, fixed-seed star field) is static.
+        // billboard geometry (sun, moon, star field) is static and
+        // host-seeded.
         let sky_bind_group_layout = sky::create_sky_bind_group_layout(&ctx.device);
         let sky_uniform_buffer = sky::create_sky_uniform_buffer(&ctx.device);
         let sky_bind_group =
             sky::create_sky_bind_group(&ctx.device, &sky_bind_group_layout, &sky_uniform_buffer);
         let sky_pipeline = sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
-        let (sky_vertex_buffer, sky_vertex_count) =
-            sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
+        // The static vertex count is derived from the same expansion the
+        // buffer factory runs, so the draw can never drift from the ABI.
+        let sky_vertex_count = sky::build_sky_vertices(&sky_geometry).len() as u32;
+        let sky_vertex_buffer = sky::create_sky_vertex_buffer(&ctx.device, &sky_geometry);
 
         // Precipitation stage (M007/S06): static camera-relative rain and
         // snowfall billboards plus one 32-byte per-frame uniform. Built from
@@ -1099,6 +1093,7 @@ impl VoxelRenderer {
             block_texture,
             block_texture_view: tex_view,
             block_texture_sampler: sampler,
+            block_array_spec,
             voxel_pipeline,
             mob_pipeline,
             water_pipeline,
@@ -1120,10 +1115,11 @@ impl VoxelRenderer {
     /// the camera bind group (MEM111).
     pub fn write_block_layers(&self, queue: &wgpu::Queue, layers: &[Vec<u8>]) {
         debug_assert!(
-            block_array_layers_match_shape(layers),
-            "texture array must match BLOCK_ARRAY_LAYERS of 16x16 RGBA bytes"
+            self.block_array_spec.matches_shape(layers),
+            "texture array must match the host-supplied spec's layer count and layer size"
         );
-        upload_block_layers(&self.block_texture, queue, layers);
+        self.block_array_spec
+            .upload_layers(&self.block_texture, queue, layers);
     }
 
     /// Re-upload exactly one texture-array layer (base mip plus mip chain)
@@ -1133,7 +1129,8 @@ impl VoxelRenderer {
     /// block or mob texture touches only its own layer. Never recreates the
     /// texture, its view, or the camera bind group (MEM111).
     pub fn write_block_layer(&self, queue: &wgpu::Queue, layer: u32, rgba: &[u8]) {
-        upload_block_layer_at(&self.block_texture, queue, layer, rgba);
+        self.block_array_spec
+            .upload_layer(&self.block_texture, queue, layer, rgba);
     }
 
     /// Draw one frame: sky, world, overlays, then the optional UI pass.
@@ -1149,7 +1146,7 @@ impl VoxelRenderer {
         &self,
         ctx: &RenderContext,
         store: &ChunkRenderStore,
-        mob_vertices: &[MobVertex],
+        mob_vertices: &[ModelVertex],
         view: FrameView<'_>,
         presentation: FramePresentation<'_>,
     ) -> Result<usize, wgpu::SurfaceError> {
@@ -1159,6 +1156,7 @@ impl VoxelRenderer {
             target_block,
             selection_box,
             selected_slot,
+            hotbar_rects,
         } = view;
         let FramePresentation {
             show_overlays,
@@ -1194,15 +1192,14 @@ impl VoxelRenderer {
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
 
-        // Per-frame celestial state: three vec4s derived from the game clock by
-        // the pure day-cycle helpers (directions, brightness fades, star
-        // visibility and rotation). One 48-byte write per frame; all sky
+        // Per-frame celestial state: the host precomputed the three vec4s
+        // (directions, brightness fades, star visibility and rotation) with
+        // its pure day-cycle helpers. One 48-byte write per frame; all sky
         // geometry itself is static.
-        let sky_uniform = sky::SkyUniform::from_time(sky.time_of_day);
         ctx.queue.write_buffer(
             &self.sky_uniform_buffer,
             0,
-            bytemuck::bytes_of(&sky_uniform),
+            bytemuck::bytes_of(&sky.celestial),
         );
 
         let overlay_verts = build_overlay_line_vertices(
@@ -1210,6 +1207,7 @@ impl VoxelRenderer {
             aspect,
             target_block,
             selection_box,
+            hotbar_rects,
             selected_slot,
             show_overlays,
         );
@@ -1221,9 +1219,10 @@ impl VoxelRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             });
 
-        // Mob batch upload (D136): one buffer for the whole visible scene, or
-        // no buffer at all when nothing is visible. The overlay precedent: an
-        // empty scene allocates nothing and the draw below is skipped.
+        // Box-model batch upload (D136): one buffer for the whole visible
+        // scene, or no buffer at all when nothing is visible. The overlay
+        // precedent: an empty scene allocates nothing and the draw below is
+        // skipped.
         let mob_vertex_buffer = if mob_vertices.is_empty() {
             None
         } else {
@@ -1291,7 +1290,8 @@ impl VoxelRenderer {
             weather::weather_vertex_range(sky.weather).map(|range| (stage, range))
         });
         if let Some((stage, _)) = weather_draw {
-            let uniform = weather::WeatherUniform::from_weather(sky.weather, sky.weather_phase);
+            let uniform =
+                weather::WeatherUniform::from_precipitation(sky.weather, sky.weather_phase);
             ctx.queue
                 .write_buffer(&stage.uniform_buffer, 0, bytemuck::bytes_of(&uniform));
         }
@@ -1356,12 +1356,13 @@ impl VoxelRenderer {
                 }
             }
 
-            // Mob stage: strictly AFTER the opaque chunk loop (so terrain
-            // wrote depth and occludes mobs) and BEFORE the water draw (so the
-            // opaque mob depth write occludes water behind a mob, while water
-            // still draws over mobs in front of it). One pipeline, one bind
-            // group and ONE draw call for the whole batch; no per-mob state.
-            // The buffer is `None` for an empty scene, so nothing is recorded.
+            // Box-model stage: strictly AFTER the opaque chunk loop (so
+            // terrain wrote depth and occludes the models) and BEFORE the
+            // water draw (so the opaque model depth write occludes water
+            // behind a model, while water still draws over models in front of
+            // it). One pipeline, one bind group and ONE draw call for the
+            // whole batch; no per-instance state. The buffer is `None` for an
+            // empty scene, so nothing is recorded.
             if let Some(mob_vertex_buffer) = mob_vertex_buffer.as_ref() {
                 rpass.set_pipeline(&self.mob_pipeline);
                 rpass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -1417,12 +1418,12 @@ impl VoxelRenderer {
             // depth, so drops never occlude later draws. `weather_draw` is
             // `None` for Clear weather or an absent/empty stage — the draw is
             // skipped, not the pass.
-            if let Some((stage, (base_vertex, vertex_count))) = weather_draw {
+            if let Some((stage, range)) = weather_draw {
                 rpass.set_pipeline(&stage.pipeline);
                 rpass.set_bind_group(0, &self.camera_bind_group, &[]);
                 rpass.set_bind_group(1, &stage.bind_group, &[]);
                 rpass.set_vertex_buffer(0, stage.vertex_buffer.slice(..));
-                rpass.draw(base_vertex..base_vertex + vertex_count, 0..1);
+                rpass.draw(range, 0..1);
             }
 
             if !overlay_verts.is_empty() {
@@ -1464,6 +1465,26 @@ impl VoxelRenderer {
 mod tests {
     use super::*;
 
+    /// Host-side fog-range expectations for each precipitation state. The
+    /// production factor is computed by the game and passed into `SkyParams`;
+    /// these literals pin the values the renderer must reproduce.
+    fn expected_fog_range_factor(precipitation: Precipitation) -> f32 {
+        match precipitation {
+            Precipitation::Clear => 1.0,
+            Precipitation::Rain => 0.75,
+            Precipitation::Snowfall => 0.85,
+        }
+    }
+
+    /// Nine synthetic hotbar NDC rects so the overlay vertex-count pins hold
+    /// without the crate knowing the host's layout.
+    fn synthetic_hotbar_rects() -> [[f32; 4]; 9] {
+        std::array::from_fn(|i| {
+            let x0 = -0.4 + i as f32 * 0.09;
+            [x0, -0.92, x0 + 0.08, -0.835]
+        })
+    }
+
     #[test]
     fn camera_uniform_stays_seven_vec4s() {
         // WGSL uniform members must be 16-byte aligned, and the day factor
@@ -1472,6 +1493,11 @@ mod tests {
         // and fog_start_end (3 vec4s) = 7 vec4s = 112 bytes. Any new field
         // here would change the CPU/GPU layout contract.
         assert_eq!(std::mem::size_of::<CameraUniform>(), 112);
+        assert_eq!(
+            std::mem::size_of::<CameraUniform>(),
+            crate::model::MODEL_CAMERA_UNIFORM_BYTES,
+            "the crate and the camera uniform must agree on the 112-byte contract"
+        );
         assert_eq!(std::mem::size_of::<CameraUniform>() % 16, 0);
         assert_eq!(
             std::mem::size_of::<CameraUniform>(),
@@ -1499,6 +1525,7 @@ mod tests {
             1.77,
             Some(IVec3::new(1, 2, 3)),
             None,
+            &synthetic_hotbar_rects(),
             0,
             true,
         );
@@ -1513,6 +1540,7 @@ mod tests {
             1.77,
             Some(IVec3::new(1, 2, 3)),
             None,
+            &synthetic_hotbar_rects(),
             0,
             true,
         );
@@ -1521,6 +1549,7 @@ mod tests {
             1.77,
             Some(IVec3::new(1, 2, 3)),
             Some((IVec3::new(-2, 0, -2), IVec3::new(2, 4, 2))),
+            &synthetic_hotbar_rects(),
             0,
             true,
         );
@@ -1546,10 +1575,24 @@ mod tests {
     fn test_overlay_selection_box_normalizes_reversed_corners() {
         let a = IVec3::new(-2, 3, -7);
         let b = IVec3::new(4, 8, 1);
-        let forward =
-            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, None, Some((a, b)), 0, true);
-        let reversed =
-            build_overlay_line_vertices(&Mat4::IDENTITY, 1.77, None, Some((b, a)), 0, true);
+        let forward = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            None,
+            Some((a, b)),
+            &synthetic_hotbar_rects(),
+            0,
+            true,
+        );
+        let reversed = build_overlay_line_vertices(
+            &Mat4::IDENTITY,
+            1.77,
+            None,
+            Some((b, a)),
+            &synthetic_hotbar_rects(),
+            0,
+            true,
+        );
         assert_eq!(forward.len(), reversed.len());
         for (f, r) in forward.iter().zip(reversed.iter()) {
             assert_eq!(f.clip_pos, r.clip_pos);
@@ -1578,6 +1621,7 @@ mod tests {
             1.77,
             Some(IVec3::new(1, 2, 3)),
             Some((IVec3::ZERO, IVec3::new(2, 2, 2))),
+            &synthetic_hotbar_rects(),
             4,
             false,
         );
@@ -1585,11 +1629,16 @@ mod tests {
     }
 
     #[test]
-    fn sky_params_carries_time_of_day_into_the_sky_uniform() {
+    fn sky_params_carries_celestial_state_into_the_sky_uniform() {
         // The same grouped struct that carries the palette also carries the
-        // game time, so render_frame's 10-arg signature did not grow. The
-        // time is what the pure day-cycle helpers turn into sun/moon/star
-        // placement for the sky pass.
+        // host-precomputed celestial state, so render_frame's 10-arg signature
+        // did not grow and the sky pass only uploads bytes. Midnight: moon up,
+        // stars out, sun below the horizon.
+        let celestial = SkyUniform {
+            sun_dir: [0.0, -1.0, 0.0, 0.0],
+            moon_dir: [0.0, 1.0, 0.0, 0.0],
+            params: [0.0, 1.0, 1.0, std::f32::consts::FRAC_PI_2],
+        };
         let params = SkyParams {
             day_factor: 0.35,
             fog_color: [0.1, 0.12, 0.2, 1.0],
@@ -1599,25 +1648,52 @@ mod tests {
                 b: 0.2,
                 a: 1.0,
             },
-            time_of_day: 18_000,
+            celestial,
             underwater: false,
-            weather: Weather::Rain,
+            weather: Precipitation::Rain,
             fog_range_factor: 0.75,
             weather_phase: 12_000.0,
         };
-        assert_eq!(params.time_of_day, 18_000);
+        assert_eq!(params.celestial.sun_dir, [0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(params.celestial.moon_dir, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            params.celestial.params,
+            [0.0, 1.0, 1.0, std::f32::consts::FRAC_PI_2]
+        );
         assert_eq!(params.day_factor, 0.35);
         assert!(!params.underwater);
-        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.weather, Precipitation::Rain);
         assert_eq!(params.fog_range_factor, 0.75);
         assert_eq!(params.weather_phase, 12_000.0);
+        assert!(
+            params.celestial.sun_dir[1] < 0.0,
+            "sun is below the horizon"
+        );
+        assert!(
+            params.celestial.moon_dir[1] > 0.0,
+            "moon is above the horizon"
+        );
+        assert!(
+            params.celestial.params[1] > 0.0,
+            "moon brightness is non-zero"
+        );
+        assert!(
+            params.celestial.params[2] > 0.0,
+            "stars are visible at midnight"
+        );
 
-        // Midnight: moon up, stars out, sun below the horizon.
-        let uniform = sky::SkyUniform::from_time(params.time_of_day);
-        assert!(uniform.sun_dir[1] < 0.0, "sun is below the horizon");
-        assert!(uniform.moon_dir[1] > 0.0, "moon is above the horizon");
-        assert!(uniform.params[1] > 0.0, "moon brightness is non-zero");
-        assert!(uniform.params[2] > 0.0, "stars are visible at midnight");
+        // Source pin: render_frame uploads the host-supplied uniform verbatim
+        // and keeps the celestial math out of the renderer.
+        let src = include_str!("pipeline.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        assert!(
+            production.contains("bytemuck::bytes_of(&sky.celestial)"),
+            "render_frame must write the precomputed celestial uniform"
+        );
+        assert!(
+            !production.contains("from_time"),
+            "the renderer must not own the celestial math"
+        );
     }
 
     #[test]
@@ -1646,10 +1722,10 @@ mod tests {
             day_factor: 1.0,
             fog_color: palette_fog,
             clear_color: wgpu::Color::BLACK,
-            time_of_day: 6_000,
+            celestial: SkyUniform::default(),
             underwater: true,
-            weather: Weather::Clear,
-            fog_range_factor: daycycle::weather_fog_range_factor(Weather::Clear),
+            weather: Precipitation::Clear,
+            fog_range_factor: 1.0,
             weather_phase: 0.0,
         };
         assert!(params.underwater);
@@ -1657,9 +1733,9 @@ mod tests {
 
     #[test]
     fn clear_weather_fog_factor_is_the_identity() {
-        // Clear is pinned to exactly 1.0 in daycycle, and `x * 1.0 == x`, so
-        // the dry path must remain bit-identical.
-        assert_eq!(daycycle::weather_fog_range_factor(Weather::Clear), 1.0);
+        // Clear is pinned to exactly 1.0 in the game's calendar rules, and
+        // `x * 1.0 == x`, so the dry path must remain bit-identical.
+        assert_eq!(expected_fog_range_factor(Precipitation::Clear), 1.0);
         let palette_fog = [0.53, 0.76, 0.96, 1.0];
         let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, 1.0);
         assert_eq!(color, palette_fog);
@@ -1669,8 +1745,8 @@ mod tests {
     #[test]
     fn rain_and_snow_fog_factors_shrink_the_range() {
         let palette_fog = [0.53, 0.76, 0.96, 1.0];
-        for weather in [Weather::Rain, Weather::Snowfall] {
-            let factor = daycycle::weather_fog_range_factor(weather);
+        for weather in [Precipitation::Rain, Precipitation::Snowfall] {
+            let factor = expected_fog_range_factor(weather);
             let (color, start, end) = effective_fog(false, palette_fog, 300.0, 512.0, factor);
             assert_eq!(color, palette_fog, "weather never recolors fog here");
             assert_eq!(start, 300.0 * factor);
@@ -1682,8 +1758,8 @@ mod tests {
             assert!(start < end, "compressed range must stay ordered");
         }
         assert!(
-            daycycle::weather_fog_range_factor(Weather::Rain)
-                < daycycle::weather_fog_range_factor(Weather::Snowfall),
+            expected_fog_range_factor(Precipitation::Rain)
+                < expected_fog_range_factor(Precipitation::Snowfall),
             "rain is the more enclosing state"
         );
     }
@@ -1722,9 +1798,9 @@ mod tests {
     #[test]
     fn weather_draw_gating_table() {
         // Clear never draws; both precip states draw only with a stage.
-        assert!(!weather_draw_visible(Weather::Clear, false));
-        assert!(!weather_draw_visible(Weather::Clear, true));
-        for weather in [Weather::Rain, Weather::Snowfall] {
+        assert!(!weather_draw_visible(Precipitation::Clear, false));
+        assert!(!weather_draw_visible(Precipitation::Clear, true));
+        for weather in [Precipitation::Rain, Precipitation::Snowfall] {
             assert!(
                 weather_draw_visible(weather, true),
                 "{weather:?} with a stage must draw"
@@ -1736,7 +1812,7 @@ mod tests {
         }
         // The stage's static buffer is authoritative about which segment to
         // draw; Clear yields no range at all.
-        assert_eq!(weather::weather_vertex_range(Weather::Clear), None);
+        assert_eq!(weather::weather_vertex_range(Precipitation::Clear), None);
     }
 
     #[test]
@@ -1762,7 +1838,7 @@ mod tests {
         );
 
         let weather_block = &src[weather_at..overlay_at];
-        assert!(weather_block.contains("base_vertex..base_vertex + vertex_count"));
+        assert!(weather_block.contains("rpass.draw(range, 0..1)"));
         assert!(weather_block.contains("stage.bind_group"));
         assert!(weather_block.contains("stage.vertex_buffer"));
         assert!(
@@ -1770,8 +1846,7 @@ mod tests {
             "an empty static buffer must skip the draw, not record an empty one"
         );
         assert!(
-            src[..weather_at]
-                .contains("if let Some((stage, (base_vertex, vertex_count))) = weather_draw"),
+            src[..weather_at].contains("if let Some((stage, range)) = weather_draw"),
             "the precip draw must be guarded by the pure weather gating decision"
         );
 
@@ -1902,60 +1977,6 @@ mod tests {
     }
 
     #[test]
-    fn menu_sky_params_follow_the_background_scene_and_stay_dry() {
-        // Source pin: the menu arm must go through `vista_sky_params` with the
-        // background scene's own clock and anchor (D091), while the session arm
-        // passes the live clock plus the per-frame weather derivation. The menu
-        // helper pins weather Clear and the identity fog factor, so the
-        // panorama never draws precipitation.
-        let src = include_str!("../main.rs");
-        assert!(
-            src.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
-            "menu frames must follow the background scene clock and stay dry"
-        );
-        // Whitespace-insensitive copy for chained calls that rustfmt wraps.
-        let compact: String = src.split_whitespace().collect();
-        assert!(
-            src.contains("self.background.anchor"),
-            "the menu camera must anchor at the background scene's saved eye position"
-        );
-        assert!(
-            compact.contains(
-                "self.background.world.update_streaming(vista_chunk,self.background.season())"
-            ),
-            "menu streaming must use the background world and its saved-calendar season"
-        );
-        assert!(
-            src.contains("self.background.world.render_distance(),"),
-            "menu rendering must use the background world's render distance"
-        );
-        assert!(
-            !compact.contains("vista_sky_params(palette,daycycle::VISTA_GOLDEN_HOUR)")
-                && !compact.contains(
-                    "vista_sky_params(daycycle::sky_palette(daycycle::VISTA_GOLDEN_HOUR))"
-                )
-                && !compact.contains("update_streaming(vista_chunk,vista::VISTA_SEASON)"),
-            "VISTA_GOLDEN_HOUR / VISTA_SEASON are default-scene values, never render-time menu constants"
-        );
-        assert!(
-            src.contains("let weather = session_weather(&self.session);"),
-            "session frames must derive weather per frame from the calendar"
-        );
-        assert!(
-            src.contains("weather_ambient_hook(weather);"),
-            "the session arm must exercise the empty ambient-audio seam"
-        );
-        assert!(
-            src.contains("self.session.clock.cycle_phase(),"),
-            "the weather phase must follow the live game clock"
-        );
-        assert!(
-            src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),
-            "the session arm must derive the flag from the live eye position"
-        );
-    }
-
-    #[test]
     fn sky_pass_is_first_and_world_pass_loads_its_color() {
         // Static source pin on render_frame's pass order. The sky pass clears
         // the target and must run before the world pass; the world pass then
@@ -2068,99 +2089,6 @@ mod tests {
     }
 
     #[test]
-    fn mob_pipeline_is_opaque_and_camera_only() {
-        // Source pin on the mob pipeline factory in mob.rs: opaque REPLACE
-        // blending, depth writes with LessEqual, and a layout that carries the
-        // camera bind group ONLY (no chunk uniform, no per-mob bind group).
-        let src = include_str!("mob.rs");
-        let code = &src[..src.find("#[cfg(test)]").expect("mob test module marker")];
-        assert!(
-            code.contains("depth_write_enabled: true"),
-            "mobs must write depth so water behind them is occluded"
-        );
-        assert!(code.contains("CompareFunction::LessEqual"));
-        assert!(
-            code.contains("BlendState::REPLACE"),
-            "mobs are opaque; no alpha blending"
-        );
-        assert!(
-            code.contains("bind_group_layouts: &[camera_bgl]"),
-            "the mob pipeline layout must be the camera bind group alone"
-        );
-        assert!(
-            code.contains("buffers: &[mob_vertex_layout()]"),
-            "the mob pipeline must consume the pinned 32-byte vertex layout"
-        );
-        assert!(
-            !code.contains("chunk_bind_group") && !code.contains("@group(1)"),
-            "mobs must not bind a chunk uniform or a second group"
-        );
-        // Shader contract: shared camera view-projection, array sample by flat
-        // layer, shade multiply, hurt flash tint, distance fog.
-        assert!(code.contains("camera.view_proj * vec4<f32>(position, 1.0)"));
-        assert!(code.contains("camera.fog_start_end.x") && code.contains("camera.fog_start_end.y"));
-        assert!(
-            code.contains("textureSample(block_texture, block_sampler, in.uv, i32(in.tex_layer))")
-        );
-        assert!(code.contains("texel.rgb * in.shade"));
-        assert!(code.contains("vec3<f32>(1.0, 0.15, 0.1), in.flash"));
-        assert!(code.contains("mix(rgb, camera.fog_color.rgb, in.fog)"));
-    }
-
-    fn assert_close(actual: f32, expected: f32, what: &str) {
-        assert!(
-            (actual - expected).abs() < 1e-5,
-            "{what}: {actual} != {expected}"
-        );
-    }
-
-    #[test]
-    fn hotbar_slots_are_uniform_adjacent_and_centered() {
-        let rects: Vec<_> = (0..HOTBAR_SLOTS)
-            .map(|i| hotbar_slot_rect_ndc(i, 1.77))
-            .collect();
-
-        let (first_x0, y0, _, y1) = rects[0];
-        let (_, _, last_x1, _) = rects[HOTBAR_SLOTS - 1];
-        assert_close(first_x0, -last_x1, "bar centered on x=0");
-        assert_close(y0, -0.92, "bar bottom");
-        assert_close(y1, -0.835, "bar top");
-
-        let (w0, h0) = (rects[0].2 - rects[0].0, rects[0].3 - rects[0].1);
-        let gap = rects[1].0 - rects[0].2;
-        assert!(gap > 0.0, "gap must be positive, got {gap}");
-
-        for (i, rect) in rects.iter().enumerate() {
-            assert_close(rect.2 - rect.0, w0, &format!("slot {i} width"));
-            assert_close(rect.3 - rect.1, h0, &format!("slot {i} height"));
-            assert_close(rect.1, y0, &format!("slot {i} bottom"));
-            assert_close(rect.3, y1, &format!("slot {i} top"));
-            if i > 0 {
-                assert_close(rect.0 - rects[i - 1].2, gap, &format!("slot {i} gap"));
-            }
-        }
-    }
-
-    #[test]
-    fn hotbar_layout_clamps_narrow_aspects() {
-        for i in 0..HOTBAR_SLOTS {
-            assert_eq!(
-                hotbar_slot_rect_ndc(i, 0.1),
-                hotbar_slot_rect_ndc(i, 0.5),
-                "aspect below 0.5 clamps to 0.5"
-            );
-        }
-    }
-
-    #[test]
-    fn hotbar_out_of_range_index_is_degenerate_and_finite() {
-        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(HOTBAR_SLOTS, 1.77);
-        assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
-        assert!(x0.is_finite() && y0.is_finite());
-        assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
-    }
-
-    #[test]
     fn write_block_layer_targets_the_retained_texture_array() {
         let src = include_str!("pipeline.rs");
         let tests_at = src.find("#[cfg(test)]").expect("tests module exists");
@@ -2172,11 +2100,12 @@ mod tests {
         let body = &body[..body.find("\n    }\n").expect("function body ends") + 6];
 
         assert!(
-            body.contains("upload_block_layer_at(&self.block_texture, queue, layer, rgba)"),
+            body.contains("self.block_array_spec")
+                && body.contains(".upload_layer(&self.block_texture, queue, layer, rgba)"),
             "single-layer uploads must write into the retained texture array"
         );
         assert!(
-            !body.contains("create_block_texture_array"),
+            !body.contains("create_texture"),
             "live uploads must never recreate the texture, view, or bind group"
         );
     }
@@ -2184,27 +2113,50 @@ mod tests {
     #[test]
     fn block_texture_view_and_sampler_are_exposed_for_ui_icons() {
         // Source pin: the UI icon pipeline samples the same texture array the
-        // world uses, taken straight from create_block_texture_array. The
-        // texture itself stays the retained upload target, so pack changes
-        // re-upload contents without recreating the view/sampler.
+        // world uses, created from the host-supplied spec. The texture itself
+        // stays the retained upload target, so pack changes re-upload contents
+        // without recreating the view/sampler.
         let src = include_str!("pipeline.rs");
+        assert!(src.contains("block_array_spec: TextureArraySpec"));
         assert!(src.contains("pub block_texture_view: wgpu::TextureView"));
         assert!(src.contains("pub block_texture_sampler: wgpu::Sampler"));
         assert!(src.contains("block_texture_view: tex_view,"));
         assert!(src.contains("block_texture_sampler: sampler,"));
 
-        let new_at = src
-            .find("pub fn new(ctx: &RenderContext) -> Self")
-            .expect("VoxelRenderer::new exists");
-        let new_block = &src[new_at..];
-        assert!(new_block.contains("create_block_texture_array(&ctx.device, &ctx.queue)"));
+        let new_at = src.find("pub fn new(").expect("VoxelRenderer::new exists");
+        let constructor_end = src[new_at..]
+            .find("\n    pub fn write_block_layers")
+            .map(|off| new_at + off)
+            .expect("the constructor body ends before write_block_layers");
+        let new_block = &src[new_at..constructor_end];
+        assert!(new_block.contains("block_array_spec: TextureArraySpec,"));
+        assert!(new_block.contains("sky_geometry: SkyGeometry,"));
+        assert!(new_block.contains("block_array_spec.create_texture(&ctx.device)"));
+        assert!(new_block.contains("block_array_spec.create_view(&block_texture)"));
+        // The sampler descriptor is unchanged from the game-side factory.
+        assert!(new_block.contains("label: Some(\"block_sampler\")"));
+        assert!(new_block.contains("address_mode_u: wgpu::AddressMode::Repeat"));
+        assert!(new_block.contains("address_mode_v: wgpu::AddressMode::Repeat"));
+        assert!(new_block.contains("address_mode_w: wgpu::AddressMode::Repeat"));
+        assert!(new_block.contains("mag_filter: wgpu::FilterMode::Nearest"));
+        assert!(new_block.contains("min_filter: wgpu::FilterMode::Nearest"));
+        assert!(new_block.contains("mipmap_filter: wgpu::FilterMode::Linear"));
+        assert!(
+            !new_block.contains("upload_layers"),
+            "the host's write_block_layers right after `new` is the one startup upload"
+        );
 
         let write_at = src
             .find("pub fn write_block_layers")
             .expect("write_block_layers exists");
         assert!(
-            src[write_at..].contains("upload_block_layers(&self.block_texture, queue, layers)"),
+            src[write_at..].contains("self.block_array_spec")
+                && src[write_at..].contains(".upload_layers(&self.block_texture, queue, layers)"),
             "pack re-uploads must write into the same retained texture"
+        );
+        assert!(
+            src[write_at..].contains("self.block_array_spec.matches_shape(layers)"),
+            "the host-supplied spec is the shape guard"
         );
     }
 }

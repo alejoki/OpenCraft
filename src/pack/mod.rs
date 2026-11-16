@@ -107,7 +107,8 @@ pub struct PackLogo {
 ///
 /// `layers` is always exactly [`crate::render::texture::NUM_TEX_LAYERS`]
 /// entries of 16x16 RGBA bytes (1024 bytes each), the same format
-/// [`crate::render::texture::create_block_texture_array`] consumes. Layers
+/// [`opencraft_gfx::texture::TextureArraySpec`] consumes (see
+/// [`crate::render::texture::BLOCK_ARRAY_SPEC`]). Layers
 /// 0..24 come from [`LAYER_FILES`], layer 25 is built-in socket-marker art
 /// that packs cannot override, 26..31 are reserved block placeholders,
 /// 32..44 come from [`MOB_LAYER_FILES`], and 45..47 are reserved spares.

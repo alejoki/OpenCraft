@@ -3,7 +3,7 @@ use std::ops::Range;
 use wgpu::util::DeviceExt;
 
 use crate::mesh::quad::{ChunkMesh, PackedQuad};
-use crate::world::chunk::{ChunkPos, CHUNK_SIZE};
+use opencraft_core::chunk::{ChunkPos, CHUNK_SIZE};
 
 /// Bytes in one `PackedQuad` vertex.
 const PACKED_QUAD_BYTES: usize = std::mem::size_of::<PackedQuad>();
@@ -73,13 +73,12 @@ impl ChunkRenderStore {
     }
 
     /// Remove every chunk (dropping its wgpu buffers) and zero all
-    /// totals. The session-swap boundary (`GameApp::start_world_session`,
-    /// S03-T02) calls this so a freshly loaded world can never render
-    /// stale GPU meshes from the outgoing world. The populated-clear
-    /// proof rides on the launch smoke script and S04's human UAT:
-    /// constructing a real `GpuChunk` needs a wgpu `Device`, which
-    /// headless lib tests do not provide (honest limitation — the tests
-    /// below cover the empty-store and missing-pos contracts).
+    /// totals. The game's session-swap boundary calls this so a freshly
+    /// loaded world can never render stale GPU meshes from the outgoing
+    /// world. The populated-clear proof rides on the windowed launch smoke
+    /// test and human UAT: constructing a real `GpuChunk` needs a wgpu
+    /// `Device`, which headless lib tests do not provide (honest limitation
+    /// — the tests below cover the empty-store and missing-pos contracts).
     pub fn clear(&mut self) {
         self.chunks.clear();
         self.total_vram_bytes = 0;
@@ -184,8 +183,8 @@ mod tests {
     fn clear_on_an_empty_store_is_a_no_op_keeping_both_totals_zero() {
         // Headless contract: clear() must leave an empty store empty with
         // both totals zero. The populated-clear proof (a store with real
-        // GpuChunks dropping to zero totals) rides on the launch smoke
-        // script and S04's human UAT — constructing a real GpuChunk needs a
+        // GpuChunks dropping to zero totals) rides on the windowed launch
+        // smoke test and human UAT — constructing a real GpuChunk needs a
         // wgpu Device, which headless lib tests do not provide (honest
         // limitation, documented on `clear`).
         let mut store = ChunkRenderStore::new();
@@ -239,8 +238,8 @@ mod tests {
             "PackedQuad stays two u32 words"
         );
 
-        // Water-only chunk (S01 contract): the opaque buffer reserves zero
-        // bytes while the filled water buffer gets its own size/range.
+        // Water-only chunk contract: the opaque buffer reserves zero bytes
+        // while the filled water buffer gets its own size/range.
         let water_only = synthetic_mesh(0, 3);
         assert_eq!(water_only.total_quads(), 0);
         assert_eq!(water_only.water_quad_count(), 3);

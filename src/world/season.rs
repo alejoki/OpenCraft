@@ -101,6 +101,20 @@ pub enum Weather {
     Snowfall,
 }
 
+impl Weather {
+    /// Map the game's calendar-derived state to the neutral render value the
+    /// graphics crate consumes. The mapping lives with the enum so the render
+    /// crate never learns about seasons or calendars.
+    pub fn precipitation(self) -> opencraft_gfx::weather::Precipitation {
+        use opencraft_gfx::weather::Precipitation;
+        match self {
+            Weather::Clear => Precipitation::Clear,
+            Weather::Rain => Precipitation::Rain,
+            Weather::Snowfall => Precipitation::Snowfall,
+        }
+    }
+}
+
 /// Share of days with precipitation in each season, in percent.
 ///
 /// Winter only ever snows; the warmer seasons only ever rain. Clear days are
@@ -208,6 +222,16 @@ pub fn weather_of_with(season: Season, day_index: u32, seed: u32, rules: &Weathe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S07-T02: the game enum maps one-to-one onto the neutral render value,
+    /// so the graphics crate never sees `Weather`.
+    #[test]
+    fn weather_maps_to_the_neutral_precipitation_state() {
+        use opencraft_gfx::weather::Precipitation;
+        assert_eq!(Weather::Clear.precipitation(), Precipitation::Clear);
+        assert_eq!(Weather::Rain.precipitation(), Precipitation::Rain);
+        assert_eq!(Weather::Snowfall.precipitation(), Precipitation::Snowfall);
+    }
 
     #[test]
     fn weather_rules_default_matches_constants() {

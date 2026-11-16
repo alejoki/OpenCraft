@@ -18,9 +18,9 @@
 //! cannot represent a mob: that format only stores integer chunk-local block
 //! coordinates. [`build_mob_vertices_into`] and [`build_mob_batch_into`] stay
 //! pure CPU data so the model contract remains headlessly testable; the
-//! wgpu-facing [`create_mob_pipeline`] factory below only translates that
-//! contract into a pipeline descriptor (one camera bind group, no per-mob
-//! state).
+//! wgpu-facing pipeline factory lives in `opencraft_gfx::model` and only
+//! translates that contract into a descriptor (one camera bind group, no
+//! per-mob state).
 //!
 //! Arrows share that one batch: [`build_arrow_vertices_into`] appends the pure
 //! model-space arrow box (36 vertices, long axis `+Z`, already-authored layer
@@ -33,181 +33,12 @@
 use glam::{Quat, Vec3};
 
 use crate::player::camera::{Camera, Frustum};
-use crate::render::context::{RenderContext, DEPTH_FORMAT};
 use crate::render::texture::{MOB_ARROW_TEX_LAYER, MOB_LAYER_BASE};
 use crate::world::mob::MobKind;
 use crate::world::session::WorldSession;
 
-/// Bytes in one [`MobVertex`]. Pinned by D136 so the WGSL layout cannot drift.
-pub const MOB_VERTEX_SIZE: usize = 32;
-
-/// The five vertex attributes of [`MobVertex`], in shader-location order.
-/// Offsets are 0 / 12 / 20 / 24 / 28 and depend on the `#[repr(C)]` field
-/// order above; a test pins every value.
-pub const MOB_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-    0 => Float32x3,
-    1 => Float32x2,
-    2 => Uint32,
-    3 => Float32,
-    4 => Float32
-];
-
-/// One mob geometry vertex (D136).
-///
-/// `shade` carries the face-shading constant multiplied by the per-mob light
-/// factor on the CPU, so world light needs no extra attribute. `flash` is the
-/// hurt tint (0 normal, 1 fully red). Distance fog is derived from the shared
-/// camera uniform in the vertex shader, so it needs no attribute either.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct MobVertex {
-    position: [f32; 3],
-    uv: [f32; 2],
-    tex_layer: u32,
-    shade: f32,
-    flash: f32,
-}
-
-/// The mob vertex buffer layout (stride 32, one vertex per step).
-pub fn mob_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
-    wgpu::VertexBufferLayout {
-        array_stride: MOB_VERTEX_SIZE as wgpu::BufferAddress,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &MOB_VERTEX_ATTRIBUTES,
-    }
-}
-
-/// Mob shader (WGSL): one batched, textured box-model pass.
-///
-/// The vertex stage consumes the pinned [`MobVertex`] attributes, applies the
-/// shared camera view-projection, and derives the distance fog factor from the
-/// existing [`crate::render::pipeline::CameraUniform`] (`camera_pos` plus
-/// `fog_start_end.xy`) so the 112-byte uniform layout is untouched. The
-/// fragment stage samples the same 256-layer block texture array from the
-/// camera bind group (`uv`, flat `tex_layer`), multiplies by the CPU-baked
-/// face shade, applies the hurt flash tint, and fades into `fog_color`.
-///
-/// Group 0 is the existing camera bind group: binding 0 uniform, binding 1
-/// `texture_2d_array<f32>`, binding 2 sampler. There is deliberately no group
-/// 1: the whole scene draws with a single bind group and a single draw call.
-pub const MOB_SHADER_WGSL: &str = r#"
-struct CameraUniform {
-    view_proj: mat4x4<f32>,
-    camera_pos: vec4<f32>,
-    fog_color: vec4<f32>,
-    fog_start_end: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: CameraUniform;
-@group(0) @binding(1) var block_texture: texture_2d_array<f32>;
-@group(0) @binding(2) var block_sampler: sampler;
-
-struct VertexOutput {
-    @builtin(position) clip_pos: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-    @location(1) @interpolate(flat) tex_layer: u32,
-    @location(2) shade: f32,
-    @location(3) flash: f32,
-    @location(4) fog: f32,
-};
-
-@vertex
-fn vs_main(
-    @location(0) position: vec3<f32>,
-    @location(1) uv: vec2<f32>,
-    @location(2) tex_layer: u32,
-    @location(3) shade: f32,
-    @location(4) flash: f32,
-) -> VertexOutput {
-    let cam_dist = distance(position, camera.camera_pos.xyz);
-    let fog_start = camera.fog_start_end.x;
-    let fog_end = camera.fog_start_end.y;
-    let fog_t = clamp((cam_dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
-
-    var out: VertexOutput;
-    out.clip_pos = camera.view_proj * vec4<f32>(position, 1.0);
-    out.uv = uv;
-    out.tex_layer = tex_layer;
-    out.shade = shade;
-    out.flash = flash;
-    out.fog = fog_t * fog_t;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let texel = textureSample(block_texture, block_sampler, in.uv, i32(in.tex_layer));
-    var rgb = texel.rgb * in.shade;
-    rgb = mix(rgb, vec3<f32>(1.0, 0.15, 0.1), in.flash);
-    let final_rgb = mix(rgb, camera.fog_color.rgb, in.fog);
-    return vec4<f32>(final_rgb, 1.0);
-}
-"#;
-
-/// Create the single batched mob pipeline.
-///
-/// The pipeline layout is `&[camera_bgl]` ONLY: mobs reuse the existing camera
-/// uniform + block texture array + sampler bind group, so there is no per-mob
-/// bind group, no chunk uniform, and no second draw call per mob. The pipeline
-/// is opaque (REPLACE blending) and writes depth with `LessEqual`, so opaque
-/// terrain occludes mobs and mobs occlude the translucent water drawn after
-/// them (D136).
-pub fn create_mob_pipeline(
-    ctx: &RenderContext,
-    camera_bgl: &wgpu::BindGroupLayout,
-) -> wgpu::RenderPipeline {
-    let shader = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("mob_shader"),
-            source: wgpu::ShaderSource::Wgsl(MOB_SHADER_WGSL.into()),
-        });
-
-    let layout = ctx
-        .device
-        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("mob_pipeline_layout"),
-            bind_group_layouts: &[camera_bgl],
-            push_constant_ranges: &[],
-        });
-
-    ctx.device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("mob_pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[mob_vertex_layout()],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: ctx.config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                // Mob cuboids are emitted with outward CCW winding, but the
-                // model is open (no back faces needed) and death squashes can
-                // flip thin parts; hardware culling only costs visibility.
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-        })
-}
+/// The neutral model vertex ABI and pipeline live in [`opencraft_gfx::model`].
+pub use opencraft_gfx::model::ModelVertex as MobVertex;
 
 /// Animation inputs for one model-space build.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -906,38 +737,6 @@ mod tests {
         camera.yaw = std::f32::consts::FRAC_PI_2;
         camera.pitch = 0.0;
         camera
-    }
-
-    #[test]
-    fn mob_vertex_is_32_bytes_with_the_pinned_attribute_offsets() {
-        assert_eq!(std::mem::size_of::<MobVertex>(), MOB_VERTEX_SIZE);
-        assert_eq!(MOB_VERTEX_SIZE, 32);
-
-        let expected = [
-            (wgpu::VertexFormat::Float32x3, 0u64, 0u32),
-            (wgpu::VertexFormat::Float32x2, 12, 1),
-            (wgpu::VertexFormat::Uint32, 20, 2),
-            (wgpu::VertexFormat::Float32, 24, 3),
-            (wgpu::VertexFormat::Float32, 28, 4),
-        ];
-        for (index, (format, offset, location)) in expected.iter().enumerate() {
-            let attr = MOB_VERTEX_ATTRIBUTES[index];
-            assert_eq!(attr.format, *format, "attribute {index} format");
-            assert_eq!(attr.offset, *offset, "attribute {index} offset");
-            assert_eq!(
-                attr.shader_location, *location,
-                "attribute {index} location"
-            );
-        }
-    }
-
-    #[test]
-    fn mob_vertex_layout_is_one_32_byte_vertex_per_step() {
-        let layout = mob_vertex_layout();
-        assert_eq!(layout.array_stride, MOB_VERTEX_SIZE as u64);
-        assert_eq!(layout.step_mode, wgpu::VertexStepMode::Vertex);
-        assert_eq!(layout.attributes.len(), 5);
-        assert_eq!(layout.attributes, &MOB_VERTEX_ATTRIBUTES);
     }
 
     #[test]

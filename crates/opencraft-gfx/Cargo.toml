@@ -1,0 +1,14 @@
+[package]
+name = "opencraft-gfx"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1.14", features = ["derive"] }
+glam = "0.27"
+opencraft-core = { path = "../opencraft-core" }
+pollster = "0.3"
+rustc-hash = "1.1"
+wgpu = "0.19"

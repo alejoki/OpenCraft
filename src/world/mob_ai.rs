@@ -18,13 +18,16 @@
 //! * **Chase is direct steering, never A\*.** Yaw 0 faces +Z (the mob module's
 //!   convention), the speed is the kind's [`MobKind::walk_speed`], and the
 //!   mob faces its target every fixed step.
-//! * **Movement is one block up, one block down, else refuse.** A blocked
-//!   candidate tries a one-block step-up; a candidate whose column has no
-//!   support drops at most one block. A larger drop is refused (cliff guard),
-//!   so a hostile never walks off a two-block ledge. Closing and retreating
-//!   share the same mover ([`move_in`]) — and so do the passive wander/flee
-//!   arms in [`crate::world::mob`], so every kind climbs, descends and collides
-//!   with solid blocks identically.
+//! * **Movement is one block up, one block down, else refuse.** The mover
+//!   rules live in [`opencraft_pathfinding::steering`]; [`move_in`] and
+//!   [`move_in_at_speed`] are thin game adapters that supply the kind's box,
+//!   the game tick and the world read, then copy the body values back. A
+//!   blocked candidate tries a one-block step-up; a candidate whose column has
+//!   no support drops at most one block. A larger drop is refused (cliff
+//!   guard), so a hostile never walks off a two-block ledge. Closing and
+//!   retreating share the same mover ([`move_in`]) — and so do the passive
+//!   wander/flee arms in [`crate::world::mob`], so every kind climbs, descends
+//!   and collides with solid blocks identically.
 //! * **Skeleton stand-off (S08).** A kind with a
 //!   [`MobKind::ranged_profile`] never melees: beyond `fire_range` it closes,
 //!   inside `min_range` it backs away, and in the band it stands still and
@@ -44,11 +47,11 @@
 //!   re-aggro from line of sight once more.
 
 use glam::{IVec3, Vec3};
+use opencraft_pathfinding::steering::{self, BodyBox, SteeringBody};
 
 use crate::player::raycast::raycast_voxels;
 use crate::world::arrow::{ARROW_GRAVITY, ARROW_SPEED_SKELETON};
-use crate::world::block::BlockId;
-use crate::world::collision::solid_overlaps;
+use crate::world::block::{BlockId, BlockIdQuery};
 use crate::world::manager::WorldManager;
 use crate::world::mob::{Mob, MobAiState, MobKind, MobShot};
 
@@ -73,14 +76,6 @@ pub const MOB_STUCK_REAGGRO_SECS: f32 = 2.0;
 /// while refusing the extreme angle that would need a lob the gravity model
 /// can no longer hit.
 pub const MOB_FIRE_VERTICAL: f32 = 4.0;
-/// Height of the one allowed step up, in blocks.
-pub const MOB_STEP_UP_HEIGHT: f32 = 1.0;
-/// The largest feet drop a hostile may walk off, in blocks.
-pub const MOB_CLIFF_DROP_BLOCKS: i32 = 1;
-
-/// Same inward epsilon as the shared collision predicate, used to turn a
-/// float feet position into block coordinates without boundary jitter.
-const SUPPORT_EPS: f32 = 1e-4;
 /// Slack on the ranged cooldown gate, in seconds.
 ///
 /// [`MobRuntime::step_mob`] drains `mob.cooldown` by [`MOB_TICK_SECS`] with
@@ -337,128 +332,65 @@ pub fn step_hostile(
 /// The shared step-up/down/cliff mover, in any horizontal direction, at the
 /// kind's walk speed.
 ///
-/// Updates `position`, `velocity`, `walk_phase`, and the stuck timer; never
-/// changes yaw or state. Closing passes the facing vector and retreating passes
-/// its negation, so both motions share the one-block step-up, one-block drop,
-/// cliff guard, footprint support and stuck rules. `dir` must be a finite
-/// horizontal direction (the callers pass the unit yaw vector or its
-/// negation); a degenerate or non-finite direction refuses the step.
+/// The movement rules live in [`opencraft_pathfinding::steering`]; this
+/// wrapper supplies the game's body size, tick duration and world read, and
+/// copies the body values back. It updates `position`, `velocity`,
+/// `walk_phase`, and the stuck timer; never changes yaw or state. Closing
+/// passes the facing vector and retreating passes its negation, so both
+/// motions share the one-block step-up, one-block drop, cliff guard, footprint
+/// support and stuck rules. `dir` must be a finite horizontal direction (the
+/// callers pass the unit yaw vector or its negation); a degenerate or
+/// non-finite direction refuses the step.
 pub fn move_in(mob: &mut Mob, world: &impl MobWorld, dir: Vec3) {
     move_in_at_speed(mob, world, dir, mob.kind.walk_speed());
 }
 
 /// [`move_in`] with an explicit speed, used by the passive flee arm.
 ///
-/// A non-finite or non-positive speed refuses the step instead of committing a
-/// body position the rest of the game cannot reason about.
+/// Game adapter over [`steering::move_in`]: the caller's `speed` wins (the
+/// kind's walk speed is not re-read) and the step is the game tick
+/// ([`crate::world::mob::MOB_TICK_SECS`]). A non-finite or non-positive speed
+/// refuses the step instead of committing a body position the rest of the game
+/// cannot reason about.
 pub fn move_in_at_speed(mob: &mut Mob, world: &impl MobWorld, dir: Vec3, speed: f32) {
-    let dir = Vec3::new(dir.x, 0.0, dir.z);
-    if !dir.is_finite() || dir.length_squared() < 1e-12 || !speed.is_finite() || speed <= 0.0 {
-        refuse(mob);
-        return;
-    }
-    let candidate = mob.position + dir * speed * crate::world::mob::MOB_TICK_SECS;
-
-    // Flat continuation: the candidate box must be clear and the destination
-    // footprint must still have ground under it.
-    if mob_box_clear(mob, candidate, world) {
-        let support = support_level(candidate);
-        if footprint_supported(mob, candidate, support, world) {
-            commit_move(mob, candidate, dir, speed);
-            return;
-        }
-        // One-block step down, but never a larger drop (cliff guard).
-        if MOB_CLIFF_DROP_BLOCKS >= 1 && footprint_supported(mob, candidate, support - 1, world) {
-            let lowered = candidate - Vec3::Y * MOB_CLIFF_DROP_BLOCKS as f32;
-            if mob_box_clear(mob, lowered, world) {
-                commit_move(mob, lowered, dir, speed);
-                return;
-            }
-        }
-        // Already airborne (a spawned/knocked body over a void, or a synthetic
-        // test world with no floor): keep the pre-existing horizontal drift.
-        // Terrain walking never reaches this arm because a grounded mob is
-        // supported at its feet level and is refused by the cliff guard above.
-        if airborne(mob, mob.position, world) {
-            commit_move(mob, candidate, dir, speed);
-            return;
-        }
-        refuse(mob);
-        return;
-    }
-
-    // Blocked at feet level: try the one allowed step up. The raised box must
-    // be clear and the step top must support the raised feet.
-    let raised = candidate + Vec3::Y * MOB_STEP_UP_HEIGHT;
-    if mob_box_clear(mob, raised, world)
-        && footprint_supported(mob, raised, support_level(raised), world)
-    {
-        commit_move(mob, raised, dir, speed);
-        return;
-    }
-
-    // A two-block wall produces neither a step nor penetration.
-    refuse(mob);
-}
-
-fn commit_move(mob: &mut Mob, position: Vec3, dir: Vec3, speed: f32) {
-    mob.position = position;
-    mob.velocity = dir * speed;
-    mob.walk_phase += speed * crate::world::mob::MOB_TICK_SECS * 4.0;
-}
-
-fn refuse(mob: &mut Mob) {
-    mob.velocity = Vec3::ZERO;
-    mob.stuck += crate::world::mob::MOB_TICK_SECS;
+    let mut body = SteeringBody {
+        feet: mob.position,
+        velocity: mob.velocity,
+        walk_phase: mob.walk_phase,
+        stuck: mob.stuck,
+    };
+    let dims = BodyBox {
+        half_width: mob.kind.width() * 0.5,
+        height: mob.kind.height(),
+    };
+    steering::move_in(
+        &mut body,
+        dims,
+        &BlockIdQuery(|x: i32, y: i32, z: i32| world.block(x, y, z)),
+        dir,
+        speed,
+        crate::world::mob::MOB_TICK_SECS,
+    );
+    mob.position = body.feet;
+    mob.velocity = body.velocity;
+    mob.walk_phase = body.walk_phase;
+    mob.stuck = body.stuck;
 }
 
 /// The mob's own box, not the player-sized `Aabb::from_feet`.
 ///
+/// Game adapter over the neutral [`steering::body_box_clear`] predicate.
 /// Public so the knockback integration in [`crate::world::mob`] can refuse a
 /// slide into a solid block through the exact same AABB the walking mover uses.
 pub fn mob_box_clear(mob: &Mob, feet: Vec3, world: &impl MobWorld) -> bool {
-    let half = mob.kind.width() * 0.5;
-    let min = Vec3::new(feet.x - half, feet.y, feet.z - half);
-    let max = Vec3::new(feet.x + half, feet.y + mob.kind.height(), feet.z + half);
-    !solid_overlaps(min, max, &|x, y, z| world.block(x, y, z))
-}
-
-/// The block y directly beneath block-level `feet` (the feet block itself is
-/// at `floor(feet.y)` when standing on a top face).
-fn support_level(feet: Vec3) -> i32 {
-    (feet.y + SUPPORT_EPS).floor() as i32 - 1
-}
-
-/// Whether any block under the box footprint is solid at `level`.
-///
-/// The whole footprint is checked so a mob straddling a step still counts as
-/// supported; a mob completely past the edge does not.
-fn footprint_supported(mob: &Mob, feet: Vec3, level: i32, world: &impl MobWorld) -> bool {
-    let half = mob.kind.width() * 0.5;
-    let min_x = (feet.x - half + SUPPORT_EPS).floor() as i32;
-    let max_x = (feet.x + half - SUPPORT_EPS).floor() as i32;
-    let min_z = (feet.z - half + SUPPORT_EPS).floor() as i32;
-    let max_z = (feet.z + half - SUPPORT_EPS).floor() as i32;
-    for z in min_z..=max_z {
-        for x in min_x..=max_x {
-            if world.block(x, level, z).is_solid() {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Whether the mob has no support at its feet level or one block below.
-///
-/// True means it is already airborne before this step. There is no mob gravity,
-/// so such a body keeps its horizontal drift instead of freezing mid-air; a
-/// grounded body that reaches a two-block ledge is still refused by the cliff
-/// guard.
-fn airborne(mob: &Mob, feet: Vec3, world: &impl MobWorld) -> bool {
-    let level = support_level(feet);
-    !footprint_supported(mob, feet, level, world)
-        && !footprint_supported(mob, feet, level - 1, world)
+    steering::body_box_clear(
+        feet,
+        BodyBox {
+            half_width: mob.kind.width() * 0.5,
+            height: mob.kind.height(),
+        },
+        &BlockIdQuery(|x: i32, y: i32, z: i32| world.block(x, y, z)),
+    )
 }
 
 #[cfg(test)]

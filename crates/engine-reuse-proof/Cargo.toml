@@ -1,0 +1,13 @@
+[package]
+name = "engine-reuse-proof"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+glam = "0.27"
+opencraft-core = { path = "../opencraft-core" }
+opencraft-gfx = { path = "../opencraft-gfx" }
+opencraft-physics = { path = "../opencraft-physics" }
+opencraft-pathfinding = { path = "../opencraft-pathfinding" }

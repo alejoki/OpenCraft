@@ -1,5 +1,8 @@
-use std::sync::Arc;
-use winit::window::Window;
+//! wgpu render context over a host-created surface.
+//!
+//! The host owns the window, the `wgpu::Instance` and the `Surface`; this
+//! module owns the adapter, device, queue, surface configuration and depth
+//! attachment shared by every render pass.
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -8,7 +11,6 @@ pub struct RenderContext {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
-    pub size: winit::dpi::PhysicalSize<u32>,
     pub depth_view: wgpu::TextureView,
     /// Present modes the surface advertises. wgpu panics when a
     /// configuration requests an unsupported mode, so every runtime present
@@ -25,7 +27,7 @@ pub struct RenderContext {
 /// direct scanout, where a `Fifo` swapchain can stall to half the display
 /// refresh (30 fps on a 60 Hz panel) even when the frame takes only a few
 /// milliseconds. The frame loop pairs `Mailbox` with an explicit
-/// refresh-rate limiter (see `GameApp::about_to_wait`) so rendering still
+/// refresh-rate limiter (see the game's frame loop) so rendering still
 /// runs at the display rate instead of spinning uncapped. `Fifo` remains
 /// the always-supported fallback.
 ///
@@ -67,17 +69,17 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
 }
 
 impl RenderContext {
-    pub fn new(window: Arc<Window>) -> Self {
-        let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
-            ..Default::default()
-        });
-
-        let surface = instance
-            .create_surface(window)
-            .expect("Failed to create wgpu surface");
-
+    /// Build the GPU context over a surface the host created from its own
+    /// window. The host keeps ownership of the window, instance and surface;
+    /// the adapter, device, queue, surface configuration and depth
+    /// attachment are owned here.
+    pub fn new(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+        vsync: bool,
+    ) -> Self {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
@@ -103,16 +105,15 @@ impl RenderContext {
             .find(|f| f.is_srgb())
             .unwrap_or(caps.formats[0]);
 
-        // Prefer uncapped Immediate / Mailbox for maximum FPS benchmarking,
-        // fallback to Fifo. The persisted vsync setting is applied later by
-        // `set_vsync`, once the window exists.
-        let present_mode = preferred_present_mode(false, &caps.present_modes);
+        // Select the requested vsync mode up front so no post-construction
+        // reconfigure is needed.
+        let present_mode = preferred_present_mode(vsync, &caps.present_modes);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: size.width.max(1),
-            height: size.height.max(1),
+            width: width.max(1),
+            height: height.max(1),
             present_mode,
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
@@ -127,7 +128,6 @@ impl RenderContext {
             device,
             queue,
             config,
-            size,
             depth_view,
             supported_present_modes: caps.present_modes,
         }
@@ -142,13 +142,15 @@ impl RenderContext {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
+    /// Reconfigure the surface and rebuild the depth attachment for a new
+    /// window size. Zero dimensions are ignored: a minimized window can
+    /// report them and a zero-sized surface configuration is invalid.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.config.width = width;
+            self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-            self.depth_view = create_depth_view(&self.device, new_size.width, new_size.height);
+            self.depth_view = create_depth_view(&self.device, width, height);
         }
     }
 }

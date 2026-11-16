@@ -18,7 +18,7 @@ the release is cut from `main` and published by
 
 ## 2. Bump the version
 
-The version lives in exactly two files and both must change in the **same
+The game version lives in exactly two files and both must change in the **same
 commit**:
 
 | File | What changes |
@@ -37,6 +37,12 @@ git diff Cargo.lock   # only the opencraft version line
 ```
 
 Do **not** run a bare `cargo update`; it churns unrelated dependency versions.
+
+The `crates/` members are not part of the release version. Each member carries
+its own independent `0.1.0` version and `publish = false`, so a game release
+never bumps them. Never give a member `version.workspace = true`: the release
+version guard reads the first `version` line in the root `Cargo.toml`, and
+workspace inheritance would make that line the wrong source of truth.
 
 Then write `docs/RELEASE-NOTES-<VERSION>.md`. The workflow looks up exactly
 `docs/RELEASE-NOTES-${VERSION}.md` and fails the run if it is missing. Keep the
@@ -156,9 +162,9 @@ Check by eye and by script:
 ## 8. Fresh-clone verification
 
 The tag-triggered Release run is the fresh-clone, two-OS proof: both `build`
-jobs check out the tag into a clean tree and run `cargo test --locked` and
-`cargo build --release --locked` there. Record the run URL with the release
-checklist.
+jobs check out the tag into a clean tree and run
+`cargo test --workspace --locked` and `cargo build --release --locked` there.
+Record the run URL with the release checklist.
 
 To repeat the fresh-clone build locally on Linux:
 
@@ -166,7 +172,7 @@ To repeat the fresh-clone build locally on Linux:
 tmp=$(mktemp -d)
 git clone --depth 1 --branch v0.2.2 https://github.com/alejoki/OpenCraft.git "$tmp/opencraft"
 cd "$tmp/opencraft"
-PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo test --locked
+PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo test --workspace --locked
 PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo build --release --locked
 ```
 

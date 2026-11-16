@@ -6,7 +6,6 @@
 use crate::content::ContentRegistry;
 use crate::player::inventory::{Inventory, Item, ItemStack, HOTBAR_SLOTS};
 use crate::player::survival::{GameMode, SurvivalState, FULL_AIR, MAX_HEALTH, MAX_HUNGER};
-use crate::render::pipeline::hotbar_slot_rect_ndc;
 use crate::ui::inventory::Rect;
 use crate::ui::quad::Quad;
 
@@ -113,6 +112,41 @@ fn vitals_metrics_from_hotbar_width(hotbar_w: f32) -> VitalsMetrics {
 pub fn vitals_stack_top(surface_w: u32, surface_h: u32) -> f32 {
     let metrics = vitals_metrics(surface_w, surface_h);
     selected_name_rect(surface_w, surface_h).1 - 2.0 * (metrics.row_gap + metrics.icon_size)
+}
+
+/// Layout of hotbar slot `index` in normalised device coordinates.
+///
+/// Returns `(x0, y0, x1, y1)` with y pointing up in NDC. The bar is centered
+/// on x = 0 at the bottom of the screen. `index >= HOTBAR_SLOTS` returns a
+/// zero-sized rect at the bar's left edge instead of panicking, so defensive
+/// callers can use it without a bounds check.
+pub fn hotbar_slot_rect_ndc(index: usize, aspect: f32) -> (f32, f32, f32, f32) {
+    let aspect = aspect.max(0.5);
+    let slot_w = 0.09 / aspect;
+    let slot_h = 0.085;
+    let gap = 0.012 / aspect;
+    let total_w = HOTBAR_SLOTS as f32 * slot_w + (HOTBAR_SLOTS - 1) as f32 * gap;
+    let start_x = -total_w * 0.5;
+    let y0 = -0.92;
+    let y1 = y0 + slot_h;
+
+    if index >= HOTBAR_SLOTS {
+        return (start_x, y0, start_x, y0);
+    }
+
+    let x0 = start_x + index as f32 * (slot_w + gap);
+    (x0, y0, x0 + slot_w, y1)
+}
+
+/// Hotbar slot outlines in NDC as `[x0, y0, x1, y1]`, in slot order.
+///
+/// Precomputed by the host from its own layout and handed to the renderer,
+/// which only loops the rects and never learns the slot count or geometry.
+pub fn hotbar_slot_ndc_rects(aspect: f32) -> [[f32; 4]; HOTBAR_SLOTS] {
+    std::array::from_fn(|index| {
+        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(index, aspect);
+        [x0, y0, x1, y1]
+    })
 }
 
 /// Hotbar slot rects in physical pixels `(x, y, w, h)` (top-left origin).
@@ -503,6 +537,75 @@ mod tests {
             (actual - expected).abs() < 1e-4,
             "{what}: {actual} != {expected}"
         );
+    }
+
+    #[test]
+    fn hotbar_slots_are_uniform_adjacent_and_centered() {
+        let rects: Vec<_> = (0..HOTBAR_SLOTS)
+            .map(|i| hotbar_slot_rect_ndc(i, 1.77))
+            .collect();
+
+        let (first_x0, y0, _, y1) = rects[0];
+        let (_, _, last_x1, _) = rects[HOTBAR_SLOTS - 1];
+        assert_close(first_x0, -last_x1, "bar centered on x=0");
+        assert_close(y0, -0.92, "bar bottom");
+        assert_close(y1, -0.835, "bar top");
+
+        let (w0, h0) = (rects[0].2 - rects[0].0, rects[0].3 - rects[0].1);
+        let gap = rects[1].0 - rects[0].2;
+        assert!(gap > 0.0, "gap must be positive, got {gap}");
+
+        for (i, rect) in rects.iter().enumerate() {
+            assert_close(rect.2 - rect.0, w0, &format!("slot {i} width"));
+            assert_close(rect.3 - rect.1, h0, &format!("slot {i} height"));
+            assert_close(rect.1, y0, &format!("slot {i} bottom"));
+            assert_close(rect.3, y1, &format!("slot {i} top"));
+            if i > 0 {
+                assert_close(rect.0 - rects[i - 1].2, gap, &format!("slot {i} gap"));
+            }
+        }
+    }
+
+    #[test]
+    fn hotbar_layout_clamps_narrow_aspects() {
+        for i in 0..HOTBAR_SLOTS {
+            assert_eq!(
+                hotbar_slot_rect_ndc(i, 0.1),
+                hotbar_slot_rect_ndc(i, 0.5),
+                "aspect below 0.5 clamps to 0.5"
+            );
+        }
+    }
+
+    #[test]
+    fn hotbar_out_of_range_index_is_degenerate_and_finite() {
+        let (x0, y0, x1, y1) = hotbar_slot_rect_ndc(HOTBAR_SLOTS, 1.77);
+        assert_eq!((x0, y0, x1, y1), (x0, y0, x0, y0));
+        assert!(x0.is_finite() && y0.is_finite());
+        assert_eq!(x0, hotbar_slot_rect_ndc(0, 1.77).0, "returns at left edge");
+    }
+
+    #[test]
+    fn hotbar_ndc_rects_match_the_pixel_helper() {
+        for (w, h) in [(1280u32, 720u32), (3440, 1440)] {
+            let aspect = w as f32 / h as f32;
+            let ndc = hotbar_slot_ndc_rects(aspect);
+            let px = hotbar_slot_rects(w, h);
+            for (i, (rect, (x, y, rw, rh))) in ndc.iter().zip(px.iter()).enumerate() {
+                assert_close((rect[0] + 1.0) / 2.0 * w as f32, *x, &format!("slot {i} x"));
+                assert_close((1.0 - rect[3]) / 2.0 * h as f32, *y, &format!("slot {i} y"));
+                assert_close(
+                    (rect[2] - rect[0]) / 2.0 * w as f32,
+                    *rw,
+                    &format!("slot {i} w"),
+                );
+                assert_close(
+                    (rect[3] - rect[1]) / 2.0 * h as f32,
+                    *rh,
+                    &format!("slot {i} h"),
+                );
+            }
+        }
     }
 
     #[test]

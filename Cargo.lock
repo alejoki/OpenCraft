@@ -592,6 +592,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-reuse-proof"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-core",
+ "opencraft-gfx",
+ "opencraft-pathfinding",
+ "opencraft-physics",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1667,8 +1678,11 @@ dependencies = [
  "crossbeam-channel",
  "glam",
  "glyphon",
+ "opencraft-core",
+ "opencraft-gfx",
+ "opencraft-pathfinding",
+ "opencraft-physics",
  "png",
- "pollster",
  "rayon",
  "rodio",
  "rustc-hash",
@@ -1677,6 +1691,41 @@ dependencies = [
  "toml",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "opencraft-core"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
+name = "opencraft-gfx"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "opencraft-core",
+ "pollster",
+ "rustc-hash",
+ "wgpu",
+]
+
+[[package]]
+name = "opencraft-pathfinding"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-core",
+]
+
+[[package]]
+name = "opencraft-physics"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-core",
 ]
 
 [[package]]

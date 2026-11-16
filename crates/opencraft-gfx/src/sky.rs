@@ -1,26 +1,25 @@
 //! Sky pass GPU layer: sun, moon and star billboards.
 //!
-//! All celestial geometry is static and camera-relative: `build_sky_vertices`
+//! All celestial geometry is static and camera-relative: [`build_sky_vertices`]
 //! expands the sun and moon quads and every star into billboard vertices once
 //! at renderer construction, and the vertex shader positions them on a sphere
-//! around `camera.camera_pos`. Per-frame state is a single
-//! 48-byte [`SkyUniform`] (the sun/moon directions, their brightness fades,
-//! the star visibility and the star rotation angle) written with
-//! `queue.write_buffer`.
+//! around `camera.camera_pos`. Per-frame state is a single 48-byte
+//! [`SkyUniform`] (the sun/moon directions, their brightness fades, the star
+//! visibility and the star rotation angle) written with `queue.write_buffer`.
 //!
-//! The pure math that fills [`SkyUniform`] lives headlessly in
-//! [`crate::world::daycycle`]; this module only uploads it and draws
-//! billboards.
+//! The host owns the celestial math and supplies it as data: [`SkyUniform`]
+//! arrives precomputed each frame and [`SkyGeometry`] carries the static star
+//! directions and angular sizes at construction. This module only uploads and
+//! draws billboards.
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-use crate::render::context::RenderContext;
-use crate::world::daycycle;
+use crate::context::RenderContext;
 
-/// Distance from the camera to the sky billboards. Must stay inside
-/// `Camera::z_far` (1200 in `src/player/camera.rs`) so the quads survive the
-/// clip-volume test; 1,000 leaves comfortable margin.
+/// Distance from the camera to the sky billboards. Must stay inside the
+/// neutral camera's far plane (1200) so the quads survive the clip-volume
+/// test; 1,000 leaves comfortable margin.
 pub const SKY_DIST: f32 = 1_000.0;
 
 /// Quad kind tags carried per vertex so the shader knows where to read the
@@ -38,7 +37,7 @@ const MOON_COLOR: [f32; 4] = [0.62, 0.68, 0.82, 1.0];
 const STAR_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
 
 /// Six corners of a quad in `-1..1`, expanded to two triangles. Same
-/// no-index-buffer expansion precedent as `src/ui/quad.rs`.
+/// no-index-buffer expansion precedent as the host's UI quad stage.
 const QUAD_CORNERS: [[f32; 2]; 6] = [
     [-1.0, -1.0],
     [1.0, -1.0],
@@ -55,6 +54,23 @@ const QUAD_CORNERS: [[f32; 2]; 6] = [
 /// constant because the static-buffer layout tests index past it.
 pub const MOON_VERTEX_COUNT: usize = 6;
 
+/// Static sky geometry supplied by the host at construction.
+///
+/// Directions are unit vectors on the celestial sphere; every angular size is
+/// a half-size in radians, scaled by [`SKY_DIST`] in the shader. The host owns
+/// the star seed and the sizes; this module owns the billboard expansion.
+#[derive(Clone, Debug)]
+pub struct SkyGeometry {
+    /// Fixed star directions, expanded into six billboard vertices each.
+    pub star_field: Vec<Vec3>,
+    /// Angular half-size of the sun quad (radians).
+    pub sun_angular_size: f32,
+    /// Angular half-size of the moon quad (radians).
+    pub moon_angular_size: f32,
+    /// Angular half-size of every star quad (radians).
+    pub star_angular_size: f32,
+}
+
 /// Per-frame sky state shared by every billboard.
 ///
 /// Layout: three `vec4`s (48 bytes, 16-aligned). Deliberately separate from
@@ -68,23 +84,15 @@ pub struct SkyUniform {
     pub params: [f32; 4],
 }
 
-impl SkyUniform {
-    /// Derive the whole uniform from a game time via the pure day-cycle math.
-    pub fn from_time(time_of_day: u32) -> Self {
-        let sun = daycycle::sun_direction(time_of_day);
-        let moon = daycycle::moon_direction(time_of_day);
-        // Same rotation the sun follows, recovered from its direction so the
-        // formula lives in exactly one place (daycycle).
-        let star_angle = sun.y.atan2(sun.x);
+impl Default for SkyUniform {
+    /// Neutral seed: sun on +X, moon on -X, full sun brightness, no stars.
+    /// The frame write overwrites every field before the pass, so this is only
+    /// the buffer's initial contents.
+    fn default() -> Self {
         Self {
-            sun_dir: [sun.x, sun.y, sun.z, 0.0],
-            moon_dir: [moon.x, moon.y, moon.z, 0.0],
-            params: [
-                daycycle::sun_brightness(time_of_day),
-                daycycle::moon_brightness(time_of_day),
-                daycycle::star_visibility(time_of_day),
-                star_angle,
-            ],
+            sun_dir: [1.0, 0.0, 0.0, 0.0],
+            moon_dir: [-1.0, 0.0, 0.0, 0.0],
+            params: [1.0, 0.0, 0.0, 0.0],
         }
     }
 }
@@ -117,22 +125,22 @@ impl SkyVertex {
     }
 }
 
-/// Expand the sun, moon and fixed-seed star field into static billboard
+/// Expand the sun, moon and host-supplied star field into static billboard
 /// vertices. Called once at renderer construction; the result never changes.
-pub fn build_sky_vertices(star_field: &[Vec3]) -> Vec<SkyVertex> {
-    let mut verts = Vec::with_capacity(6 + MOON_VERTEX_COUNT + star_field.len() * 6);
+pub fn build_sky_vertices(geometry: &SkyGeometry) -> Vec<SkyVertex> {
+    let mut verts = Vec::with_capacity(6 + MOON_VERTEX_COUNT + geometry.star_field.len() * 6);
 
     // Sun and moon directions are placeholders: the shader replaces them with
     // the per-frame uniform directions, so the static buffer stays valid all
-    // day. Their colors and angular sizes are fixed.
-    for v in SkyVertex::quad(Vec3::X, daycycle::SUN_ANGULAR_SIZE, SUN_COLOR, KIND_SUN) {
+    // day. Their colors are fixed; their angular sizes come from the host.
+    for v in SkyVertex::quad(Vec3::X, geometry.sun_angular_size, SUN_COLOR, KIND_SUN) {
         verts.push(v);
     }
-    for v in SkyVertex::quad(-Vec3::X, daycycle::MOON_ANGULAR_SIZE, MOON_COLOR, KIND_MOON) {
+    for v in SkyVertex::quad(-Vec3::X, geometry.moon_angular_size, MOON_COLOR, KIND_MOON) {
         verts.push(v);
     }
-    for star in star_field {
-        for v in SkyVertex::quad(*star, daycycle::STAR_ANGULAR_SIZE, STAR_COLOR, KIND_STAR) {
+    for star in &geometry.star_field {
+        for v in SkyVertex::quad(*star, geometry.star_angular_size, STAR_COLOR, KIND_STAR) {
             verts.push(v);
         }
     }
@@ -261,10 +269,10 @@ pub fn create_sky_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLay
     })
 }
 
-/// Create the sky uniform buffer initialised to the default noon sky.
+/// Create the sky uniform buffer initialised to [`SkyUniform::default`].
 pub fn create_sky_uniform_buffer(device: &wgpu::Device) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
-    let uniform = SkyUniform::from_time(daycycle::DEFAULT_TIME_OF_DAY);
+    let uniform = SkyUniform::default();
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("sky_uniform_buffer"),
         contents: bytemuck::bytes_of(&uniform),
@@ -289,16 +297,14 @@ pub fn create_sky_bind_group(
 
 /// Build the static sky vertex buffer (sun quad + moon quad + every star
 /// quad) once at renderer construction.
-pub fn create_sky_vertex_buffer(device: &wgpu::Device, star_field: &[Vec3]) -> (wgpu::Buffer, u32) {
+pub fn create_sky_vertex_buffer(device: &wgpu::Device, geometry: &SkyGeometry) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
-    let vertices = build_sky_vertices(star_field);
-    let count = vertices.len() as u32;
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let vertices = build_sky_vertices(geometry);
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("sky_vertex_buffer"),
         contents: bytemuck::cast_slice(&vertices),
         usage: wgpu::BufferUsages::VERTEX,
-    });
-    (buffer, count)
+    })
 }
 
 /// Sky pipeline: alpha-blended, double-sided camera-relative billboards with
@@ -385,7 +391,7 @@ pub fn create_sky_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::camera::Camera;
+    use opencraft_core::camera::Camera;
 
     #[test]
     fn sky_uniform_is_three_16_byte_aligned_vec4s() {
@@ -394,32 +400,6 @@ mod tests {
         assert_eq!(std::mem::offset_of!(SkyUniform, sun_dir), 0);
         assert_eq!(std::mem::offset_of!(SkyUniform, moon_dir), 16);
         assert_eq!(std::mem::offset_of!(SkyUniform, params), 32);
-    }
-
-    #[test]
-    fn sky_uniform_from_time_tracks_the_pure_day_cycle() {
-        let noon = SkyUniform::from_time(daycycle::DEFAULT_TIME_OF_DAY);
-        assert!(
-            (noon.sun_dir[1] - 1.0).abs() < 1e-5,
-            "noon sun is at zenith"
-        );
-        assert!((noon.params[0] - 1.0).abs() < 1e-5, "noon sun is bright");
-        assert_eq!(noon.params[2], 0.0, "no stars at noon");
-
-        let midnight =
-            SkyUniform::from_time(daycycle::DAY_TICKS / 2 + daycycle::DEFAULT_TIME_OF_DAY);
-        assert!(
-            (midnight.moon_dir[1] - 1.0).abs() < 1e-5,
-            "midnight moon is at zenith"
-        );
-        assert!(
-            (midnight.params[1] - 1.0).abs() < 1e-5,
-            "midnight moon is bright"
-        );
-        assert!(
-            (midnight.params[2] - 1.0).abs() < 1e-5,
-            "midnight star visibility is full"
-        );
     }
 
     #[test]
@@ -449,7 +429,13 @@ mod tests {
 
     #[test]
     fn build_sky_vertices_handles_an_empty_star_field() {
-        let verts = build_sky_vertices(&[]);
+        let geometry = SkyGeometry {
+            star_field: Vec::new(),
+            sun_angular_size: 0.06,
+            moon_angular_size: 0.045,
+            star_angular_size: 0.002,
+        };
+        let verts = build_sky_vertices(&geometry);
         assert_eq!(
             verts.len(),
             6 + MOON_VERTEX_COUNT,
@@ -460,116 +446,6 @@ mod tests {
             verts.iter().filter(|v| v.kind == KIND_MOON).count(),
             MOON_VERTEX_COUNT
         );
-    }
-
-    #[test]
-    fn sky_uniform_from_time_wraps_and_stays_finite() {
-        let dawn = SkyUniform::from_time(0);
-        assert_eq!(
-            bytemuck::bytes_of(&dawn),
-            bytemuck::bytes_of(&SkyUniform::from_time(daycycle::DAY_TICKS))
-        );
-        assert_eq!(
-            bytemuck::bytes_of(&SkyUniform::from_time(1_000)),
-            bytemuck::bytes_of(&SkyUniform::from_time(daycycle::DAY_TICKS + 1_000))
-        );
-
-        // Sweep the whole cycle plus out-of-range values: no NaN/inf may reach
-        // the uniform, and every field stays in its documented range.
-        for time in (0..=daycycle::DAY_TICKS * 2).step_by(250) {
-            let u = SkyUniform::from_time(time);
-            for value in u
-                .sun_dir
-                .iter()
-                .chain(u.moon_dir.iter())
-                .chain(u.params.iter())
-            {
-                assert!(value.is_finite(), "non-finite uniform field at t={time}");
-            }
-            for brightness in &u.params[0..3] {
-                assert!(
-                    (0.0..=1.0).contains(brightness),
-                    "brightness out of range at t={time}: {brightness}"
-                );
-            }
-            assert!((u.sun_dir[0].hypot(u.sun_dir[1]) - 1.0).abs() < 1e-4);
-            assert!((u.moon_dir[0].hypot(u.moon_dir[1]) - 1.0).abs() < 1e-4);
-        }
-    }
-
-    #[test]
-    fn build_sky_vertices_emits_body_geometry_and_star_quads() {
-        let stars = daycycle::generate_star_field();
-        let verts = build_sky_vertices(&stars);
-        let star_base = 6 + MOON_VERTEX_COUNT;
-
-        assert_eq!(stars.len(), daycycle::STAR_COUNT);
-        assert_eq!(verts.len(), star_base + stars.len() * 6);
-        assert_eq!(
-            &verts[0..6].iter().map(|v| v.kind).collect::<Vec<_>>(),
-            &[KIND_SUN; 6]
-        );
-        assert_eq!(
-            &verts[6..star_base]
-                .iter()
-                .map(|v| v.kind)
-                .collect::<Vec<_>>(),
-            &[KIND_MOON; MOON_VERTEX_COUNT]
-        );
-        assert!(verts[star_base..].iter().all(|v| v.kind == KIND_STAR));
-
-        for (i, star) in stars.iter().enumerate() {
-            let base = star_base + i * 6;
-            for v in &verts[base..base + 6] {
-                assert_eq!(Vec3::from(v.dir), *star);
-                assert_eq!(v.size, daycycle::STAR_ANGULAR_SIZE);
-            }
-        }
-    }
-
-    #[test]
-    fn moon_geometry_is_a_static_square_quad() {
-        let verts = build_sky_vertices(&[]);
-        let moon: Vec<SkyVertex> = verts
-            .iter()
-            .copied()
-            .filter(|v| v.kind == KIND_MOON)
-            .collect();
-
-        assert_eq!(moon.len(), MOON_VERTEX_COUNT);
-        assert_eq!(MOON_VERTEX_COUNT, 6, "the moon is a single quad");
-
-        // The square must use exactly the six shared quad corners, including
-        // the four diagonal (-1,-1) style corners a crescent never reaches.
-        for corner in QUAD_CORNERS {
-            assert!(
-                moon.iter().any(|v| v.corner == corner),
-                "missing square corner {corner:?}"
-            );
-        }
-
-        // Identity is belt-and-braces: square silhouette plus smaller size
-        // plus a cool, dim tint that is clearly not the warm-white sun.
-        for v in &moon {
-            assert_eq!(v.color, MOON_COLOR);
-            assert_eq!(v.size, daycycle::MOON_ANGULAR_SIZE);
-            assert_eq!(
-                Vec3::from(v.dir),
-                -Vec3::X,
-                "moon dir is a shader placeholder"
-            );
-        }
-        const {
-            assert!(MOON_COLOR[2] > MOON_COLOR[0], "moon tint must be cool");
-            assert!(
-                MOON_COLOR[0] < SUN_COLOR[0],
-                "moon tint must be dimmer than the sun"
-            );
-            assert!(
-                daycycle::MOON_ANGULAR_SIZE < daycycle::SUN_ANGULAR_SIZE,
-                "the moon must be smaller than the sun"
-            );
-        }
     }
 
     #[test]
@@ -648,18 +524,6 @@ mod tests {
             !SKY_SHADER_WGSL.contains("in.kind != 0.0")
                 && !SKY_SHADER_WGSL.contains("in.kind > 0.5"),
             "the mask must be star-only, never applied to sun/moon"
-        );
-    }
-
-    #[test]
-    fn default_scene_golden_hour_never_shows_stars() {
-        // The deterministic demo scene renders at the golden hour, where the
-        // sun is still up: star visibility (and therefore the materialised
-        // mask) is zero. A persisted background may render night instead.
-        assert_eq!(
-            SkyUniform::from_time(daycycle::VISTA_GOLDEN_HOUR).params[2],
-            0.0,
-            "the default scene's golden hour never shows stars, so the mask is a no-op there"
         );
     }
 }

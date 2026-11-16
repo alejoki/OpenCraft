@@ -164,7 +164,7 @@ pub fn format_frame_budget_digest(samples: &[Duration]) -> Option<String> {
 ///
 /// HONESTY NOTE (S08-T01): the samples are real wall dt from the frame loop.
 /// Default settings run `vsync = false`, which requests the uncapped
-/// `Immediate` present mode (`render::context::preferred_present_mode`), so a
+/// `Immediate` present mode (the gfx context's present-mode policy), so a
 /// frame's dt measures the work of that frame rather than a display refresh
 /// wait. The p95 <= 16.6 ms claim is therefore only meaningful at default
 /// settings; a vsync-on run is paced by the compositor and would report the

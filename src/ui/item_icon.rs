@@ -30,8 +30,8 @@ use crate::content::{ContentRegistry, PACK_ICON_BASE, PACK_ICON_CAP};
 use crate::player::inventory::{
     Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
 };
-use crate::render::context::RenderContext;
 use crate::world::block::BlockId;
+use opencraft_gfx::context::RenderContext;
 
 /// Fraction of the icon's smaller edge kept as empty padding on each side.
 pub const ICON_INSET_FRACTION: f32 = 0.15;
@@ -1456,7 +1456,7 @@ fn create_item_sprite_array(
 ///
 /// * `block` — three-face cubes sampling the world's block texture array (the
 ///   view/sampler borrowed at construction from
-///   [`crate::render::pipeline::VoxelRenderer`]).
+///   [`opencraft_gfx::pipeline::VoxelRenderer`]).
 /// * `sprite` — flat material/tool quads sampling the UI-only procedural sprite
 ///   array, generated and uploaded internally in [`Self::new`].
 ///
@@ -2612,7 +2612,7 @@ mod tests {
         assert!(ui_block.contains("&renderer.block_texture_view"));
         assert!(ui_block.contains("&renderer.block_texture_sampler"));
         let renderer_at = src
-            .find("let renderer = VoxelRenderer::new(&ctx);")
+            .find("let renderer = VoxelRenderer::new(&ctx, BLOCK_ARRAY_SPEC, sky_geometry());")
             .expect("renderer construction exists");
         assert!(
             renderer_at < ui_at,

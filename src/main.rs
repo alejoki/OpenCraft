@@ -100,11 +100,10 @@ use opencraft::player::physics::Player;
 use opencraft::player::physics::PLAYER_EYE_HEIGHT;
 use opencraft::player::physics::{InputState, InventoryCommandError};
 use opencraft::player::raycast::raycast_voxels;
-use opencraft::render::buffer::ChunkRenderStore;
-use opencraft::render::context::RenderContext;
 use opencraft::render::mob::{build_mob_batch_into, MobVertex};
-use opencraft::render::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
-use opencraft::render::texture::{compose_block_array_layers, generate_all_texture_layers_rgba};
+use opencraft::render::texture::{
+    compose_block_array_layers, generate_all_texture_layers_rgba, BLOCK_ARRAY_SPEC,
+};
 use opencraft::settings::keybind::key_to_string;
 use opencraft::settings::{
     load_with_warnings, Keybinds, Settings, SettingsWarning, DEFAULT_SETTINGS_PATH, VOLUME_MAX,
@@ -211,6 +210,9 @@ use opencraft::world::terrain::{ruin_loot_chest_at, SEA_LEVEL};
 use opencraft::world::village::VillageCatalog;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
+use opencraft_gfx::buffer::ChunkRenderStore;
+use opencraft_gfx::context::RenderContext;
+use opencraft_gfx::pipeline::{FramePresentation, FrameView, SkyParams, UiPass, VoxelRenderer};
 
 /// Top-left corner of the stats overlay text, in physical pixels.
 const OVERLAY_TEXT_LEFT: f32 = 8.0;
@@ -851,6 +853,43 @@ fn session_mining_target(
 /// engine handle. Called once per session frame; as a no-op the call is free.
 fn weather_ambient_hook(_weather: Weather) {}
 
+/// The per-frame 48-byte sky uniform derived from a game time.
+///
+/// The pure celestial math stays in [`daycycle`]; this helper only packs it
+/// into the neutral [`opencraft_gfx::sky::SkyUniform`] that the renderer
+/// uploads verbatim. `daycycle` remains the sole owner of the formulas.
+fn sky_uniform_from_time(time_of_day: u32) -> opencraft_gfx::sky::SkyUniform {
+    let sun = daycycle::sun_direction(time_of_day);
+    let moon = daycycle::moon_direction(time_of_day);
+    // Same rotation the sun follows, recovered from its direction so the
+    // formula lives in exactly one place (daycycle).
+    let star_angle = sun.y.atan2(sun.x);
+    opencraft_gfx::sky::SkyUniform {
+        sun_dir: [sun.x, sun.y, sun.z, 0.0],
+        moon_dir: [moon.x, moon.y, moon.z, 0.0],
+        params: [
+            daycycle::sun_brightness(time_of_day),
+            daycycle::moon_brightness(time_of_day),
+            daycycle::star_visibility(time_of_day),
+            star_angle,
+        ],
+    }
+}
+
+/// Static sky geometry built once from the day-cycle constants.
+///
+/// The crate owns the billboard expansion; the host owns the deterministic
+/// star seed and the angular sizes. Passed into `VoxelRenderer::new` at
+/// startup.
+fn sky_geometry() -> opencraft_gfx::sky::SkyGeometry {
+    opencraft_gfx::sky::SkyGeometry {
+        star_field: daycycle::generate_star_field(),
+        sun_angular_size: daycycle::SUN_ANGULAR_SIZE,
+        moon_angular_size: daycycle::MOON_ANGULAR_SIZE,
+        star_angular_size: daycycle::STAR_ANGULAR_SIZE,
+    }
+}
+
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
 /// Session frames use the live clock's weather-tinted palette *and* its
@@ -869,14 +908,15 @@ fn sky_params(
     weather_phase: f32,
 ) -> SkyParams {
     SkyParams {
-        time_of_day,
+        celestial: sky_uniform_from_time(time_of_day),
         underwater,
         day_factor: palette.day_factor,
         // Weather travels through the same grouped struct so render_frame's
         // 10-argument signature did not grow. Only the session arm feeds live
         // values; the vista arm pins Clear / 1.0 / 0.0 so the panorama stays
-        // byte-identical to pre-S06 output and never draws precipitation.
-        weather,
+        // byte-identical to pre-S06 output and never draws precipitation. The
+        // game enum maps to the crate's neutral value here, at the seam.
+        weather: weather.precipitation(),
         fog_range_factor,
         weather_phase,
         fog_color: [
@@ -4096,8 +4136,19 @@ impl ApplicationHandler for GameApp {
                 .expect("Failed to create window"),
         );
 
-        let mut ctx = RenderContext::new(window.clone());
-        let renderer = VoxelRenderer::new(&ctx);
+        // The game owns the window, instance and surface; `opencraft-gfx`
+        // owns the adapter, device, queue, surface configuration and depth
+        // attachment.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let size = window.inner_size();
+        #[rustfmt::skip]
+        let surface = instance.create_surface(window.clone()).expect("Failed to create wgpu surface");
+        #[rustfmt::skip]
+        let ctx = RenderContext::new(instance, surface, size.width, size.height, self.settings.vsync);
+        let renderer = VoxelRenderer::new(&ctx, BLOCK_ARRAY_SPEC, sky_geometry());
         // Re-apply the persisted texture pack to the freshly created GPU
         // texture (M004/S03): the renderer is still a local here, so the
         // initial upload reuses the same live-apply path as cycling. A
@@ -4205,14 +4256,11 @@ impl ApplicationHandler for GameApp {
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
-        // fullscreen when enabled, and the Fifo present mode when vsync is
-        // on (RenderContext::new prefers uncapped Immediate, which matches
-        // the vsync=false default — only vsync=true needs the override).
+        // fullscreen when enabled. The vsync setting is passed into
+        // `RenderContext::new`, so the surface is configured with the right
+        // present mode from the first frame.
         if self.settings.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
-        if self.settings.vsync {
-            apply_vsync(&mut ctx, true);
         }
 
         // Startup cursor state follows the lifecycle screen set in
@@ -4276,7 +4324,7 @@ impl ApplicationHandler for GameApp {
                 self.melee.reset();
             }
             WindowEvent::Resized(new_size) => {
-                gpu.ctx.resize(new_size);
+                gpu.ctx.resize(new_size.width, new_size.height);
                 // The creator overlay wraps at the surface width, so a resize
                 // must recompose it even when its text is unchanged.
                 self.creator_overlay_dirty = true;
@@ -6709,6 +6757,7 @@ impl ApplicationHandler for GameApp {
                             target_block: None,
                             selection_box: None,
                             selected_slot: self.session.player.selected_slot(),
+                            hotbar_rects: &[],
                         },
                         FramePresentation {
                             show_overlays: false,
@@ -6750,6 +6799,7 @@ impl ApplicationHandler for GameApp {
                     // the slice empty and therefore produces no GPU buffer
                     // allocation inside render_frame.
                     let aspect = gpu.ctx.config.width as f32 / gpu.ctx.config.height.max(1) as f32;
+                    let hotbar_rects = opencraft::ui::hud::hotbar_slot_ndc_rects(aspect);
                     build_mob_batch_into(
                         &mut self.mob_vertices,
                         &self.session,
@@ -6766,6 +6816,7 @@ impl ApplicationHandler for GameApp {
                             target_block,
                             selection_box: self.capture.selection_box(),
                             selected_slot: self.session.player.selected_slot(),
+                            hotbar_rects: &hotbar_rects,
                         },
                         FramePresentation {
                             show_overlays: playing,
@@ -6853,7 +6904,8 @@ impl ApplicationHandler for GameApp {
                         }
                     }
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        gpu.ctx.resize(gpu.ctx.size);
+                        let (width, height) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        gpu.ctx.resize(width, height);
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
                         let _ = save_current_world(&mut self.session);
@@ -7459,6 +7511,7 @@ mod tests {
     use opencraft::world::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
     use opencraft::world::season::{weather_of, Season, WeatherRules};
     use opencraft::world::terrain::generate_chunk_seeded;
+    use opencraft_gfx::weather::Precipitation;
     use rustc_hash::FxHashMap;
     use std::path::PathBuf;
 
@@ -21224,14 +21277,18 @@ stack = 64
                 daycycle::CLEAR_FOG_RANGE_FACTOR,
                 0.0,
             );
-            assert_eq!(params.time_of_day, tick);
+            assert_eq!(
+                bytemuck::bytes_of(&params.celestial),
+                bytemuck::bytes_of(&sky_uniform_from_time(tick)),
+                "the render inputs must carry the day-cycle celestial state"
+            );
             assert_eq!(params.clear_color.r, sky[0] as f64);
             assert_eq!(params.clear_color.g, sky[1] as f64);
             assert_eq!(params.clear_color.b, sky[2] as f64);
             assert_eq!(params.clear_color.a, 1.0);
             assert_eq!(params.fog_color, [fog[0], fog[1], fog[2], 1.0]);
             // The Clear identity keeps the pre-S06 dry path unchanged.
-            assert_eq!(params.weather, Weather::Clear);
+            assert_eq!(params.weather, Precipitation::Clear);
             assert_eq!(params.fog_range_factor, 1.0);
             assert_eq!(params.weather_phase, 0.0);
         }
@@ -21260,6 +21317,176 @@ stack = 64
         );
         assert_eq!(midnight.day_factor, night.day_factor);
         assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
+    #[test]
+    fn sky_uniform_from_time_tracks_the_pure_day_cycle() {
+        let noon = sky_uniform_from_time(daycycle::DEFAULT_TIME_OF_DAY);
+        assert!(
+            (noon.sun_dir[1] - 1.0).abs() < 1e-5,
+            "noon sun is at zenith"
+        );
+        assert!((noon.params[0] - 1.0).abs() < 1e-5, "noon sun is bright");
+        assert_eq!(noon.params[2], 0.0, "no stars at noon");
+
+        let midnight =
+            sky_uniform_from_time(daycycle::DAY_TICKS / 2 + daycycle::DEFAULT_TIME_OF_DAY);
+        assert!(
+            (midnight.moon_dir[1] - 1.0).abs() < 1e-5,
+            "midnight moon is at zenith"
+        );
+        assert!(
+            (midnight.params[1] - 1.0).abs() < 1e-5,
+            "midnight moon is bright"
+        );
+        assert!(
+            (midnight.params[2] - 1.0).abs() < 1e-5,
+            "midnight star visibility is full"
+        );
+    }
+
+    #[test]
+    fn sky_uniform_from_time_wraps_and_stays_finite() {
+        let dawn = sky_uniform_from_time(0);
+        assert_eq!(
+            bytemuck::bytes_of(&dawn),
+            bytemuck::bytes_of(&sky_uniform_from_time(daycycle::DAY_TICKS))
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&sky_uniform_from_time(1_000)),
+            bytemuck::bytes_of(&sky_uniform_from_time(daycycle::DAY_TICKS + 1_000))
+        );
+
+        // Sweep the whole cycle plus out-of-range values: no NaN/inf may reach
+        // the uniform, and every field stays in its documented range.
+        for time in (0..=daycycle::DAY_TICKS * 2).step_by(250) {
+            let u = sky_uniform_from_time(time);
+            for value in u
+                .sun_dir
+                .iter()
+                .chain(u.moon_dir.iter())
+                .chain(u.params.iter())
+            {
+                assert!(value.is_finite(), "non-finite uniform field at t={time}");
+            }
+            for brightness in &u.params[0..3] {
+                assert!(
+                    (0.0..=1.0).contains(brightness),
+                    "brightness out of range at t={time}: {brightness}"
+                );
+            }
+            assert!((u.sun_dir[0].hypot(u.sun_dir[1]) - 1.0).abs() < 1e-4);
+            assert!((u.moon_dir[0].hypot(u.moon_dir[1]) - 1.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn build_sky_vertices_emits_body_geometry_and_star_quads() {
+        let geometry = sky_geometry();
+        let stars = geometry.star_field.clone();
+        let verts = opencraft_gfx::sky::build_sky_vertices(&geometry);
+        let star_base = 6 + opencraft_gfx::sky::MOON_VERTEX_COUNT;
+
+        assert_eq!(geometry.sun_angular_size, daycycle::SUN_ANGULAR_SIZE);
+        assert_eq!(geometry.moon_angular_size, daycycle::MOON_ANGULAR_SIZE);
+        assert_eq!(geometry.star_angular_size, daycycle::STAR_ANGULAR_SIZE);
+        assert_eq!(stars.len(), daycycle::STAR_COUNT);
+        assert_eq!(verts.len(), star_base + stars.len() * 6);
+        assert_eq!(
+            &verts[0..6].iter().map(|v| v.kind).collect::<Vec<_>>(),
+            &[opencraft_gfx::sky::KIND_SUN; 6]
+        );
+        assert_eq!(
+            &verts[6..star_base]
+                .iter()
+                .map(|v| v.kind)
+                .collect::<Vec<_>>(),
+            &[opencraft_gfx::sky::KIND_MOON; opencraft_gfx::sky::MOON_VERTEX_COUNT]
+        );
+        assert!(verts[star_base..]
+            .iter()
+            .all(|v| v.kind == opencraft_gfx::sky::KIND_STAR));
+
+        for (i, star) in stars.iter().enumerate() {
+            let base = star_base + i * 6;
+            for v in &verts[base..base + 6] {
+                assert_eq!(Vec3::from(v.dir), *star);
+                assert_eq!(v.size, daycycle::STAR_ANGULAR_SIZE);
+            }
+        }
+    }
+
+    #[test]
+    fn moon_geometry_is_a_static_square_quad() {
+        // The square must use exactly the six shared quad corners, including
+        // the four diagonal (-1,-1) style corners a crescent never reaches.
+        const SQUARE_CORNERS: [[f32; 2]; 6] = [
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+        ];
+        const MOON_TINT: [f32; 4] = [0.62, 0.68, 0.82, 1.0];
+        const SUN_TINT: [f32; 4] = [1.0, 0.96, 0.80, 1.0];
+
+        let geometry = sky_geometry();
+        let verts = opencraft_gfx::sky::build_sky_vertices(&geometry);
+        let moon: Vec<opencraft_gfx::sky::SkyVertex> = verts
+            .iter()
+            .copied()
+            .filter(|v| v.kind == opencraft_gfx::sky::KIND_MOON)
+            .collect();
+
+        assert_eq!(moon.len(), opencraft_gfx::sky::MOON_VERTEX_COUNT);
+        assert_eq!(
+            opencraft_gfx::sky::MOON_VERTEX_COUNT,
+            6,
+            "the moon is a single quad"
+        );
+
+        for corner in SQUARE_CORNERS {
+            assert!(
+                moon.iter().any(|v| v.corner == corner),
+                "missing square corner {corner:?}"
+            );
+        }
+
+        // Identity is belt-and-braces: square silhouette plus smaller size
+        // plus a cool, dim tint that is clearly not the warm-white sun.
+        for v in &moon {
+            assert_eq!(v.color, MOON_TINT);
+            assert_eq!(v.size, daycycle::MOON_ANGULAR_SIZE);
+            assert_eq!(
+                Vec3::from(v.dir),
+                -Vec3::X,
+                "moon dir is a shader placeholder"
+            );
+        }
+        const {
+            assert!(MOON_TINT[2] > MOON_TINT[0], "moon tint must be cool");
+            assert!(
+                MOON_TINT[0] < SUN_TINT[0],
+                "moon tint must be dimmer than the sun"
+            );
+            assert!(
+                daycycle::MOON_ANGULAR_SIZE < daycycle::SUN_ANGULAR_SIZE,
+                "the moon must be smaller than the sun"
+            );
+        }
+    }
+
+    #[test]
+    fn default_scene_golden_hour_never_shows_stars() {
+        // The deterministic demo scene renders at the golden hour, where the
+        // sun is still up: star visibility (and therefore the materialised
+        // mask) is zero. A persisted background may render night instead.
+        assert_eq!(
+            sky_uniform_from_time(daycycle::VISTA_GOLDEN_HOUR).params[2],
+            0.0,
+            "the default scene's golden hour never shows stars, so the mask is a no-op there"
+        );
     }
 
     /// S06-T04: session weather is exactly the pure calendar derivation over
@@ -21384,7 +21611,7 @@ stack = 64
             daycycle::weather_fog_range_factor(Weather::Rain),
             12_345.5,
         );
-        assert_eq!(params.weather, Weather::Rain);
+        assert_eq!(params.weather, Precipitation::Rain);
         assert_eq!(params.fog_range_factor, 0.75);
         assert_eq!(params.weather_phase, 12_345.5);
         assert_eq!(params.clear_color.r, tinted.sky_color[0] as f64);
@@ -21397,10 +21624,11 @@ stack = 64
         let vista_time = 9_000;
         let vista = vista_sky_params(daycycle::sky_palette(vista_time), vista_time);
         assert_eq!(
-            vista.time_of_day, vista_time,
+            bytemuck::bytes_of(&vista.celestial),
+            bytemuck::bytes_of(&sky_uniform_from_time(vista_time)),
             "the menu scene clock reaches SkyParams, never a pinned constant"
         );
-        assert_eq!(vista.weather, Weather::Clear);
+        assert_eq!(vista.weather, Precipitation::Clear);
         assert_eq!(vista.fog_range_factor, 1.0);
         assert_eq!(vista.weather_phase, 0.0);
         assert!(!vista.underwater);
@@ -21416,6 +21644,89 @@ stack = 64
         assert!(
             vista_arm.contains("vista_sky_params(palette, self.background.clock.time_of_day)"),
             "menu frames must render through the scene clock and Clear-weather sky inputs"
+        );
+    }
+
+    #[test]
+    fn menu_sky_params_follow_the_background_scene_and_stay_dry() {
+        // Vista sky inputs are derived from the background scene's own clock,
+        // so the celestial uniform tracks that clock rather than a pinned
+        // constant (D091); weather stays Clear and the fog factor identity, so
+        // the panorama never draws precipitation.
+        for vista_time in [daycycle::VISTA_GOLDEN_HOUR, 0, 12_000] {
+            let vista = vista_sky_params(daycycle::sky_palette(vista_time), vista_time);
+            assert_eq!(
+                bytemuck::bytes_of(&vista.celestial),
+                bytemuck::bytes_of(&sky_uniform_from_time(vista_time)),
+                "the menu scene clock must reach the celestial uniform"
+            );
+            assert_eq!(vista.weather, Precipitation::Clear);
+            assert_eq!(vista.fog_range_factor, 1.0);
+            assert_eq!(vista.weather_phase, 0.0);
+            assert!(!vista.underwater);
+        }
+
+        // Source pin: the menu arm must go through `vista_sky_params` with the
+        // background scene's own clock and anchor (D091), while the session arm
+        // passes the live clock plus the per-frame weather derivation. The menu
+        // helper pins weather Clear and the identity fog factor, so the
+        // panorama never draws precipitation.
+        let src = include_str!("main.rs");
+        // Build scan needles at runtime: plain literals would match themselves
+        // inside this included `main.rs` source.
+        let menu_clock_call = [
+            "vista_sky_params(palette,",
+            " self.background.clock.time_of_day)",
+        ]
+        .concat();
+        assert!(
+            src.contains(&menu_clock_call),
+            "menu frames must follow the background scene clock and stay dry"
+        );
+        // Whitespace-insensitive copy for chained calls that rustfmt wraps.
+        let compact: String = src.split_whitespace().collect();
+        assert!(
+            src.contains("self.background.anchor"),
+            "the menu camera must anchor at the background scene's saved eye position"
+        );
+        assert!(
+            compact.contains(
+                "self.background.world.update_streaming(vista_chunk,self.background.season())"
+            ),
+            "menu streaming must use the background world and its saved-calendar season"
+        );
+        assert!(
+            src.contains("self.background.world.render_distance(),"),
+            "menu rendering must use the background world's render distance"
+        );
+        let golden_palette = ["vista_sky_params(palette,", "daycycle::VISTA_GOLDEN_HOUR)"].concat();
+        let golden_call = [
+            "vista_sky_params(daycycle::sky_palette(",
+            "daycycle::VISTA_GOLDEN_HOUR))",
+        ]
+        .concat();
+        let vista_season = ["update_streaming(vista_chunk,", "vista::VISTA_SEASON)"].concat();
+        assert!(
+            !compact.contains(&golden_palette)
+                && !compact.contains(&golden_call)
+                && !compact.contains(&vista_season),
+            "VISTA_GOLDEN_HOUR / VISTA_SEASON are default-scene values, never render-time menu constants"
+        );
+        assert!(
+            src.contains("let weather = session_weather(&self.session);"),
+            "session frames must derive weather per frame from the calendar"
+        );
+        assert!(
+            src.contains("weather_ambient_hook(weather);"),
+            "the session arm must exercise the empty ambient-audio seam"
+        );
+        assert!(
+            src.contains("self.session.clock.cycle_phase(),"),
+            "the weather phase must follow the live game clock"
+        );
+        assert!(
+            src.contains("eye_is_submerged(&self.session.world, self.session.camera.position)"),
+            "the session arm must derive the flag from the live eye position"
         );
     }
 
@@ -29148,6 +29459,42 @@ selected_name_secs = 0.5
         assert!(
             poll.contains("self.creator_overlay_dirty = true"),
             "a settled or pending-change reload must recompose the overlay"
+        );
+    }
+
+    #[test]
+    fn resumed_creates_the_surface_and_resize_forwards_both_dimensions() {
+        let source = include_str!("main.rs");
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        let resumed_flat = resumed.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            resumed_flat.contains("instance.create_surface(window.clone())"),
+            "the game must create the surface from the owned window handle"
+        );
+        assert!(
+            resumed_flat.contains(
+                "RenderContext::new(instance, surface, size.width, size.height, self.settings.vsync)"
+            ),
+            "resumed must pass the game-created instance, surface, dimensions and vsync to gfx"
+        );
+
+        let resized = source
+            .split("WindowEvent::Resized(new_size) =>")
+            .nth(1)
+            .expect("window_event must handle Resized")
+            .split("WindowEvent::KeyboardInput")
+            .next()
+            .expect("the Resized arm must end before KeyboardInput");
+        let resized_flat = resized.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            resized_flat.contains("gpu.ctx.resize(new_size.width, new_size.height)"),
+            "a resize must forward both dimensions to the gfx context"
         );
     }
 

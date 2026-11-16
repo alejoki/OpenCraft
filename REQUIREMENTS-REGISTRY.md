@@ -225,7 +225,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M005 / S02 day cycle and S03 sky pass
 - Primary owning slice: M005/S02
 - Supporting slices: M005/S03, M005/S07, M005/S08
-- Validation: cargo test --locked --lib -- world::daycycle (incl. NIGHTFALL/pre-dawn keyframe pins and dusk/midnight/dawn sRGB probe; S08 exhaustive step-1 sun-brightness-zero star-visibility sweep + boundary-tick pins + STAR_ANGULAR_SIZE ratio pins); cargo test --locked --lib -- render::sky (incl. square MOON_VERTEX_COUNT geometry pins and S08 kind-gated circular alpha mask WGSL pins); cargo test --locked --bin opencraft
+- Validation: cargo test --locked --lib -- world::daycycle (incl. NIGHTFALL/pre-dawn keyframe pins and dusk/midnight/dawn sRGB probe; S08 exhaustive step-1 sun-brightness-zero star-visibility sweep + boundary-tick pins + STAR_ANGULAR_SIZE ratio pins); cargo test -p opencraft-gfx --locked -- sky (incl. square MOON_VERTEX_COUNT geometry pins and S08 kind-gated circular alpha mask WGSL pins); cargo test --locked --bin opencraft
 
 ### R023 — Honest game-time clock: it advances only while Playing, freezes in every menu and pause, wraps at cycle end, and persists per world as a SAVE_VERSION 3 time-of-day field with v1/v2 migration to default noon, so Save-and-Quit resumes the exact time of day
 - Class: continuity
@@ -305,7 +305,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M007 / S04 translucent water
 - Primary owning slice: M007/S04
 - Supporting slices: None
-- Validation: cargo test --locked --lib -- render::buffer; cargo test --locked --lib -- render::pipeline; bash scripts/water_smoke.sh
+- Validation: cargo test -p opencraft-gfx --locked -- buffer; cargo test -p opencraft-gfx --locked -- pipeline; bash scripts/water_smoke.sh
 
 ### R031 — Seasonal worldgen surfaces and the bounded rollover wave
 - Class: core-capability
@@ -325,7 +325,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M007 / S06 weather
 - Primary owning slice: M007/S06
 - Supporting slices: None
-- Validation: cargo test --locked --lib -- render::weather; cargo test --locked --lib -- world::daycycle; cargo test --locked --bins -- weather; bash scripts/weather_smoke.sh
+- Validation: cargo test -p opencraft-gfx --locked -- weather; cargo test --locked --lib -- world::daycycle; cargo test --locked --bins -- weather; bash scripts/weather_smoke.sh
 
 ### R033 — Deterministic surface ruins with the present-but-empty loot seam
 - Class: core-capability
@@ -889,6 +889,46 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M015/S01, M015/S02, M015/S03, M015/S04, M015/S05, M015/S06
 - Validation: bash scripts/village_smoke.sh; SMOKE_PROFILE=release bash scripts/village_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo test --locked; cargo fmt --all -- --check; cargo clippy --locked --all-targets -- -D warnings
 
+### R089 — Neutral engine crate workspace and boundary contract
+- Class: integration
+- Status: active
+- Description: The root `opencraft` game package stays at the repository root; the workspace members `opencraft-core`, `opencraft-gfx`, `opencraft-physics`, `opencraft-pathfinding` and `engine-reuse-proof` live under `crates/`, each `publish = false` with an independent 0.1.0 version. No engine crate depends on `opencraft`; `opencraft-core` has no GPU or windowing dependency; `opencraft-gfx` has no `winit` and takes a game-created surface; physics and pathfinding query blocks only through `BlockQuery -> BlockKind`; and no `BlockId`, `ContentRegistry`, `Player`, `WorldSession` or `Mob` crosses into a crate. The game consumes gfx through a game-created `Instance` and `Surface<'static>`, physics through `BlockIdQuery`, and pathfinding steering through the same query, and the duplicate solver, geometry, raycast and mover bodies and the temporary `src/render` re-export facade are deleted.
+- Why it matters: Compiler-enforced reuse is the point of the split; one neutral boundary keeps the engine crates reusable outside the game package.
+- Source: M017 / S01-S09 engine partition and game migration
+- Primary owning slice: M017/S09
+- Supporting slices: M017/S01, M017/S02, M017/S03, M017/S04, M017/S05, M017/S06, M017/S07
+- Validation: cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo metadata --locked --no-deps --format-version 1; cargo tree --locked -p opencraft-core; cargo tree --locked -p opencraft-gfx; cargo tree --locked -p opencraft-physics; cargo tree --locked -p opencraft-pathfinding
+
+### R090 — Device-free external reuse proof
+- Class: differentiator
+- Status: active
+- Description: `crates/engine-reuse-proof` depends only on the four engine crates plus `glam 0.27`, compiles and runs headless, exercises a physics body, raycast and sweep, steering, deterministic A* and gfx CPU-side mesh, texture and model data, prints the deterministic 15-line `ProofReport`, never imports `opencraft`, never creates a GPU adapter or surface, and CI runs its tests explicitly.
+- Why it matters: A real external consumer is the only proof the crates are reusable without the game package or a GPU.
+- Source: M017 / S08 external reuse proof
+- Primary owning slice: M017/S09
+- Supporting slices: M017/S08
+- Validation: cargo test -p engine-reuse-proof --locked; cargo run -p engine-reuse-proof --locked; cargo tree --locked -p engine-reuse-proof --edges normal,build,dev; bash scripts/check_engine_boundaries.sh
+
+### R091 — Game migration without save or gameplay regression and the M017 closure surface
+- Class: launchability
+- Status: active
+- Description: v1-v9 saves load, v9 writes and reads byte-stably, `SAVE_VERSION` stays 9, and `.mcvx`, pack and worldgen formats are unchanged. The full workspace suite, all 23 smoke scripts and the demo digests are green, the 317-byte v9 witness is unchanged, frame p95 stays at or below 16.6 ms, and streaming and autosave distributions are re-reported rather than re-pinned. CI is green on Linux and Windows, clippy, fmt, release build, package and installer scripts are green, `docs/CRATES.md` records the layout, boundaries, neutral-API rules and M018 scope, and the registry carries R089-R092 plus the 10-row M017 trace with checker and selftest lockstep.
+- Why it matters: M017 must close without changing saves or gameplay, and the closure proof must be reproducible on the final tree.
+- Source: M017 / S09 closure and final operational verification
+- Primary owning slice: M017/S09
+- Supporting slices: M017/S01, M017/S02, M017/S03, M017/S04, M017/S05, M017/S06, M017/S07, M017/S08
+- Validation: bash scripts/ci_gate.sh; cargo test --workspace --locked; cargo test -p opencraft --locked --lib -- world::persistence; cargo test -p opencraft --locked --test save_v9_cli; cargo test --locked --release --test autosave_budget -- --ignored --nocapture; cargo test --locked --release --lib -- --ignored streaming_budget --nocapture; cargo test --locked --release --test village_frame_budget -- --ignored --nocapture; cargo build --release --locked; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
+### R092 — Constraint: no format, gameplay or threshold scope creep
+- Class: constraint
+- Status: active
+- Description: `SAVE_VERSION` stays 9 and `.mcvx`, pack and worldgen formats are unchanged; A* stays unwired in mob behavior; `daycycle` celestial math, texture layer identity, hotbar layout, procedural art and mob scene assembly stay game-side; only provably dead or duplicated code is deleted; no new external dependency is added without a decision; and no digest, witness or performance threshold is re-pinned without a decision and evidence.
+- Why it matters: The partition refactor must not smuggle in format, gameplay or threshold changes.
+- Source: M017 / S09 scope guardrails
+- Primary owning slice: M017/S09
+- Supporting slices: M017/S09
+- Validation: cargo test -p opencraft --locked --test save_v9_cli; cargo test -p opencraft --locked --lib -- world::persistence; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; git diff --exit-code -- tests/fixtures packs worldgen; ! rg -q find_path src; ! rg -q NavGrid src
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -1023,3 +1063,18 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 8 | R085, R087, R065 | S04, S06 | cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v9_cli; bash scripts/village_smoke.sh |
 | 9 | R088, R069 | S01, S02, S07 | bash scripts/village_smoke.sh; SMOKE_PROFILE=release bash scripts/village_smoke.sh; bash scripts/requirements_check.sh |
 | 10 | R082, R083 | S01, S02, S03, S05 | cargo test --locked --test worldgen_cli; cargo test --locked --test village_cli; cargo test --locked --test capture_cli |
+
+## M017 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R089 | S01, S02, S03, S04, S05, S06, S07, S08 | cargo test --workspace --locked && bash scripts/check_engine_boundaries.sh |
+| 2 | R089 | S01, S02, S03, S04, S05, S06, S07 | cargo metadata --locked --no-deps --format-version 1 && bash scripts/check_engine_boundaries.sh |
+| 3 | R089 | S02, S03, S04, S05, S06, S07 | cargo test --workspace --locked && bash scripts/launch_smoke.sh && bash scripts/combat_smoke.sh |
+| 4 | R090 | S08 | cargo test -p engine-reuse-proof --locked && cargo run -p engine-reuse-proof --locked && bash scripts/check_engine_boundaries.sh |
+| 5 | R089 | S03, S04, S05, S07 | ! rg -q find_path src && ! rg -q NavGrid src && cargo test --workspace --locked |
+| 6 | R091, R092 | S03, S09 | cargo test -p opencraft --locked --test save_v9_cli && cargo test -p opencraft --locked --lib -- world::persistence |
+| 7 | R091, R092 | S07, S09 | bash scripts/combat_smoke.sh && bash scripts/village_smoke.sh && bash scripts/presentation_smoke.sh |
+| 8 | R091 | S09 | bash scripts/ci_gate.sh && cargo build --release --locked |
+| 9 | R091 | S09 | cargo test --locked --release --test autosave_budget -- --ignored --nocapture && cargo test --locked --release --lib -- --ignored streaming_budget --nocapture && cargo test --locked --release --test village_frame_budget -- --ignored --nocapture |
+| 10 | R091 | S09 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && cargo test --workspace --locked |

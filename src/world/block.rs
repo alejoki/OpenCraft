@@ -1,3 +1,5 @@
+use opencraft_core::block::{BlockKind, BlockQuery};
+
 /// Stable block identity for built-in terrain plus registry-local modded
 /// content.
 ///
@@ -84,6 +86,18 @@ impl BlockId {
     #[inline]
     pub const fn is_solid(self) -> bool {
         !matches!(self, BlockId::Air | BlockId::Water)
+    }
+
+    /// Neutral kind of this block for engine crates that must not know block
+    /// identity: air is empty, water is liquid, and every other built-in and
+    /// modded id is solid.
+    #[inline]
+    pub const fn kind(self) -> BlockKind {
+        match self {
+            BlockId::Air => BlockKind::Empty,
+            BlockId::Water => BlockKind::Liquid,
+            _ => BlockKind::Solid,
+        }
     }
 
     /// Whether this block is a liquid volume rather than a solid block.
@@ -465,9 +479,34 @@ impl BlockId {
     }
 }
 
+/// Adapter from the game's block-identity lookup to the neutral
+/// [`BlockQuery`] contract consumed by the engine crates.
+pub struct BlockIdQuery<F>(pub F);
+
+impl<F: Fn(i32, i32, i32) -> BlockId> BlockQuery for BlockIdQuery<F> {
+    #[inline]
+    fn block_kind(&self, x: i32, y: i32, z: i32) -> BlockKind {
+        self.0(x, y, z).kind()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_id_query_adapter_maps_identity_to_kind() {
+        let world = |x: i32, y: i32, z: i32| match (x, y, z) {
+            (0, 0, 0) => BlockId::Air,
+            (1, 0, 0) => BlockId::Water,
+            (2, 0, 0) => BlockId::Stone,
+            _ => BlockId::Air,
+        };
+        let query = BlockIdQuery(world);
+        assert_eq!(query.block_kind(0, 0, 0), BlockKind::Empty);
+        assert_eq!(query.block_kind(1, 0, 0), BlockKind::Liquid);
+        assert_eq!(query.block_kind(2, 0, 0), BlockKind::Solid);
+    }
 
     /// One row of the frozen built-in contract: raw id, display name, six face
     /// texture layers, hardness, and mined drop.
@@ -696,6 +735,41 @@ mod tests {
                 "{block:?} container classification drifted"
             );
         }
+    }
+
+    #[test]
+    fn block_kind_maps_every_builtin_and_modded_id() {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            let expected = match block {
+                BlockId::Air => BlockKind::Empty,
+                BlockId::Water => BlockKind::Liquid,
+                _ => BlockKind::Solid,
+            };
+            assert_eq!(block.kind(), expected, "{block:?} neutral kind drifted");
+            // The neutral classification and the game predicates must agree.
+            assert_eq!(
+                block.kind().is_solid(),
+                block.is_solid(),
+                "{block:?} solidity drifted from kind"
+            );
+            assert_eq!(
+                block.kind().is_liquid(),
+                block.is_liquid(),
+                "{block:?} liquid classification drifted from kind"
+            );
+        }
+
+        // Modded ids are solid until the registry answers per-block.
+        for raw in [BUILTIN_BLOCK_COUNT, BUILTIN_BLOCK_COUNT + 1, u16::MAX] {
+            assert_eq!(BlockId::Modded(raw).kind(), BlockKind::Solid);
+        }
+
+        // Explicit anchors for the passable ids.
+        assert_eq!(BlockId::Air.kind(), BlockKind::Empty);
+        assert_eq!(BlockId::Water.kind(), BlockKind::Liquid);
+        assert_eq!(BlockId::Stone.kind(), BlockKind::Solid);
+        assert_eq!(BlockId::SocketMarker.kind(), BlockKind::Solid);
     }
 
     #[test]

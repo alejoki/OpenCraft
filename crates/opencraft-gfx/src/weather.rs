@@ -1,8 +1,8 @@
 //! Precipitation presentation layer: deterministic camera-relative rain
 //! streaks and snowfall flakes.
 //!
-//! Presentation follows the [`crate::render::sky`] static-billboard precedent
-//! exactly, because that pattern is deterministic by construction: a fixed-seed
+//! Presentation follows the [`crate::sky`] static-billboard precedent exactly,
+//! because that pattern is deterministic by construction: a fixed-seed
 //! pattern of drop quads fills a camera-relative box and is uploaded once at
 //! renderer construction. Per-frame state is a single 32-byte
 //! [`WeatherUniform`] (the live kind, the continuous clock phase and the
@@ -14,19 +14,29 @@
 //! to a degenerate transparent quad. Nothing here reads or writes blocks — the
 //! pattern is biome-agnostic, so precipitation renders over liquid oceans too.
 //!
-//! The clock phase comes from [`crate::world::daycycle::GameClock::cycle_phase`]
-//! (game time, never wall clock), so two runs with the same calendar render the
-//! same animation and a paused game freezes it.
+//! The host supplies the clock phase from its own game clock (never wall
+//! clock), so two runs with the same calendar render the same animation and a
+//! paused game freezes it. The host also resolves the [`Precipitation`] state
+//! for the frame; this module has no knowledge of seasons or calendars.
+
+use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 
-use crate::render::context::{RenderContext, DEPTH_FORMAT};
-use crate::world::season::Weather;
+use crate::context::{RenderContext, DEPTH_FORMAT};
+
+/// The precipitation state the host resolves for this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Precipitation {
+    Clear,
+    Rain,
+    Snowfall,
+}
 
 /// Fixed seed for [`build_weather_vertices`]; no wall-clock or global state.
 ///
-/// Mirrors the `STAR_SEED` precedent in [`crate::world::daycycle`]: the drop
+/// Mirrors the `STAR_SEED` precedent in the host day-cycle module: the drop
 /// pattern is identical on every launch and for every seed/world, because it is
 /// presentation only and must not depend on world state.
 pub const WEATHER_PATTERN_SEED: u32 = 0x5EED_7A1D;
@@ -72,8 +82,8 @@ pub const RAIN_COLOR: [f32; 4] = [0.60, 0.70, 0.85, 0.55];
 pub const SNOW_COLOR: [f32; 4] = [0.96, 0.98, 1.00, 0.85];
 
 /// Six corners of a quad in `-1..1`, expanded to two triangles. Same
-/// no-index-buffer expansion precedent as `src/render/sky.rs` and
-/// `src/ui/quad.rs`.
+/// no-index-buffer expansion precedent as [`crate::sky`] and the host's UI
+/// quad stage.
 const QUAD_CORNERS: [[f32; 2]; 6] = [
     [-1.0, -1.0],
     [1.0, -1.0],
@@ -100,7 +110,7 @@ pub const WEATHER_VERTEX_COUNT: u32 = RAIN_VERTEX_COUNT + SNOW_VERTEX_COUNT;
 /// `size` is the billboard half-width in blocks. `color.rgb` is a per-drop
 /// multiplier and `color.a` a per-drop alpha variation; the kind tint lives in
 /// [`WeatherUniform`]. The field order and offsets deliberately mirror
-/// [`crate::render::sky::SkyVertex`], so the vertex buffer layout is the same
+/// [`crate::sky::SkyVertex`], so the vertex buffer layout is the same
 /// shape.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -143,23 +153,24 @@ pub struct WeatherUniform {
 }
 
 impl WeatherUniform {
-    /// Derive the whole uniform from the day's weather and the clock phase.
+    /// Derive the whole uniform from the precipitation state and the clock
+    /// phase.
     ///
     /// Clear writes an invisible rain configuration (zero alpha): the draw is
     /// skipped upstream, and if it ever runs anyway the fragment still fades
     /// to nothing instead of showing a stray streak. Pure and total — every
     /// input yields finite fields.
-    pub fn from_weather(weather: Weather, phase: f32) -> Self {
-        match weather {
-            Weather::Clear => Self {
+    pub fn from_precipitation(precipitation: Precipitation, phase: f32) -> Self {
+        match precipitation {
+            Precipitation::Clear => Self {
                 params: [KIND_RAIN as f32, phase, RAIN_FALL_SPEED, RAIN_STRETCH],
                 tint: [0.0; 4],
             },
-            Weather::Rain => Self {
+            Precipitation::Rain => Self {
                 params: [KIND_RAIN as f32, phase, RAIN_FALL_SPEED, RAIN_STRETCH],
                 tint: RAIN_COLOR,
             },
-            Weather::Snowfall => Self {
+            Precipitation::Snowfall => Self {
                 params: [KIND_SNOWFLAKE as f32, phase, SNOW_FALL_SPEED, SNOW_STRETCH],
                 tint: SNOW_COLOR,
             },
@@ -167,18 +178,18 @@ impl WeatherUniform {
     }
 }
 
-/// Draw range `(base_vertex, vertex_count)` for a weather state, or `None`
-/// when there is nothing to draw.
+/// Draw range `base_vertex..base_vertex + vertex_count` for a precipitation
+/// state, or `None` when there is nothing to draw.
 ///
 /// The static buffer stores the rain segment first and the snowfall segment
 /// second. A renderer can either use this range or draw the whole buffer and
 /// rely on the shader's kind gate; both are correct, and the range form avoids
 /// processing the inactive half.
-pub fn weather_vertex_range(weather: Weather) -> Option<(u32, u32)> {
-    match weather {
-        Weather::Clear => None,
-        Weather::Rain => Some((0, RAIN_VERTEX_COUNT)),
-        Weather::Snowfall => Some((RAIN_VERTEX_COUNT, SNOW_VERTEX_COUNT)),
+pub fn weather_vertex_range(precipitation: Precipitation) -> Option<Range<u32>> {
+    match precipitation {
+        Precipitation::Clear => None,
+        Precipitation::Rain => Some(0..RAIN_VERTEX_COUNT),
+        Precipitation::Snowfall => Some(RAIN_VERTEX_COUNT..RAIN_VERTEX_COUNT + SNOW_VERTEX_COUNT),
     }
 }
 
@@ -381,7 +392,7 @@ pub fn create_weather_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGrou
 /// Create the weather uniform buffer initialised to the invisible Clear state.
 pub fn create_weather_uniform_buffer(device: &wgpu::Device) -> wgpu::Buffer {
     use wgpu::util::DeviceExt;
-    let uniform = WeatherUniform::from_weather(Weather::Clear, 0.0);
+    let uniform = WeatherUniform::from_precipitation(Precipitation::Clear, 0.0);
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("weather_uniform_buffer"),
         contents: bytemuck::bytes_of(&uniform),
@@ -418,8 +429,8 @@ pub fn create_weather_vertex_buffer(device: &wgpu::Device) -> (wgpu::Buffer, u32
     (buffer, count)
 }
 
-/// Weather pipeline: alpha-blended, depth-write-disabled billboards drawn
-/// inside the existing main pass (overlay/water pipeline template).
+/// Precipitation pipeline: alpha-blended, depth-write-disabled billboards
+/// drawn inside the existing main pass (overlay/water pipeline template).
 ///
 /// `LessEqual` against the shared depth buffer lets terrain occlude far drops
 /// while near drops render in front of it; never writing depth keeps the
@@ -667,14 +678,14 @@ mod tests {
 
     #[test]
     fn weather_uniform_derives_kind_speed_stretch_and_tint() {
-        let rain = WeatherUniform::from_weather(Weather::Rain, 123.5);
+        let rain = WeatherUniform::from_precipitation(Precipitation::Rain, 123.5);
         assert_eq!(rain.params[0], KIND_RAIN as f32);
         assert_eq!(rain.params[1], 123.5);
         assert_eq!(rain.params[2], RAIN_FALL_SPEED);
         assert_eq!(rain.params[3], RAIN_STRETCH);
         assert_eq!(rain.tint, RAIN_COLOR);
 
-        let snow = WeatherUniform::from_weather(Weather::Snowfall, 9.0);
+        let snow = WeatherUniform::from_precipitation(Precipitation::Snowfall, 9.0);
         assert_eq!(snow.params[0], KIND_SNOWFLAKE as f32);
         assert_eq!(snow.params[1], 9.0);
         assert_eq!(snow.params[2], SNOW_FALL_SPEED);
@@ -693,16 +704,20 @@ mod tests {
 
     #[test]
     fn clear_weather_is_invisible_even_if_it_is_drawn() {
-        let clear = WeatherUniform::from_weather(Weather::Clear, 42.0);
+        let clear = WeatherUniform::from_precipitation(Precipitation::Clear, 42.0);
         assert_eq!(clear.tint[3], 0.0, "Clear must never paint a drop");
-        assert_eq!(weather_vertex_range(Weather::Clear), None);
+        assert_eq!(weather_vertex_range(Precipitation::Clear), None);
     }
 
     #[test]
     fn weather_uniform_is_finite_across_a_long_phase_sweep() {
         for phase in [0.0, 0.5, 24_000.0, 96_000.0, 1_000_000.0] {
-            for weather in [Weather::Clear, Weather::Rain, Weather::Snowfall] {
-                let u = WeatherUniform::from_weather(weather, phase);
+            for weather in [
+                Precipitation::Clear,
+                Precipitation::Rain,
+                Precipitation::Snowfall,
+            ] {
+                let u = WeatherUniform::from_precipitation(weather, phase);
                 assert_finite(u.params.into_iter().chain(u.tint), "WeatherUniform");
             }
         }
@@ -711,16 +726,18 @@ mod tests {
     #[test]
     fn weather_vertex_range_covers_both_segments() {
         assert_eq!(
-            weather_vertex_range(Weather::Rain),
-            Some((0, RAIN_VERTEX_COUNT))
+            weather_vertex_range(Precipitation::Rain),
+            Some(0..RAIN_VERTEX_COUNT)
         );
         assert_eq!(
-            weather_vertex_range(Weather::Snowfall),
-            Some((RAIN_VERTEX_COUNT, SNOW_VERTEX_COUNT))
+            weather_vertex_range(Precipitation::Snowfall),
+            Some(RAIN_VERTEX_COUNT..RAIN_VERTEX_COUNT + SNOW_VERTEX_COUNT)
         );
-        let (_, rain_count) = weather_vertex_range(Weather::Rain).unwrap();
-        let (base, snow_count) = weather_vertex_range(Weather::Snowfall).unwrap();
-        assert_eq!(base + snow_count, WEATHER_VERTEX_COUNT);
+        let rain_range = weather_vertex_range(Precipitation::Rain).unwrap();
+        let snow_range = weather_vertex_range(Precipitation::Snowfall).unwrap();
+        let rain_count = rain_range.end - rain_range.start;
+        let snow_count = snow_range.end - snow_range.start;
+        assert_eq!(snow_range.start + snow_count, WEATHER_VERTEX_COUNT);
         assert_eq!(rain_count + snow_count, WEATHER_VERTEX_COUNT);
     }
 

@@ -27,6 +27,8 @@ use crate::player::survival::GameMode;
 use crate::player::tools::tier_sword_damage;
 use crate::world::mob::Mob;
 
+pub use opencraft_core::geometry::ray_aabb;
+
 /// Damage of an empty hand (or of any item that is not a sword).
 pub const FIST_DAMAGE: u16 = 1;
 /// Damage of a wood sword in Survival.
@@ -99,12 +101,6 @@ impl MeleeRules {
         }
     }
 }
-
-/// Axis-parallel epsilon below which a ray component is treated as parallel to
-/// the slab. Also the floor below which a direction is structurally degenerate.
-const RAY_EPSILON_SQ: f32 = 1e-12;
-/// Per-axis parallel test, the square root of [`RAY_EPSILON_SQ`].
-const RAY_PARALLEL_EPSILON: f32 = 1e-6;
 
 /// Damage one swing applies to a mob that currently has `target_health`.
 ///
@@ -186,55 +182,6 @@ pub fn attack_damage_with_rules(
             .map_or(rules.fist_damage, |tier| tier.damage),
         _ => rules.fist_damage,
     }
-}
-
-/// Slab-method ray/AABB intersection returning the **entry distance**.
-///
-/// `dir` does not have to be normalized: the returned distance is measured in
-/// units of `dir`'s length, so a normalized ray yields a world-space distance.
-///
-/// Returns `None` when the ray or the box is non-finite, when `dir` is
-/// structurally degenerate (`dir.length_squared() < 1e-12`), on a miss, and
-/// when the entry distance is not finite or is negative. A ray whose origin
-/// already lies inside the box has a negative entry distance and is therefore
-/// rejected: only an entry *ahead of* the origin counts as a hit.
-pub fn ray_aabb(origin: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
-    if !origin.is_finite() || !dir.is_finite() || !min.is_finite() || !max.is_finite() {
-        return None;
-    }
-    if dir.length_squared() < RAY_EPSILON_SQ {
-        return None;
-    }
-
-    let mut t_enter = f32::NEG_INFINITY;
-    let mut t_exit = f32::INFINITY;
-    for (o, d, lo, hi) in [
-        (origin.x, dir.x, min.x, max.x),
-        (origin.y, dir.y, min.y, max.y),
-        (origin.z, dir.z, min.z, max.z),
-    ] {
-        if d.abs() < RAY_PARALLEL_EPSILON {
-            // Parallel to this slab: the origin must already be inside it.
-            if o < lo || o > hi {
-                return None;
-            }
-            continue;
-        }
-        let inv = 1.0 / d;
-        let a = (lo - o) * inv;
-        let b = (hi - o) * inv;
-        let (near, far) = if a <= b { (a, b) } else { (b, a) };
-        t_enter = t_enter.max(near);
-        t_exit = t_exit.min(far);
-        if t_enter > t_exit {
-            return None;
-        }
-    }
-
-    if !t_enter.is_finite() || t_enter < 0.0 {
-        return None;
-    }
-    Some(t_enter)
 }
 
 /// One mob selected by the crosshair ray: its list index and entry distance.
@@ -430,97 +377,6 @@ mod tests {
             .iter()
             .map(|pos| Mob::new(MobKind::Pig, *pos, 0.0))
             .collect()
-    }
-
-    // ---- ray_aabb -----------------------------------------------------
-
-    #[test]
-    fn ray_hits_a_box_ahead_of_the_origin() {
-        let origin = Vec3::new(0.0, 0.5, -5.0);
-        let dir = Vec3::Z;
-        let min = Vec3::new(-1.0, 0.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        let hit = ray_aabb(origin, dir, min, max).expect("ray passes through the slab");
-        assert!((hit - 4.0).abs() < 1e-6, "entry distance was {hit}");
-    }
-
-    #[test]
-    fn ray_from_every_axis_hits_the_box() {
-        let min = Vec3::new(-1.0, -1.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        for (origin, dir) in [
-            (Vec3::new(-5.0, 0.0, 0.0), Vec3::X),
-            (Vec3::new(5.0, 0.0, 0.0), -Vec3::X),
-            (Vec3::new(0.0, 5.0, 0.0), -Vec3::Y),
-            (Vec3::new(0.0, 0.0, 5.0), -Vec3::Z),
-        ] {
-            let hit = ray_aabb(origin, dir, min, max).expect("axis ray hits");
-            assert!((hit - 4.0).abs() < 1e-6, "entry distance was {hit}");
-        }
-    }
-
-    #[test]
-    fn ray_misses_a_box_beside_or_behind_it() {
-        let min = Vec3::new(-1.0, 0.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        // Beside: parallel offset in x.
-        assert!(ray_aabb(Vec3::new(5.0, 0.5, -5.0), Vec3::Z, min, max).is_none());
-        // Above: the ray never descends into the box.
-        assert!(ray_aabb(Vec3::new(0.0, 5.0, -5.0), Vec3::Z, min, max).is_none());
-        // Behind: pointing away from the box.
-        assert!(ray_aabb(Vec3::new(0.0, 0.5, -5.0), -Vec3::Z, min, max).is_none());
-        // Past it: the box is behind a positive entry that never happens.
-        assert!(ray_aabb(Vec3::new(0.0, 0.5, 5.0), Vec3::Z, min, max).is_none());
-    }
-
-    #[test]
-    fn ray_starting_inside_the_box_has_no_positive_entry_distance() {
-        // The contract rejects a negative entry distance, so an origin already
-        // inside the slab is not a valid hit: only an entry ahead counts.
-        let min = Vec3::new(-1.0, -1.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        assert_eq!(ray_aabb(Vec3::ZERO, Vec3::Z, min, max), None);
-        assert_eq!(ray_aabb(Vec3::new(-0.5, 0.5, 0.5), Vec3::Z, min, max), None);
-    }
-
-    #[test]
-    fn degenerate_and_non_finite_rays_are_rejected() {
-        let min = Vec3::new(-1.0, -1.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        for dir in [
-            Vec3::ZERO,
-            Vec3::new(1e-7, 0.0, 0.0),
-            Vec3::new(f32::NAN, 0.0, 1.0),
-            Vec3::new(f32::INFINITY, 0.0, 0.0),
-        ] {
-            assert_eq!(
-                ray_aabb(Vec3::new(0.0, 0.0, -5.0), dir, min, max),
-                None,
-                "dir {dir:?} must be rejected"
-            );
-        }
-        assert_eq!(
-            ray_aabb(Vec3::new(f32::NAN, 0.0, -5.0), Vec3::Z, min, max),
-            None
-        );
-        assert_eq!(
-            ray_aabb(
-                Vec3::new(0.0, 0.0, -5.0),
-                Vec3::Z,
-                Vec3::new(f32::NAN, 0.0, 0.0),
-                max
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn non_normalized_dir_scales_the_returned_distance() {
-        let min = Vec3::new(-1.0, -1.0, -1.0);
-        let max = Vec3::new(1.0, 1.0, 1.0);
-        let origin = Vec3::new(0.0, 0.0, -5.0);
-        let hit = ray_aabb(origin, Vec3::Z * 2.0, min, max).expect("hits");
-        assert!((hit - 2.0).abs() < 1e-6, "scaled distance was {hit}");
     }
 
     // ---- nearest_mob_hit ----------------------------------------------
