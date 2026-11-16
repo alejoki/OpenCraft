@@ -1,4 +1,4 @@
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
 use crate::content::ContentRegistry;
 
@@ -10,9 +10,16 @@ use crate::player::inventory::{
     InventoryError, Item, ItemError, ItemId, ItemStack, RecipePreview, ToolWear, HOTBAR_SLOTS,
 };
 use crate::player::survival::{GameMode, SurvivalState, MAX_HUNGER};
-use crate::world::block::BlockId;
+use crate::world::block::{BlockId, BlockIdQuery};
+use opencraft_physics::movement::{step_body, Body, BodyDims, MoveMode, StepInput};
 
 pub use opencraft_core::geometry::Aabb;
+pub use opencraft_physics::movement::{
+    FallTracker, MoveInput as InputState, MovementRules, FLY_SPEED, FLY_SPRINT_SPEED,
+    FLY_VERTICAL_FACTOR, GRAVITY, JUMP_VELOCITY, SPRINT_SPEED, SWIM_MAX_SINK_SPEED,
+    SWIM_RISE_ACCEL, SWIM_RISE_SPEED, SWIM_SINK_ACCEL, SWIM_VERTICAL_DRAG, SWIM_WALK_SPEED_MULT,
+    TERMINAL_VELOCITY, WALK_SPEED,
+};
 
 /// Errors from the narrow inventory-screen command façade.
 ///
@@ -45,156 +52,6 @@ pub const PLAYER_HALF_WIDTH: f32 = 0.3;
 pub const PLAYER_HEIGHT: f32 = 1.8;
 pub const PLAYER_EYE_HEIGHT: f32 = 1.62;
 
-/// Per-second exponential drag on vertical velocity while submerged (D087).
-/// With gravity this bounds an idle sink at roughly 4.7 m/s: deliberate, never
-/// a teleport.
-pub const SWIM_VERTICAL_DRAG: f32 = 6.0;
-/// Upward acceleration while `jump_or_up` is held underwater (D087). Net of the
-/// 28.0 m/s^2 gravity below this lifts a submerged body; released, gravity plus
-/// drag make it sink. There is no buoyant surface lock in either case.
-pub const SWIM_RISE_ACCEL: f32 = 40.0;
-/// Upward speed while `jump_or_up` is held underwater. Deliberately below the
-/// 9.0 m/s land jump so swimming up reads as a steady rise, not a leap.
-pub const SWIM_RISE_SPEED: f32 = 4.0;
-/// Terminal sink speed underwater, so entering from a long fall never slams the
-/// body into the seabed at the 45 m/s dry-land terminal velocity.
-pub const SWIM_MAX_SINK_SPEED: f32 = 6.0;
-/// Horizontal walk-speed multiplier while submerged: 4.6 * 0.55 = 2.53 m/s, so
-/// swimming is always slower than the 4.6 m/s land walk (and the 7.2 sprint).
-pub const SWIM_WALK_SPEED_MULT: f32 = 0.55;
-/// Downward acceleration applied while submerged, in blocks per second
-/// squared. The swim branch subtracts this so the idle sink keeps matching the
-/// dry-land gravity feel while drag bounds the terminal speed.
-pub const SWIM_SINK_ACCEL: f32 = 28.0;
-
-/// Horizontal walking speed on land, in blocks per second.
-pub const WALK_SPEED: f32 = 4.6;
-/// Horizontal sprint speed in blocks per second. Crouching deliberately uses
-/// the sprint speed too, matching the pre-config behavior.
-pub const SPRINT_SPEED: f32 = 7.2;
-/// Flight speed in blocks per second while not sprinting.
-pub const FLY_SPEED: f32 = 18.0;
-/// Flight speed in blocks per second while sprinting.
-pub const FLY_SPRINT_SPEED: f32 = 48.0;
-/// Fraction of flight speed applied to vertical movement.
-pub const FLY_VERTICAL_FACTOR: f32 = 0.75;
-/// Upward launch speed of a standing jump, in blocks per second.
-pub const JUMP_VELOCITY: f32 = 9.0;
-/// Downward gravity acceleration, in blocks per second squared.
-pub const GRAVITY: f32 = 28.0;
-/// Maximum downward fall speed, in blocks per second.
-pub const TERMINAL_VELOCITY: f32 = 45.0;
-
-/// Effective movement tuning for one player, in blocks and seconds.
-///
-/// The defaults reference the named constants above, so a fresh player is
-/// behavior-identical to the pre-config rules. Startup and live reload replace
-/// this wholesale through [`crate::world::session::WorldSession::apply_rules`];
-/// `Player::update` never reads the bare constants, so an applied rule set is
-/// the only thing that steers movement.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MovementRules {
-    pub walk_speed: f32,
-    pub sprint_speed: f32,
-    pub fly_speed: f32,
-    pub fly_sprint_speed: f32,
-    pub fly_vertical_factor: f32,
-    pub jump_velocity: f32,
-    pub gravity: f32,
-    pub terminal_velocity: f32,
-    pub swim_vertical_drag: f32,
-    pub swim_rise_accel: f32,
-    pub swim_rise_speed: f32,
-    pub swim_max_sink_speed: f32,
-    pub swim_walk_speed_mult: f32,
-    pub swim_sink_accel: f32,
-}
-
-impl Default for MovementRules {
-    fn default() -> Self {
-        Self {
-            walk_speed: WALK_SPEED,
-            sprint_speed: SPRINT_SPEED,
-            fly_speed: FLY_SPEED,
-            fly_sprint_speed: FLY_SPRINT_SPEED,
-            fly_vertical_factor: FLY_VERTICAL_FACTOR,
-            jump_velocity: JUMP_VELOCITY,
-            gravity: GRAVITY,
-            terminal_velocity: TERMINAL_VELOCITY,
-            swim_vertical_drag: SWIM_VERTICAL_DRAG,
-            swim_rise_accel: SWIM_RISE_ACCEL,
-            swim_rise_speed: SWIM_RISE_SPEED,
-            swim_max_sink_speed: SWIM_MAX_SINK_SPEED,
-            swim_walk_speed_mult: SWIM_WALK_SPEED_MULT,
-            swim_sink_accel: SWIM_SINK_ACCEL,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct InputState {
-    pub forward: bool,
-    pub backward: bool,
-    pub left: bool,
-    pub right: bool,
-    pub jump_or_up: bool,
-    pub crouch_or_down: bool,
-    pub sprint: bool,
-}
-
-impl InputState {
-    #[inline]
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Whether any movement key is held this frame.
-    ///
-    /// Hold-to-eat cancels on movement (see [`crate::player::eating`]), so the
-    /// check lives next to the flags themselves rather than being re-derived
-    /// from them at the call site.
-    pub fn is_moving(&self) -> bool {
-        self.forward
-            || self.backward
-            || self.left
-            || self.right
-            || self.jump_or_up
-            || self.crouch_or_down
-            || self.sprint
-    }
-}
-
-/// Dry-land fall measurement carried by the player's physics step.
-///
-/// Physics measures distance only; damage, hunger, and air rules live in
-/// [`crate::player::survival`] and are applied by `WorldSession::tick_survival`
-/// (S04). Water contact always cancels a pending fall and consumes the armed
-/// spawn immunity, because touching water counts as the first contact.
-#[derive(Clone, Debug, Default)]
-struct FallState {
-    /// Highest feet height seen since the body last left the ground.
-    peak_y: Option<f32>,
-    /// One-shot dry-land distance latched on landing, consumed by the session.
-    landing_distance: f32,
-    /// Discards the first ground (or water) contact after a fresh spawn or
-    /// respawn.
-    spawn_immune: bool,
-}
-
-impl FallState {
-    /// Drops all fall bookkeeping, including spawn immunity.
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Drops the in-flight fall and any latched landing but keeps spawn
-    /// immunity.
-    fn clear_pending(&mut self) {
-        self.peak_y = None;
-        self.landing_distance = 0.0;
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Player {
     pub position: Vec3,
@@ -224,19 +81,10 @@ pub struct Player {
     /// Unfinished 4x4 crafting-table grid carried with the player.
     table_grid: CraftingGrid,
     /// Dry-land fall measurement and one-shot spawn immunity (S04).
-    fall: FallState,
+    fall: FallTracker,
     /// Player combat carrier: cause-tagged hits, i-frames, hurt flash, and the
     /// one decaying hostile knockback impulse (S06). Ephemeral — never saved.
     pub combat: PlayerCombat,
-}
-
-/// Thin player-side wrapper over the shared box-vs-solid predicate.
-///
-/// The epsilon/flooring rule lives in [`crate::world::collision::solid_overlaps`]
-/// so the player and every mob mover cannot drift apart. This wrapper keeps
-/// the existing player-sized [`Aabb`] call sites unchanged.
-fn collides_with_world<F: Fn(i32, i32, i32) -> BlockId>(aabb: Aabb, get_block: &F) -> bool {
-    crate::world::collision::solid_overlaps(aabb.min, aabb.max, get_block)
 }
 
 impl Player {
@@ -258,7 +106,7 @@ impl Player {
             inventory: Inventory::empty(),
             player_grid: CraftingGrid::new(GridKind::Player),
             table_grid: CraftingGrid::new(GridKind::Table),
-            fall: FallState::default(),
+            fall: FallTracker::default(),
             combat: PlayerCombat::default(),
         }
     }
@@ -327,9 +175,7 @@ impl Player {
     /// The value is cleared on read so a single fall can never be damaged
     /// twice. Water contact and flight leave no latch behind.
     pub fn take_landing_fall(&mut self) -> f32 {
-        let distance = self.fall.landing_distance;
-        self.fall.landing_distance = 0.0;
-        distance
+        self.fall.take_landing()
     }
 
     /// Arms the first-contact spawn immunity used by fresh Survival sessions
@@ -888,206 +734,37 @@ impl Player {
         input: &InputState,
         get_block: F,
     ) {
-        let dt = dt.clamp(0.0, 0.1);
-        let (sy, cy) = self.yaw.sin_cos();
-        let forward_flat = Vec3::new(cy, 0.0, sy).normalize_or_zero();
-        let right_flat = Vec3::new(-sy, 0.0, cy).normalize_or_zero();
-
-        let mut move_dir = Vec3::ZERO;
-        if input.forward {
-            move_dir += forward_flat;
-        }
-        if input.backward {
-            move_dir -= forward_flat;
-        }
-        if input.right {
-            move_dir += right_flat;
-        }
-        if input.left {
-            move_dir -= right_flat;
-        }
-        if move_dir.length_squared() > 0.0 {
-            move_dir = move_dir.normalize();
-        }
-
-        if self.can_fly() {
-            let speed = if input.sprint {
-                self.movement.fly_sprint_speed
-            } else {
-                self.movement.fly_speed
-            };
-            let mut vel = move_dir * speed;
-            if input.jump_or_up {
-                vel.y += speed * self.movement.fly_vertical_factor;
-            }
-            if input.crouch_or_down {
-                vel.y -= speed * self.movement.fly_vertical_factor;
-            }
-            self.velocity = vel;
-            self.position += self.velocity * dt;
-            self.on_ground = false;
-            // Flight is never a fall: drop any in-flight measurement.
-            self.fall.clear_pending();
-            return;
-        }
-
-        let start_y = self.position.y;
-
-        // Submersion is derived from the already-in-scope `get_block` closure —
-        // no signature change and no new call-site parameter. Sampling the feet
-        // block catches a wading body, and the mid-body block keeps a body whose
-        // feet have just cleared the surface in the water branch until it is
-        // actually out of the water (a generated ocean fills every column below
-        // `SEA_LEVEL`).
-        let body_x = self.position.x.floor() as i32;
-        let body_z = self.position.z.floor() as i32;
-        let feet_block_y = (self.position.y + 1e-4).floor() as i32;
-        let mid_block_y = (self.position.y + PLAYER_HEIGHT * 0.5).floor() as i32;
-        let submerged = get_block(body_x, feet_block_y, body_z).is_liquid()
-            || get_block(body_x, mid_block_y, body_z).is_liquid();
-
-        // Crouching deliberately uses the sprint speed too, matching the
-        // pre-config behavior.
-        let mut walk_speed = if input.sprint || input.crouch_or_down {
-            self.movement.sprint_speed
+        let mode = if self.can_fly() {
+            MoveMode::Fly
         } else {
-            self.movement.walk_speed
+            MoveMode::Walk
         };
-        if submerged {
-            walk_speed *= self.movement.swim_walk_speed_mult;
-        }
-        self.velocity.x = move_dir.x * walk_speed;
-        self.velocity.z = move_dir.z * walk_speed;
-        // Hostile knockback is integrated *after* the input assignment above.
-        // Input reassigns `velocity.x/z` every frame, so this is deliberately
-        // not a second owner of the velocity: the impulse itself lives only in
-        // `combat.knockback`, is never persisted, and has no vertical
-        // component so the player is never pushed into the floor or ceiling.
-        self.velocity.x += self.combat.knockback().x;
-        self.velocity.z += self.combat.knockback().z;
-
-        // Swim branch of walk mode (D087). Honesty note: this asserts mechanics
-        // only (positions, sink/rise, on_ground). Fall distance is measured by
-        // the dry-land bookkeeping after the sub-step loop below; the damage,
-        // hunger, and air rules live in `player::survival` and are applied by
-        // `WorldSession::tick_survival` (S04). Water contact cancels a fall.
-        if submerged {
-            // D087: no buoyant surface lock. A submerged walk-mode body is
-            // dragged vertically and then pulled down by gravity while
-            // `jump_or_up` is released; holding it applies the rise acceleration
-            // instead. Both directions clamp to their terminal swim speeds, so an
-            // idle body sinks away from the surface and a held Jump rises back up.
-            let drag = (1.0 - self.movement.swim_vertical_drag * dt).clamp(0.0, 1.0);
-            self.velocity.y *= drag;
-            let vertical_accel = if input.jump_or_up {
-                self.movement.swim_rise_accel
-            } else {
-                -self.movement.swim_sink_accel
-            };
-            self.velocity.y = (self.velocity.y + vertical_accel * dt).clamp(
-                -self.movement.swim_max_sink_speed,
-                self.movement.swim_rise_speed,
-            );
-            // A body in water is never standing: no on-ground land jump of 9.0.
-            // The sub-step Y resolution below may still turn this true, but only
-            // on a solid block (the seabed), never on the liquid surface.
-            self.on_ground = false;
-        } else {
-            if self.on_ground && input.jump_or_up {
-                self.velocity.y = self.movement.jump_velocity;
-                self.on_ground = false;
-            }
-
-            self.velocity.y = (self.velocity.y - self.movement.gravity * dt)
-                .max(-self.movement.terminal_velocity);
-        }
-
-        // Sub-step physics dynamically so no single step exceeds 0.25 blocks
-        let steps = ((self.velocity.length() * dt) / 0.25).ceil().max(4.0) as usize;
-        let sub_dt = dt / steps as f32;
-        for _ in 0..steps {
-            // 1. Resolve Y
-            let dy = self.velocity.y * sub_dt;
-            if dy != 0.0 {
-                let candidate_y = Vec3::new(self.position.x, self.position.y + dy, self.position.z);
-                if collides_with_world(
-                    Aabb::from_feet(candidate_y, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
-                    &get_block,
-                ) {
-                    if dy < 0.0 {
-                        self.position.y = (self.position.y + dy).ceil();
-                        self.on_ground = true;
-                    }
-                    self.velocity.y = 0.0;
-                } else {
-                    self.position.y += dy;
-                    self.on_ground = false;
-                }
-            }
-
-            // 2. Resolve X
-            let dx = self.velocity.x * sub_dt;
-            if dx != 0.0 {
-                let candidate_x = Vec3::new(self.position.x + dx, self.position.y, self.position.z);
-                if !collides_with_world(
-                    Aabb::from_feet(candidate_x, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
-                    &get_block,
-                ) {
-                    self.position.x += dx;
-                } else {
-                    self.velocity.x = 0.0;
-                }
-            }
-
-            // 3. Resolve Z
-            let dz = self.velocity.z * sub_dt;
-            if dz != 0.0 {
-                let candidate_z = Vec3::new(self.position.x, self.position.y, self.position.z + dz);
-                if !collides_with_world(
-                    Aabb::from_feet(candidate_z, PLAYER_HALF_WIDTH, PLAYER_HEIGHT),
-                    &get_block,
-                ) {
-                    self.position.z += dz;
-                } else {
-                    self.velocity.z = 0.0;
-                }
-            }
-        }
-
-        // Fall measurement (dry land only). Physics owns the distance; the
-        // survival runtime owns the damage. Re-sample submersion at the new
-        // position because the body may have entered water during this step.
-        let body_x_after = self.position.x.floor() as i32;
-        let body_z_after = self.position.z.floor() as i32;
-        let feet_block_y_after = (self.position.y + 1e-4).floor() as i32;
-        let mid_block_y_after = (self.position.y + PLAYER_HEIGHT * 0.5).floor() as i32;
-        let submerged_after = get_block(body_x_after, feet_block_y_after, body_z_after).is_liquid()
-            || get_block(body_x_after, mid_block_y_after, body_z_after).is_liquid();
-
-        if submerged || submerged_after {
-            // Water contact counts as the first contact: cancel the fall and
-            // spend the fresh-spawn immunity.
-            self.fall.clear_pending();
-            self.fall.spawn_immune = false;
-        } else if self.on_ground {
-            let peak = self.fall.peak_y.take();
-            if self.fall.spawn_immune {
-                // Fresh spawn/respawn: discard the first dry landing whole.
-                self.fall.spawn_immune = false;
-            } else if let Some(peak) = peak {
-                self.fall.landing_distance = (peak - self.position.y).max(0.0);
-            }
-        } else {
-            // A ledge walk-off keeps its takeoff height, and a jump still
-            // peaks at the apex instead of only recording the final height.
-            self.fall.peak_y = Some(
-                self.fall
-                    .peak_y
-                    .unwrap_or(start_y)
-                    .max(start_y)
-                    .max(self.position.y),
-            );
-        }
+        let knockback = self.combat.knockback();
+        let mut body = Body {
+            position: self.position,
+            velocity: self.velocity,
+            on_ground: self.on_ground,
+        };
+        step_body(
+            &mut body,
+            BodyDims {
+                half_width: PLAYER_HALF_WIDTH,
+                height: PLAYER_HEIGHT,
+            },
+            &self.movement,
+            &mut self.fall,
+            StepInput {
+                dt,
+                yaw: self.yaw,
+                input,
+                mode,
+                impulse_xz: Vec2::new(knockback.x, knockback.z),
+            },
+            &BlockIdQuery(&get_block),
+        );
+        self.position = body.position;
+        self.velocity = body.velocity;
+        self.on_ground = body.on_ground;
     }
 }
 
@@ -2765,7 +2442,7 @@ mod tests {
     /// collision stop) but not walkable (no standing on the surface, no walking
     /// the seabed).
     /// The four `is_solid` consumer sites and their named proof:
-    /// 1. Physics collision (`collides_with_world` in this module) — asserted here.
+    /// 1. Physics collision (`solid_overlaps` in `opencraft-core::geometry`) — asserted here.
     /// 2. Voxel raycast (`src/player/raycast.rs`) —
     ///    `raycast_skips_water_and_hits_the_stone_seabed`.
     /// 3. Greedy mesh (`src/mesh/greedy.rs`, `water_quads`) — already pinned by
@@ -2793,7 +2470,7 @@ mod tests {
 
         // Passable: a walk-mode player moves horizontally through the water
         // column at the reduced swim speed with no collision stop. `update`
-        // resolves X/Z against `collides_with_world`, which only sees solid
+        // resolves X/Z against `solid_overlaps`, which only sees solid
         // blocks, so the water cells cannot block the body.
         let mut swimmer = Player::new(Vec3::new(0.5, 10.0, 0.5));
         swimmer.fly_mode = false;
