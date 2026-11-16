@@ -1,7 +1,9 @@
-//! GPU and windowing layer for OpenCraft.
+//! GPU layer for OpenCraft.
 //!
-//! Owns the wgpu device/surface setup, render pipelines, and window event
-//! plumbing once the extraction lands; it builds on `opencraft-core` for
-//! neutral math and never depends on the `opencraft` game crate.
+//! The host creates the window, the `wgpu::Instance` and the surface; this
+//! crate takes that host-created instance and surface and owns the adapter,
+//! device, queue, surface configuration and depth attachment (with the chunk
+//! buffer and mesh wire-format modules arriving beside them). It builds on
+//! `opencraft-core` for neutral math and never depends on the game crate.
 
-pub use opencraft_core as core;
+pub mod context;

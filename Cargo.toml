@@ -9,7 +9,7 @@ bytemuck = { version = "1.14", features = ["derive"] }
 crossbeam-channel = "0.5"
 glam = "0.27"
 opencraft-core = { path = "crates/opencraft-core" }
-pollster = "0.3"
+opencraft-gfx = { path = "crates/opencraft-gfx" }
 rayon = "1.10"
 rustc-hash = "1.1"
 wgpu = "0.19"

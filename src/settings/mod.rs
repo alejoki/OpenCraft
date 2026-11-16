@@ -77,7 +77,7 @@ impl Default for Keybinds {
 /// S04 wiring swap is behavior-neutral: sensitivity 0.0022
 /// (`src/main.rs` device_event), FOV 75.0 (`src/player/camera.rs`
 /// `Camera::new`), render distance 16 (`WorldSession::new_session`),
-/// fullscreen false, vsync false (`src/render/context.rs` prefers
+/// fullscreen false, vsync false (`opencraft-gfx` prefers
 /// Immediate -> no vsync).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {

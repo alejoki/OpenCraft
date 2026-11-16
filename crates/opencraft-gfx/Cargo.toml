@@ -7,3 +7,5 @@ publish = false
 
 [dependencies]
 opencraft-core = { path = "../opencraft-core" }
+pollster = "0.3"
+wgpu = "0.19"

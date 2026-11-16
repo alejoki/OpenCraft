@@ -1668,8 +1668,8 @@ dependencies = [
  "glam",
  "glyphon",
  "opencraft-core",
+ "opencraft-gfx",
  "png",
- "pollster",
  "rayon",
  "rodio",
  "rustc-hash",
@@ -1692,6 +1692,8 @@ name = "opencraft-gfx"
 version = "0.1.0"
 dependencies = [
  "opencraft-core",
+ "pollster",
+ "wgpu",
 ]
 
 [[package]]

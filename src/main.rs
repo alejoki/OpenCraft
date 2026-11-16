@@ -4096,7 +4096,18 @@ impl ApplicationHandler for GameApp {
                 .expect("Failed to create window"),
         );
 
-        let mut ctx = RenderContext::new(window.clone());
+        // The game owns the window, instance and surface; `opencraft-gfx`
+        // owns the adapter, device, queue, surface configuration and depth
+        // attachment.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY | wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let size = window.inner_size();
+        #[rustfmt::skip]
+        let surface = instance.create_surface(window.clone()).expect("Failed to create wgpu surface");
+        #[rustfmt::skip]
+        let ctx = RenderContext::new(instance, surface, size.width, size.height, self.settings.vsync);
         let renderer = VoxelRenderer::new(&ctx);
         // Re-apply the persisted texture pack to the freshly created GPU
         // texture (M004/S03): the renderer is still a local here, so the
@@ -4205,14 +4216,11 @@ impl ApplicationHandler for GameApp {
 
         // Loaded video settings apply at startup too (the loaded Settings
         // are the single source of truth for video parameters): borderless
-        // fullscreen when enabled, and the Fifo present mode when vsync is
-        // on (RenderContext::new prefers uncapped Immediate, which matches
-        // the vsync=false default — only vsync=true needs the override).
+        // fullscreen when enabled. The vsync setting is passed into
+        // `RenderContext::new`, so the surface is configured with the right
+        // present mode from the first frame.
         if self.settings.fullscreen {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
-        }
-        if self.settings.vsync {
-            apply_vsync(&mut ctx, true);
         }
 
         // Startup cursor state follows the lifecycle screen set in
@@ -4276,7 +4284,7 @@ impl ApplicationHandler for GameApp {
                 self.melee.reset();
             }
             WindowEvent::Resized(new_size) => {
-                gpu.ctx.resize(new_size);
+                gpu.ctx.resize(new_size.width, new_size.height);
                 // The creator overlay wraps at the surface width, so a resize
                 // must recompose it even when its text is unchanged.
                 self.creator_overlay_dirty = true;
@@ -6853,7 +6861,8 @@ impl ApplicationHandler for GameApp {
                         }
                     }
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                        gpu.ctx.resize(gpu.ctx.size);
+                        let (width, height) = (gpu.ctx.config.width, gpu.ctx.config.height);
+                        gpu.ctx.resize(width, height);
                     }
                     Err(wgpu::SurfaceError::OutOfMemory) => {
                         let _ = save_current_world(&mut self.session);
@@ -29148,6 +29157,42 @@ selected_name_secs = 0.5
         assert!(
             poll.contains("self.creator_overlay_dirty = true"),
             "a settled or pending-change reload must recompose the overlay"
+        );
+    }
+
+    #[test]
+    fn resumed_creates_the_surface_and_resize_forwards_both_dimensions() {
+        let source = include_str!("main.rs");
+        let resumed = source
+            .split("fn resumed(")
+            .nth(1)
+            .expect("main.rs must define resumed")
+            .split("fn window_event(")
+            .next()
+            .expect("resumed must end before window_event");
+        let resumed_flat = resumed.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            resumed_flat.contains("instance.create_surface(window.clone())"),
+            "the game must create the surface from the owned window handle"
+        );
+        assert!(
+            resumed_flat.contains(
+                "RenderContext::new(instance, surface, size.width, size.height, self.settings.vsync)"
+            ),
+            "resumed must pass the game-created instance, surface, dimensions and vsync to gfx"
+        );
+
+        let resized = source
+            .split("WindowEvent::Resized(new_size) =>")
+            .nth(1)
+            .expect("window_event must handle Resized")
+            .split("WindowEvent::KeyboardInput")
+            .next()
+            .expect("the Resized arm must end before KeyboardInput");
+        let resized_flat = resized.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            resized_flat.contains("gpu.ctx.resize(new_size.width, new_size.height)"),
+            "a resize must forward both dimensions to the gfx context"
         );
     }
 
