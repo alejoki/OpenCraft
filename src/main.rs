@@ -851,6 +851,44 @@ fn session_mining_target(
 /// engine handle. Called once per session frame; as a no-op the call is free.
 fn weather_ambient_hook(_weather: Weather) {}
 
+/// The per-frame 48-byte sky uniform derived from a game time.
+///
+/// The pure celestial math stays in [`daycycle`]; this helper only packs it
+/// into the neutral [`opencraft_gfx::sky::SkyUniform`] that the renderer
+/// uploads verbatim. `daycycle` remains the sole owner of the formulas.
+fn sky_uniform_from_time(time_of_day: u32) -> opencraft_gfx::sky::SkyUniform {
+    let sun = daycycle::sun_direction(time_of_day);
+    let moon = daycycle::moon_direction(time_of_day);
+    // Same rotation the sun follows, recovered from its direction so the
+    // formula lives in exactly one place (daycycle).
+    let star_angle = sun.y.atan2(sun.x);
+    opencraft_gfx::sky::SkyUniform {
+        sun_dir: [sun.x, sun.y, sun.z, 0.0],
+        moon_dir: [moon.x, moon.y, moon.z, 0.0],
+        params: [
+            daycycle::sun_brightness(time_of_day),
+            daycycle::moon_brightness(time_of_day),
+            daycycle::star_visibility(time_of_day),
+            star_angle,
+        ],
+    }
+}
+
+/// Static sky geometry built once from the day-cycle constants.
+///
+/// The crate owns the billboard expansion; the host owns the deterministic
+/// star seed and the angular sizes. Tests drive it now; the frame-seam move
+/// wires it into `VoxelRenderer::new` next.
+#[allow(dead_code)] // Consumed by the tests until the frame seam moves.
+fn sky_geometry() -> opencraft_gfx::sky::SkyGeometry {
+    opencraft_gfx::sky::SkyGeometry {
+        star_field: daycycle::generate_star_field(),
+        sun_angular_size: daycycle::SUN_ANGULAR_SIZE,
+        moon_angular_size: daycycle::MOON_ANGULAR_SIZE,
+        star_angular_size: daycycle::STAR_ANGULAR_SIZE,
+    }
+}
+
 /// Render-side sky inputs from a pure day-cycle palette plus a game time.
 ///
 /// Session frames use the live clock's weather-tinted palette *and* its
@@ -869,7 +907,7 @@ fn sky_params(
     weather_phase: f32,
 ) -> SkyParams {
     SkyParams {
-        time_of_day,
+        celestial: sky_uniform_from_time(time_of_day),
         underwater,
         day_factor: palette.day_factor,
         // Weather travels through the same grouped struct so render_frame's
@@ -21233,7 +21271,11 @@ stack = 64
                 daycycle::CLEAR_FOG_RANGE_FACTOR,
                 0.0,
             );
-            assert_eq!(params.time_of_day, tick);
+            assert_eq!(
+                bytemuck::bytes_of(&params.celestial),
+                bytemuck::bytes_of(&sky_uniform_from_time(tick)),
+                "the render inputs must carry the day-cycle celestial state"
+            );
             assert_eq!(params.clear_color.r, sky[0] as f64);
             assert_eq!(params.clear_color.g, sky[1] as f64);
             assert_eq!(params.clear_color.b, sky[2] as f64);
@@ -21269,6 +21311,176 @@ stack = 64
         );
         assert_eq!(midnight.day_factor, night.day_factor);
         assert_eq!(night.day_factor, daycycle::MOONLIT_FLOOR);
+    }
+
+    #[test]
+    fn sky_uniform_from_time_tracks_the_pure_day_cycle() {
+        let noon = sky_uniform_from_time(daycycle::DEFAULT_TIME_OF_DAY);
+        assert!(
+            (noon.sun_dir[1] - 1.0).abs() < 1e-5,
+            "noon sun is at zenith"
+        );
+        assert!((noon.params[0] - 1.0).abs() < 1e-5, "noon sun is bright");
+        assert_eq!(noon.params[2], 0.0, "no stars at noon");
+
+        let midnight =
+            sky_uniform_from_time(daycycle::DAY_TICKS / 2 + daycycle::DEFAULT_TIME_OF_DAY);
+        assert!(
+            (midnight.moon_dir[1] - 1.0).abs() < 1e-5,
+            "midnight moon is at zenith"
+        );
+        assert!(
+            (midnight.params[1] - 1.0).abs() < 1e-5,
+            "midnight moon is bright"
+        );
+        assert!(
+            (midnight.params[2] - 1.0).abs() < 1e-5,
+            "midnight star visibility is full"
+        );
+    }
+
+    #[test]
+    fn sky_uniform_from_time_wraps_and_stays_finite() {
+        let dawn = sky_uniform_from_time(0);
+        assert_eq!(
+            bytemuck::bytes_of(&dawn),
+            bytemuck::bytes_of(&sky_uniform_from_time(daycycle::DAY_TICKS))
+        );
+        assert_eq!(
+            bytemuck::bytes_of(&sky_uniform_from_time(1_000)),
+            bytemuck::bytes_of(&sky_uniform_from_time(daycycle::DAY_TICKS + 1_000))
+        );
+
+        // Sweep the whole cycle plus out-of-range values: no NaN/inf may reach
+        // the uniform, and every field stays in its documented range.
+        for time in (0..=daycycle::DAY_TICKS * 2).step_by(250) {
+            let u = sky_uniform_from_time(time);
+            for value in u
+                .sun_dir
+                .iter()
+                .chain(u.moon_dir.iter())
+                .chain(u.params.iter())
+            {
+                assert!(value.is_finite(), "non-finite uniform field at t={time}");
+            }
+            for brightness in &u.params[0..3] {
+                assert!(
+                    (0.0..=1.0).contains(brightness),
+                    "brightness out of range at t={time}: {brightness}"
+                );
+            }
+            assert!((u.sun_dir[0].hypot(u.sun_dir[1]) - 1.0).abs() < 1e-4);
+            assert!((u.moon_dir[0].hypot(u.moon_dir[1]) - 1.0).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn build_sky_vertices_emits_body_geometry_and_star_quads() {
+        let geometry = sky_geometry();
+        let stars = geometry.star_field.clone();
+        let verts = opencraft_gfx::sky::build_sky_vertices(&geometry);
+        let star_base = 6 + opencraft_gfx::sky::MOON_VERTEX_COUNT;
+
+        assert_eq!(geometry.sun_angular_size, daycycle::SUN_ANGULAR_SIZE);
+        assert_eq!(geometry.moon_angular_size, daycycle::MOON_ANGULAR_SIZE);
+        assert_eq!(geometry.star_angular_size, daycycle::STAR_ANGULAR_SIZE);
+        assert_eq!(stars.len(), daycycle::STAR_COUNT);
+        assert_eq!(verts.len(), star_base + stars.len() * 6);
+        assert_eq!(
+            &verts[0..6].iter().map(|v| v.kind).collect::<Vec<_>>(),
+            &[opencraft_gfx::sky::KIND_SUN; 6]
+        );
+        assert_eq!(
+            &verts[6..star_base]
+                .iter()
+                .map(|v| v.kind)
+                .collect::<Vec<_>>(),
+            &[opencraft_gfx::sky::KIND_MOON; opencraft_gfx::sky::MOON_VERTEX_COUNT]
+        );
+        assert!(verts[star_base..]
+            .iter()
+            .all(|v| v.kind == opencraft_gfx::sky::KIND_STAR));
+
+        for (i, star) in stars.iter().enumerate() {
+            let base = star_base + i * 6;
+            for v in &verts[base..base + 6] {
+                assert_eq!(Vec3::from(v.dir), *star);
+                assert_eq!(v.size, daycycle::STAR_ANGULAR_SIZE);
+            }
+        }
+    }
+
+    #[test]
+    fn moon_geometry_is_a_static_square_quad() {
+        // The square must use exactly the six shared quad corners, including
+        // the four diagonal (-1,-1) style corners a crescent never reaches.
+        const SQUARE_CORNERS: [[f32; 2]; 6] = [
+            [-1.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, -1.0],
+            [1.0, 1.0],
+            [-1.0, 1.0],
+        ];
+        const MOON_TINT: [f32; 4] = [0.62, 0.68, 0.82, 1.0];
+        const SUN_TINT: [f32; 4] = [1.0, 0.96, 0.80, 1.0];
+
+        let geometry = sky_geometry();
+        let verts = opencraft_gfx::sky::build_sky_vertices(&geometry);
+        let moon: Vec<opencraft_gfx::sky::SkyVertex> = verts
+            .iter()
+            .copied()
+            .filter(|v| v.kind == opencraft_gfx::sky::KIND_MOON)
+            .collect();
+
+        assert_eq!(moon.len(), opencraft_gfx::sky::MOON_VERTEX_COUNT);
+        assert_eq!(
+            opencraft_gfx::sky::MOON_VERTEX_COUNT,
+            6,
+            "the moon is a single quad"
+        );
+
+        for corner in SQUARE_CORNERS {
+            assert!(
+                moon.iter().any(|v| v.corner == corner),
+                "missing square corner {corner:?}"
+            );
+        }
+
+        // Identity is belt-and-braces: square silhouette plus smaller size
+        // plus a cool, dim tint that is clearly not the warm-white sun.
+        for v in &moon {
+            assert_eq!(v.color, MOON_TINT);
+            assert_eq!(v.size, daycycle::MOON_ANGULAR_SIZE);
+            assert_eq!(
+                Vec3::from(v.dir),
+                -Vec3::X,
+                "moon dir is a shader placeholder"
+            );
+        }
+        const {
+            assert!(MOON_TINT[2] > MOON_TINT[0], "moon tint must be cool");
+            assert!(
+                MOON_TINT[0] < SUN_TINT[0],
+                "moon tint must be dimmer than the sun"
+            );
+            assert!(
+                daycycle::MOON_ANGULAR_SIZE < daycycle::SUN_ANGULAR_SIZE,
+                "the moon must be smaller than the sun"
+            );
+        }
+    }
+
+    #[test]
+    fn default_scene_golden_hour_never_shows_stars() {
+        // The deterministic demo scene renders at the golden hour, where the
+        // sun is still up: star visibility (and therefore the materialised
+        // mask) is zero. A persisted background may render night instead.
+        assert_eq!(
+            sky_uniform_from_time(daycycle::VISTA_GOLDEN_HOUR).params[2],
+            0.0,
+            "the default scene's golden hour never shows stars, so the mask is a no-op there"
+        );
     }
 
     /// S06-T04: session weather is exactly the pure calendar derivation over
@@ -21406,7 +21618,8 @@ stack = 64
         let vista_time = 9_000;
         let vista = vista_sky_params(daycycle::sky_palette(vista_time), vista_time);
         assert_eq!(
-            vista.time_of_day, vista_time,
+            bytemuck::bytes_of(&vista.celestial),
+            bytemuck::bytes_of(&sky_uniform_from_time(vista_time)),
             "the menu scene clock reaches SkyParams, never a pinned constant"
         );
         assert_eq!(vista.weather, Weather::Clear);

@@ -1694,6 +1694,7 @@ name = "opencraft-gfx"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "glam",
  "opencraft-core",
  "pollster",
  "rustc-hash",

@@ -35,8 +35,8 @@ pub struct CameraUniform {
 /// parameter rather than four. The day factor rides in the otherwise unused
 /// `CameraUniform::fog_start_end.z` slot, so the 112-byte uniform layout and the
 /// WGSL struct stay untouched; the celestial inputs (sun/moon direction,
-/// brightness fades, star visibility and rotation) travel in the separate
-/// 48-byte [`sky::SkyUniform`] derived from `time_of_day`.
+/// brightness fades, star visibility and rotation) travel as the host-supplied
+/// 48-byte [`sky::SkyUniform`] in [`SkyParams::celestial`].
 #[derive(Copy, Clone, Debug)]
 pub struct SkyParams {
     /// Multiplier applied to terrain light: 1.0 at noon down to the moonlit
@@ -46,9 +46,9 @@ pub struct SkyParams {
     pub fog_color: [f32; 4],
     /// Background clear color for the sky pass (and thus the horizon).
     pub clear_color: wgpu::Color,
-    /// Game time in day-cycle ticks (`0..DAY_TICKS`), the input the pure
-    /// [`daycycle`] helpers turn into sun/moon/star placement.
-    pub time_of_day: u32,
+    /// Precomputed 48-byte celestial state for this frame. The host's pure
+    /// day-cycle math fills it; `render_frame` only uploads it verbatim.
+    pub celestial: sky::SkyUniform,
     /// True when the camera's eye is inside a liquid block. The world pass
     /// then swaps the palette fog for the fixed deep-water shift below. This
     /// is a plain flag so `SkyParams` stays `Copy` and `render_frame`'s
@@ -904,14 +904,22 @@ impl VoxelRenderer {
 
         // Sky pass resources: the pipeline reused the camera bind group for
         // group 0 and a small dedicated 48-byte uniform for group 1. The
-        // billboard geometry (sun, moon, fixed-seed star field) is static.
+        // billboard geometry (sun, moon, star field) is static and host-seeded.
         let sky_bind_group_layout = sky::create_sky_bind_group_layout(&ctx.device);
         let sky_uniform_buffer = sky::create_sky_uniform_buffer(&ctx.device);
         let sky_bind_group =
             sky::create_sky_bind_group(&ctx.device, &sky_bind_group_layout, &sky_uniform_buffer);
         let sky_pipeline = sky::create_sky_pipeline(ctx, &camera_bgl, &sky_bind_group_layout);
-        let (sky_vertex_buffer, sky_vertex_count) =
-            sky::create_sky_vertex_buffer(&ctx.device, &daycycle::generate_star_field());
+        let sky_geometry = sky::SkyGeometry {
+            star_field: daycycle::generate_star_field(),
+            sun_angular_size: daycycle::SUN_ANGULAR_SIZE,
+            moon_angular_size: daycycle::MOON_ANGULAR_SIZE,
+            star_angular_size: daycycle::STAR_ANGULAR_SIZE,
+        };
+        // The static vertex count is derived from the same expansion the
+        // buffer factory runs, so the draw can never drift from the ABI.
+        let sky_vertex_count = sky::build_sky_vertices(&sky_geometry).len() as u32;
+        let sky_vertex_buffer = sky::create_sky_vertex_buffer(&ctx.device, &sky_geometry);
 
         // Precipitation stage (M007/S06): static camera-relative rain and
         // snowfall billboards plus one 32-byte per-frame uniform. Built from
@@ -1195,15 +1203,14 @@ impl VoxelRenderer {
         ctx.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam_uniform));
 
-        // Per-frame celestial state: three vec4s derived from the game clock by
-        // the pure day-cycle helpers (directions, brightness fades, star
-        // visibility and rotation). One 48-byte write per frame; all sky
+        // Per-frame celestial state: the host precomputed the three vec4s
+        // (directions, brightness fades, star visibility and rotation) with
+        // its pure day-cycle helpers. One 48-byte write per frame; all sky
         // geometry itself is static.
-        let sky_uniform = sky::SkyUniform::from_time(sky.time_of_day);
         ctx.queue.write_buffer(
             &self.sky_uniform_buffer,
             0,
-            bytemuck::bytes_of(&sky_uniform),
+            bytemuck::bytes_of(&sky.celestial),
         );
 
         let overlay_verts = build_overlay_line_vertices(
@@ -1591,11 +1598,16 @@ mod tests {
     }
 
     #[test]
-    fn sky_params_carries_time_of_day_into_the_sky_uniform() {
+    fn sky_params_carries_celestial_state_into_the_sky_uniform() {
         // The same grouped struct that carries the palette also carries the
-        // game time, so render_frame's 10-arg signature did not grow. The
-        // time is what the pure day-cycle helpers turn into sun/moon/star
-        // placement for the sky pass.
+        // host-precomputed celestial state, so render_frame's 10-arg signature
+        // did not grow and the sky pass only uploads bytes. Midnight: moon up,
+        // stars out, sun below the horizon.
+        let celestial = sky::SkyUniform {
+            sun_dir: [0.0, -1.0, 0.0, 0.0],
+            moon_dir: [0.0, 1.0, 0.0, 0.0],
+            params: [0.0, 1.0, 1.0, std::f32::consts::FRAC_PI_2],
+        };
         let params = SkyParams {
             day_factor: 0.35,
             fog_color: [0.1, 0.12, 0.2, 1.0],
@@ -1605,25 +1617,52 @@ mod tests {
                 b: 0.2,
                 a: 1.0,
             },
-            time_of_day: 18_000,
+            celestial,
             underwater: false,
             weather: Weather::Rain,
             fog_range_factor: 0.75,
             weather_phase: 12_000.0,
         };
-        assert_eq!(params.time_of_day, 18_000);
+        assert_eq!(params.celestial.sun_dir, [0.0, -1.0, 0.0, 0.0]);
+        assert_eq!(params.celestial.moon_dir, [0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            params.celestial.params,
+            [0.0, 1.0, 1.0, std::f32::consts::FRAC_PI_2]
+        );
         assert_eq!(params.day_factor, 0.35);
         assert!(!params.underwater);
         assert_eq!(params.weather, Weather::Rain);
         assert_eq!(params.fog_range_factor, 0.75);
         assert_eq!(params.weather_phase, 12_000.0);
+        assert!(
+            params.celestial.sun_dir[1] < 0.0,
+            "sun is below the horizon"
+        );
+        assert!(
+            params.celestial.moon_dir[1] > 0.0,
+            "moon is above the horizon"
+        );
+        assert!(
+            params.celestial.params[1] > 0.0,
+            "moon brightness is non-zero"
+        );
+        assert!(
+            params.celestial.params[2] > 0.0,
+            "stars are visible at midnight"
+        );
 
-        // Midnight: moon up, stars out, sun below the horizon.
-        let uniform = sky::SkyUniform::from_time(params.time_of_day);
-        assert!(uniform.sun_dir[1] < 0.0, "sun is below the horizon");
-        assert!(uniform.moon_dir[1] > 0.0, "moon is above the horizon");
-        assert!(uniform.params[1] > 0.0, "moon brightness is non-zero");
-        assert!(uniform.params[2] > 0.0, "stars are visible at midnight");
+        // Source pin: render_frame uploads the host-supplied uniform verbatim
+        // and keeps the celestial math out of the renderer.
+        let src = include_str!("pipeline.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        assert!(
+            production.contains("bytemuck::bytes_of(&sky.celestial)"),
+            "render_frame must write the precomputed celestial uniform"
+        );
+        assert!(
+            !production.contains("from_time"),
+            "the renderer must not own the celestial math"
+        );
     }
 
     #[test]
@@ -1652,7 +1691,7 @@ mod tests {
             day_factor: 1.0,
             fog_color: palette_fog,
             clear_color: wgpu::Color::BLACK,
-            time_of_day: 6_000,
+            celestial: sky::SkyUniform::default(),
             underwater: true,
             weather: Weather::Clear,
             fog_range_factor: daycycle::weather_fog_range_factor(Weather::Clear),

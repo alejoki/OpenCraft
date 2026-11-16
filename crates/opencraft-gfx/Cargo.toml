@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 bytemuck = { version = "1.14", features = ["derive"] }
+glam = "0.27"
 opencraft-core = { path = "../opencraft-core" }
 pollster = "0.3"
 rustc-hash = "1.1"

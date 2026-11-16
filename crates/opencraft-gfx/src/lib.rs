@@ -7,11 +7,13 @@
 //! host uploads and draws. It also owns the neutral texture-array upload/mip
 //! machinery that the host drives from its own content spec, plus the neutral
 //! model vertex ABI, WGSL and single-camera-bind-group pipeline factory. It
-//! builds on `opencraft-core` for neutral math and never depends on the game
-//! crate.
+//! also owns the camera-relative sky billboard pass, driven by a host-supplied
+//! per-frame uniform and static geometry. It builds on `opencraft-core` for
+//! neutral math and never depends on the game crate.
 
 pub mod buffer;
 pub mod context;
 pub mod mesh;
 pub mod model;
+pub mod sky;
 pub mod texture;
