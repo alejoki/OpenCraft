@@ -11,5 +11,6 @@
 //! `opencraft_core::block::BlockQuery` contract and answers only
 //! `BlockKind` cells, so the consumer never names a game block identity.
 
+pub mod gfx;
 pub mod physics;
 pub mod world;
