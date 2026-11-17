@@ -6,19 +6,6 @@ use crate::world::season::Season;
 use crate::world::village::{place_village_cells, VillageCatalog};
 
 #[inline]
-fn hash2d(x: i32, z: i32, seed: u32) -> u32 {
-    let mut h = (x as u32).wrapping_mul(0x9E37_79B9)
-        ^ (z as u32).wrapping_mul(0x85EB_CA6B)
-        ^ seed.wrapping_mul(0xC2B2_AE35);
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7FEB_352D);
-    h ^= h >> 15;
-    h = h.wrapping_mul(0x846C_A68B);
-    h ^= h >> 16;
-    h
-}
-
-#[inline]
 fn hash3d(x: i32, y: i32, z: i32, seed: u32) -> u32 {
     let mut h = (x as u32).wrapping_mul(0x9E37_79B9)
         ^ (y as u32).wrapping_mul(0x85EB_CA6B)
@@ -79,45 +66,18 @@ pub use opencraft_worldgen::ruin::{
     ruin_at, ruin_at_seeded, ruin_covers, ruin_loot, ruin_loot_chest_at, ruin_loot_chest_pos,
     RuinSpec, RUIN_FOOTPRINT_HALF,
 };
+pub use opencraft_worldgen::spawn::{
+    find_spawn_column, is_spawn_safe, SPAWN_MIN_HEIGHT, SPAWN_SEARCH_RADIUS, SPAWN_TREE_CLEARANCE,
+};
+pub use opencraft_worldgen::tree::{
+    oak_tree_at, tree_trunk_height, OakTree, TREE_CANOPY_HEADROOM, TREE_CANOPY_TOP_OVER_TRUNK,
+    TREE_MAX_HEIGHT, TREE_MAX_HEIGHT_OVER_SURFACE, TREE_MAX_TRUNK_HEIGHT, TREE_MIN_HEIGHT,
+};
 
 pub const DEFAULT_WORLD_SEED: u32 = 1337;
 
 /// Snow caps appear only above this mountain surface height.
 pub const SNOW_CAP_HEIGHT: i32 = 96;
-
-/// Trees only grow on Plains/Forest land in this surface-height band. The
-/// lower bound is above the beach band (so never on Sand) and the upper bound
-/// stays below the mountain stone threshold (so never on mountain rock). The
-/// gate is the pre-season terrain class, not the post-season surface block:
-/// Winter keeps its trees even though the surface becomes Snow (D088).
-pub const TREE_MIN_HEIGHT: i32 = SEA_LEVEL + BEACH_BAND + 1;
-pub const TREE_MAX_HEIGHT: i32 = MOUNTAIN_HEIGHT_THRESHOLD - 1;
-
-/// Tallest trunk any oak can generate, in blocks above its column surface.
-/// `oak_tree_at` returns `4..=TREE_MAX_TRUNK_HEIGHT`.
-const TREE_MAX_TRUNK_HEIGHT: i32 = 5;
-
-/// How far the canopy rises above the highest trunk cell.
-const TREE_CANOPY_TOP_OVER_TRUNK: i32 = 1;
-
-/// Tallest emitted oak cell above its column surface. Branches sit on the
-/// upper trunk, so they are strictly below this bound; the canopy top is the
-/// binding cell.
-const TREE_MAX_HEIGHT_OVER_SURFACE: i32 = TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK;
-
-/// Vertical headroom reserved above `MAX_TERRAIN_HEIGHT` for a trunk, its
-/// branches and its canopy. One spare block beyond the tallest emitted cell
-/// keeps the uniform-Air fast path provably above every possible tree cell, so
-/// it can never clip a branch. The derivation is asserted in the tests.
-const TREE_CANOPY_HEADROOM: i32 = TREE_MAX_HEIGHT_OVER_SURFACE + 1;
-
-/// Branch cells are single OakLog blocks one block out from the trunk. Four
-/// cardinal directions keep every branch inside the chunk interior (the trunk
-/// sits at `3..29`, so `2..30` is still strictly interior) and inside the
-/// `SPAWN_TREE_CLEARANCE` clearing radius shared with the trunk.
-const TREE_BRANCH_DIRECTIONS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-const TREE_BRANCH_MIN: i32 = 2;
-const TREE_BRANCH_MAX: i32 = 4;
 
 /// World-aligned cave lattice spacing in blocks. Sampling the density on a
 /// 4-block grid (9 corners per 32-block chunk axis) keeps cave generation
@@ -865,88 +825,6 @@ fn place_ruin_at(
     }
 }
 
-/// A deterministic oak's full vertical model: the trunk length plus the bits
-/// that select its branch cells.
-///
-/// Produced by [`oak_tree_at`], the single placement rule shared by the chunk
-/// generator, the spawn search and the tests. The model is a pure function of
-/// `(position, height, biome, seed)` — deliberately season-blind (D088), so a
-/// Winter tree keeps its trunk and branches while only its leaves are omitted
-/// from the emission pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct OakTree {
-    /// Trunk length in blocks above the column surface, `4..=TREE_MAX_TRUNK_HEIGHT`.
-    trunk_height: i32,
-    /// Deterministic bits selecting the branch count and rotation.
-    branch_bits: u32,
-}
-
-impl OakTree {
-    /// Deterministic upper-trunk branch cells `(wx, wy, wz)`, `2..=4` of them.
-    ///
-    /// Each branch is a single OakLog one block out from the trunk in a
-    /// distinct cardinal direction, descending from just below the trunk top.
-    /// Directions are rotated by the per-seed hash (never by season), so the
-    /// same tree is identical in every season and across regenerations.
-    fn branch_cells(self, wx: i32, wz: i32, h: i32) -> impl Iterator<Item = (i32, i32, i32)> {
-        let count =
-            TREE_BRANCH_MIN + (self.branch_bits & 1) as i32 + ((self.branch_bits >> 1) & 1) as i32;
-        debug_assert!((TREE_BRANCH_MIN..=TREE_BRANCH_MAX).contains(&count));
-        let rotation = ((self.branch_bits >> 2) & 3) as usize;
-        (0..count).map(move |i| {
-            let (dx, dz) = TREE_BRANCH_DIRECTIONS[(rotation + i as usize) % 4];
-            // Upper trunk: two branches pair at the highest cell, then two at
-            // the cell below it. Always at or below the trunk top.
-            let dy = self.trunk_height - 1 - i / 2;
-            (wx + dx, h + dy, wz + dz)
-        })
-    }
-}
-
-/// The deterministic oak this column grows, or `None` when the column is
-/// ineligible.
-///
-/// Single source of truth shared by `generate_chunk_seeded` and
-/// `find_spawn_column`: the interior-only placement rule, the tree height band,
-/// the per-biome hash gate and the model (trunk + branches) all live here, so
-/// the spawn search can reject a column the generator would fill with OakLog
-/// without duplicating the rule. The gate is the pre-season terrain class
-/// (Plains/Forest + the Grass height band), never the post-season surface
-/// block, so Winter trees persist (D088).
-fn oak_tree_at(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<OakTree> {
-    // Trees only grow on the chunk interior (3..29) so canopies never cross a
-    // chunk border.
-    let lx = wx.rem_euclid(CHUNK_SIZE as i32);
-    let lz = wz.rem_euclid(CHUNK_SIZE as i32);
-    if !(3..29).contains(&lx) || !(3..29).contains(&lz) {
-        return None;
-    }
-    // `TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT` is exactly the pre-season Grass
-    // band: above the Sand beach shelf and below Mountain stone. Beaches and
-    // seabeds are below it, mountain stone above it, so both stay tree-free
-    // without consulting a seasonal surface block.
-    if !(TREE_MIN_HEIGHT..=TREE_MAX_HEIGHT).contains(&h) {
-        return None;
-    }
-    let tree_hash = hash2d(wx, wz, 777 ^ seed);
-    let gate = match biome {
-        Biome::Forest => (tree_hash & 0x0F) == 0,
-        Biome::Plains => (tree_hash & 0xFF) == 0,
-        Biome::Mountains | Biome::Ocean => false,
-    };
-    gate.then(|| OakTree {
-        trunk_height: 4 + ((tree_hash >> 8) & 1) as i32,
-        branch_bits: (tree_hash >> 9) & 0x0F,
-    })
-}
-
-/// Trunk height of the oak at this column, or `None` when it grows no tree.
-/// Convenience wrapper used by the spawn search and tests that only need the
-/// trunk; the generator uses [`oak_tree_at`] for the branches too.
-fn tree_trunk_height(wx: i32, wz: i32, h: i32, biome: Biome, seed: u32) -> Option<i32> {
-    oak_tree_at(wx, wz, h, biome, seed).map(|tree| tree.trunk_height)
-}
-
 /// Wall material for a footprint offset: Brick on the four corner pillars,
 /// Cobblestone on the wall runs between them. Both are already complete,
 /// legal-edit opaque blocks, so ruins add no block ids and no registry rows.
@@ -977,121 +855,6 @@ fn ruin_cell_bottom(dx: i32, dz: i32) -> i32 {
 fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
     let corner = dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF;
     wall_height + i32::from(corner)
-}
-
-/// Minimum surface height of a spawnable column: two blocks above the named sea
-/// level, so the player always starts on dry land above the water line rather
-/// than on the seabed. The Sand beach band can still reach `SEA_LEVEL +
-/// BEACH_BAND`, so a spawn on the shoreline shelf is possible (and safe);
-/// `SPAWN_MIN_HEIGHT` is the D071 threshold from the plan.
-pub const SPAWN_MIN_HEIGHT: i32 = SEA_LEVEL + 2;
-
-/// Horizontal Chebyshev radius of the tree-free clearing demanded around a
-/// spawn column.
-///
-/// A generated canopy reaches two blocks out from its trunk, so rejecting every
-/// tree within this radius guarantees no trunk or neighbour leaf can occupy the
-/// player's feet/head blocks (surface + 1..=surface + 4).
-const SPAWN_TREE_CLEARANCE: i32 = 2;
-
-/// Bounded Chebyshev radius (blocks) of the deterministic spawn search.
-///
-/// Sized from the terrain distribution, not guessed: a scan of 10_000 hashed
-/// seeds found the first safe land column within 365 blocks of (0, 0) in the
-/// worst case, so 512 leaves headroom while keeping the pathological
-/// no-land-found path to ~1M height samples.
-pub const SPAWN_SEARCH_RADIUS: i32 = 512;
-
-/// Whether a player can safely spawn on this column: land above the water line,
-/// with no generated oak trunk or neighbour canopy overhead.
-fn is_spawn_safe(wx: i32, wz: i32, seed: u32) -> bool {
-    let h = terrain_height_at_seeded(wx, wz, seed);
-    if h < SPAWN_MIN_HEIGHT {
-        return false;
-    }
-    // Land-biome policy stated explicitly rather than inferred: Ocean is
-    // exactly `h < SEA_LEVEL`, so this can only fire if that coupling ever
-    // breaks, and then the search keeps moving instead of spawning in water.
-    if biome_for_height(h, forest_noise(wx, wz, seed)) == Biome::Ocean {
-        return false;
-    }
-    for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
-        for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
-            let nx = wx + dx;
-            let nz = wz + dz;
-            let nh = terrain_height_at_seeded(nx, nz, seed);
-            let nb = biome_for_height(nh, forest_noise(nx, nz, seed));
-            if tree_trunk_height(nx, nz, nh, nb, seed).is_some() {
-                return false;
-            }
-        }
-    }
-    // Ruin clearance (S07): a footprint column is unsafe because the tallest
-    // ruin cell is `surface + 4` — the top of the spawn body — so a spawn here
-    // would be buried inside a wall or corner pillar. `ruin_covers` shares
-    // the placement rule with the generator, so the footprint shape and gate
-    // are never duplicated here.
-    if ruin_covers(wx, wz, seed) {
-        return false;
-    }
-    true
-}
-
-/// Deterministic, bounded land search for the player spawn column.
-///
-/// Scans fixed-order square rings outward from (0, 0) — every ring clockwise
-/// from its north edge — and returns the first column that is land
-/// (`SPAWN_MIN_HEIGHT` or higher, never `Biome::Ocean`) with a tree-free
-/// clearing (see `SPAWN_TREE_CLEARANCE`). Pure in `seed`: the same seed always
-/// yields the same column, with no clock, RNG, or shared state (R001).
-///
-/// D071: after the four-biome rewrite column (0, 0) can be open ocean for a
-/// given seed, and spawning there would drop the player on the seabed (and a
-/// tree column would swallow the surface + 4 spawn in OakLog). The search is
-/// bounded by `SPAWN_SEARCH_RADIUS`; if it finds nothing it panics loudly
-/// instead of silently returning an unsafe column.
-pub fn find_spawn_column(seed: u32) -> (i32, i32) {
-    find_spawn_column_within(seed, SPAWN_SEARCH_RADIUS)
-}
-
-/// `find_spawn_column` with an explicit bound, so the loud failure path is
-/// directly testable without needing a pathological seed.
-fn find_spawn_column_within(seed: u32, max_radius: i32) -> (i32, i32) {
-    assert!(max_radius >= 0, "spawn search radius must be non-negative");
-    if is_spawn_safe(0, 0, seed) {
-        return (0, 0);
-    }
-    for radius in 1..=max_radius {
-        // North edge: west -> east.
-        for wx in -radius..=radius {
-            if is_spawn_safe(wx, -radius, seed) {
-                return (wx, -radius);
-            }
-        }
-        // East edge: north -> south (the north-east corner was visited above).
-        for wz in (-radius + 1)..=radius {
-            if is_spawn_safe(radius, wz, seed) {
-                return (radius, wz);
-            }
-        }
-        // South edge: east -> west.
-        for wx in (-radius..radius).rev() {
-            if is_spawn_safe(wx, radius, seed) {
-                return (wx, radius);
-            }
-        }
-        // West edge: south -> north (both corners were visited above).
-        for wz in (-radius + 1..radius).rev() {
-            if is_spawn_safe(-radius, wz, seed) {
-                return (-radius, wz);
-            }
-        }
-    }
-    panic!(
-        "terrain: no land spawn column within {max_radius} blocks of (0, 0) for seed {seed} \
-         (need h >= SPAWN_MIN_HEIGHT {SPAWN_MIN_HEIGHT} and no oak within \
-         {SPAWN_TREE_CLEARANCE} blocks) — raise SPAWN_SEARCH_RADIUS or fix the height envelope"
-    );
 }
 
 /// Generates `pos` with the default world seed and [`Season::Summer`].
@@ -2346,78 +2109,6 @@ mod tests {
             wz.rem_euclid(CHUNK_SIZE as i32) as usize,
         )
     }
-    /// Positive + determinism: the spawn column is always land above the water
-    /// line, is identical across repeat calls (R001 purity), and has no tree
-    /// trunk or neighbour canopy inside the spawn body.
-    #[test]
-    fn test_find_spawn_column_is_land_above_sea_level_and_deterministic() {
-        // Includes seeds whose (0, 0) column is open ocean after the T03
-        // rewrite (12345 -> h 8, 4 -> h 2, VISTA_SEED -> h -2) beside seeds
-        // whose origin is already safe, plus the seed with the widest observed
-        // search ring (2400638911 -> 365 blocks).
-        for seed in [DEFAULT_WORLD_SEED, 12345, 9, 4, 0x5EED_4A11, 2_400_638_911] {
-            let (wx, wz) = find_spawn_column(seed);
-            let h = terrain_height_at_seeded(wx, wz, seed);
-            assert!(
-                h >= SPAWN_MIN_HEIGHT,
-                "seed {seed} spawn ({wx}, {wz}) has h {h} below SPAWN_MIN_HEIGHT {SPAWN_MIN_HEIGHT}"
-            );
-            assert!(
-                h <= MAX_TERRAIN_HEIGHT,
-                "seed {seed} spawn ({wx}, {wz}) leaves the height envelope"
-            );
-            assert_ne!(
-                biome_at_seeded(wx, wz, seed),
-                Biome::Ocean,
-                "seed {seed} spawned in an ocean column"
-            );
-            assert_eq!(
-                find_spawn_column(seed),
-                (wx, wz),
-                "seed {seed} spawn search must be byte-identical across repeats"
-            );
-            // Tree clearance: no oak within the canopy radius, so the surface+4
-            // spawn can never be inside a trunk or a neighbour's leaves.
-            for dz in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
-                for dx in -SPAWN_TREE_CLEARANCE..=SPAWN_TREE_CLEARANCE {
-                    let nx = wx + dx;
-                    let nz = wz + dz;
-                    let nh = terrain_height_at_seeded(nx, nz, seed);
-                    let nb = biome_for_height(nh, forest_noise(nx, nz, seed));
-                    assert_eq!(
-                        tree_trunk_height(nx, nz, nh, nb, seed),
-                        None,
-                        "seed {seed} spawn ({wx}, {wz}) is within {SPAWN_TREE_CLEARANCE} blocks of a tree at ({nx}, {nz})"
-                    );
-                }
-            }
-        }
-    }
-
-    /// The common case stays put: a safe origin column keeps the spawn at
-    /// (0, 0), so the search changes nothing for the default world.
-    #[test]
-    fn test_find_spawn_column_keeps_a_safe_origin() {
-        let seed = DEFAULT_WORLD_SEED;
-        assert!(is_spawn_safe(0, 0, seed));
-        assert_eq!(find_spawn_column(seed), (0, 0));
-    }
-
-    /// Negative/envelope: when (0, 0) is open ocean the search must move to
-    /// land instead of pinning the old fixed column.
-    #[test]
-    fn test_find_spawn_column_moves_off_an_ocean_origin() {
-        let seed = 12345u32;
-        assert!(
-            terrain_height_at_seeded(0, 0, seed) < SEA_LEVEL,
-            "test premise: seed {seed} must have an ocean at (0, 0)"
-        );
-        assert_eq!(biome_at_seeded(0, 0, seed), Biome::Ocean);
-        let (wx, wz) = find_spawn_column(seed);
-        assert_ne!((wx, wz), (0, 0));
-        assert!(terrain_height_at_seeded(wx, wz, seed) >= SPAWN_MIN_HEIGHT);
-    }
-
     /// Integration: the block the player's feet occupy (surface + 1..=+4) is
     /// Air in the actually generated chunk, so no trunk, leaf, or water block
     /// sits inside the spawn body.
@@ -2445,23 +2136,6 @@ mod tests {
         }
     }
 
-    /// Failure mode: a bound too small for the seed panics loudly with the
-    /// search parameters instead of silently returning an unsafe column.
-    #[test]
-    #[should_panic(expected = "no land spawn column within 8 blocks")]
-    fn test_find_spawn_column_fails_loudly_when_bounded_out() {
-        let seed = 12345u32;
-        // Premise: the first safe column for this seed is far outside 8 blocks.
-        for wx in -8..=8 {
-            for wz in -8..=8 {
-                assert!(
-                    !is_spawn_safe(wx, wz, seed),
-                    "test premise: ({wx}, {wz}) is safe, widen the bound"
-                );
-            }
-        }
-        let _ = find_spawn_column_within(seed, 8);
-    }
     /// Surface skin follows the biome: sand seabed and beaches, grass/dirt on
     /// plains and forest, stone (or snow high up) on mountains. The three-block
     /// subsurface band stays solid so caves never open the surface.
@@ -4547,63 +4221,6 @@ mod tests {
             winter_logs, summer_logs,
             "winter changed the oak log skeleton ({summer_logs} summer logs vs \
              {winter_logs} winter logs); only leaves may be seasonal (D088)"
-        );
-    }
-
-    /// The model bound used by `TREE_CANOPY_HEADROOM` must cover every emitted
-    /// cell — trunk, branch and canopy — so the uniform-Air fast path can never
-    /// clip a branch. Pins the constants together with a sampled scan.
-    #[test]
-    fn test_tree_model_bounds_fit_the_canopy_headroom() {
-        const {
-            assert!(
-                TREE_MAX_HEIGHT_OVER_SURFACE >= TREE_MAX_TRUNK_HEIGHT + TREE_CANOPY_TOP_OVER_TRUNK,
-                "the max tree height must cover the tallest trunk plus its canopy top"
-            );
-            assert!(
-                TREE_CANOPY_HEADROOM > TREE_MAX_HEIGHT_OVER_SURFACE,
-                "headroom must leave at least one spare block above the tallest tree cell"
-            );
-            assert!(
-                MAX_TERRAIN_HEIGHT + TREE_CANOPY_HEADROOM < 4 * CHUNK_SIZE as i32,
-                "the top chunk layer must stay provably air with tree headroom"
-            );
-        }
-
-        let seed = DEFAULT_WORLD_SEED;
-        let mut sampled = 0usize;
-        for wz in -256..=256 {
-            for wx in -256..=256 {
-                let h = terrain_height_at_seeded(wx, wz, seed);
-                let biome = biome_at_seeded(wx, wz, seed);
-                let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
-                    continue;
-                };
-                sampled += 1;
-                assert!(
-                    (4..=TREE_MAX_TRUNK_HEIGHT).contains(&tree.trunk_height),
-                    "trunk height {} outside the headroom derivation at ({wx}, {wz})",
-                    tree.trunk_height
-                );
-                for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
-                    assert!(
-                        (1..=TREE_MAX_HEIGHT_OVER_SURFACE).contains(&(by - h)),
-                        "branch cell ({bx}, {by}, {bz}) is outside the headroom derivation"
-                    );
-                    assert!(
-                        (2..=CHUNK_SIZE as i32 - 3).contains(&bx.rem_euclid(CHUNK_SIZE as i32)),
-                        "branch x {bx} left the chunk interior"
-                    );
-                    assert!(
-                        (2..=CHUNK_SIZE as i32 - 3).contains(&bz.rem_euclid(CHUNK_SIZE as i32)),
-                        "branch z {bz} left the chunk interior"
-                    );
-                }
-            }
-        }
-        assert!(
-            sampled > 0,
-            "no oak sampled in the model-bound region (test is vacuous)"
         );
     }
 
