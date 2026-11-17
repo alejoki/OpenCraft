@@ -478,6 +478,9 @@ impl WorldSession {
             ContentRegistry::builtin_arc(),
             None,
             None,
+            // v1-v9 loads carry no validated crop section: rebuild the
+            // candidates from the edit map exactly as before.
+            None,
         )
     }
 
@@ -490,12 +493,14 @@ impl WorldSession {
     pub fn from_loaded_world(loaded: LoadedWorld, save_path: PathBuf) -> WorldSession {
         let content_notice = loaded.content_notice();
         let saved_config = loaded.saved_config;
+        let crops = loaded.crops;
         Self::session_from_save_with_registry(
             loaded.data,
             save_path,
             Arc::new(loaded.registry),
             content_notice,
             saved_config,
+            crops,
         )
     }
 
@@ -513,6 +518,7 @@ impl WorldSession {
         registry: Arc<ContentRegistry>,
         content_notice: Option<String>,
         saved_config: Option<SaveConfigMeta>,
+        crops: Option<Vec<IVec3>>,
     ) -> WorldSession {
         let WorldSaveData {
             seed,
@@ -546,8 +552,13 @@ impl WorldSession {
         player.restore_selected_slot(saved.selected_slot as usize);
         // Rebuild growth candidates from the persisted stage edits *before*
         // the edit map is moved into the world manager. Progress restarts at
-        // zero: only the visible stage survives a save.
-        let crops = CropRuntime::from_edits(&chunk_edits);
+        // zero: only the visible stage survives a save. A v10 load carries
+        // the already-validated crop section, so its 10M-edit load skips the
+        // edit-map scan entirely; v1-v9 and hand-built loads scan as before.
+        let crops = match crops {
+            Some(positions) => CropRuntime::from_positions(&positions),
+            None => CropRuntime::from_edits(&chunk_edits),
+        };
         // Restore the live mob records from the v7 tail. Each record re-anchors
         // `home` at the saved feet position and keeps the saved health, so
         // damage survives a reload; every ephemeral runtime field (velocity,
@@ -2579,6 +2590,7 @@ mod tests {
                 registry: ContentRegistry::builtin().clone(),
                 saved_content: None,
                 saved_config: Some(saved),
+                crops: None,
                 unresolved: 0,
             },
             PathBuf::from("/tmp/v9-config.mcvx"),
@@ -5381,6 +5393,61 @@ mod tests {
         assert_eq!(restored.crops.progress(IVec3::new(3, 2, 3)), Some(0.0));
         assert_eq!(restored.crops.progress(IVec3::new(4, 2, 3)), None);
         assert_eq!(restored.crops.progress(IVec3::new(5, 2, 3)), None);
+    }
+
+    #[test]
+    fn from_loaded_world_installs_crop_candidates_from_the_v10_crop_section() {
+        use crate::world::chunk::linear_index;
+        use crate::world::persistence::{load_world_from_path_with, save_world_to_path};
+
+        let mut edits = ChunkEditMap::default();
+        let chunk = ChunkPos::new(0, 0, 0);
+        for (index, block) in [
+            (linear_index(1, 2, 3), BlockId::WheatStage0),
+            (linear_index(2, 2, 3), BlockId::WheatStage1),
+            (linear_index(3, 2, 3), BlockId::WheatStage2),
+            (linear_index(4, 2, 3), BlockId::WheatStage3),
+            (linear_index(5, 2, 3), BlockId::Farmland),
+        ] {
+            edits.insert_block(chunk, index as u16, block);
+        }
+        let mut data = make_save(1);
+        data.chunk_edits = edits;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crops-from-section.mcvx");
+        save_world_to_path(&path, &data).expect("the save writes");
+
+        let loaded =
+            load_world_from_path_with(&path, ContentRegistry::builtin()).expect("the save loads");
+        assert_eq!(
+            loaded.crops,
+            Some(vec![
+                IVec3::new(1, 2, 3),
+                IVec3::new(2, 2, 3),
+                IVec3::new(3, 2, 3),
+            ]),
+            "the crop section carries exactly the immature wheat positions"
+        );
+        assert!(
+            loaded
+                .data
+                .chunk_edits
+                .values()
+                .all(|section| section.is_palette()),
+            "every v10-loaded section is palette"
+        );
+
+        let restored = WorldSession::from_loaded_world(loaded, path);
+        assert_eq!(restored.crops.len(), 3);
+        for pos in [
+            IVec3::new(1, 2, 3),
+            IVec3::new(2, 2, 3),
+            IVec3::new(3, 2, 3),
+        ] {
+            assert_eq!(restored.crops.progress(pos), Some(0.0));
+        }
+        assert_eq!(restored.crops.progress(IVec3::new(4, 2, 3)), None);
     }
 
     #[test]
@@ -8475,6 +8542,7 @@ mod tests {
                 digest: 0x1234,
             }),
             saved_config: None,
+            crops: None,
             unresolved: 1,
         };
 
@@ -8672,6 +8740,7 @@ mod tests {
             Arc::clone(&registry),
             None,
             None,
+            None,
         );
         assert_eq!(
             (*restored.world.worldgen_rules()).as_ref(),
@@ -8685,6 +8754,7 @@ mod tests {
                 registry: (*registry).clone(),
                 saved_content: None,
                 saved_config: None,
+                crops: None,
                 unresolved: 0,
             },
             PathBuf::from("/tmp/loaded-rules.mcvx"),
@@ -8723,6 +8793,7 @@ mod tests {
             registry,
             saved_content: None,
             saved_config: None,
+            crops: None,
             unresolved: 0,
         };
         let session =

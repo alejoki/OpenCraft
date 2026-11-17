@@ -743,6 +743,13 @@ pub struct LoadedWorld {
     pub registry: ContentRegistry,
     pub saved_content: Option<SaveContentMeta>,
     pub saved_config: Option<SaveConfigMeta>,
+    /// Immature-wheat crop candidates decoded from the v10 crop section.
+    ///
+    /// `Some(positions)` for v10 only: every position was validated against
+    /// the decoded chunk edits inside the fail-closed decoder. `None` for
+    /// v1-v9 payloads (no crop section) and for hand-built test literals, so
+    /// the session falls back to scanning the edit map.
+    pub crops: Option<Vec<IVec3>>,
     pub unresolved: usize,
 }
 
@@ -2964,6 +2971,7 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
         registry: resolver.registry,
         saved_content: Some(SaveContentMeta { packs, digest }),
         saved_config,
+        crops: None,
         unresolved,
     })
 }
@@ -3225,13 +3233,31 @@ fn build_v10_sections(
         }
         chunk_index.extend_from_slice(&edit_count.to_le_bytes());
 
-        let mut sorted_edits: Vec<(u16, u16)> = Vec::with_capacity(edits.len());
-        for (&local, &block) in edits.iter() {
-            let name_index =
-                table.index_of(ContentKind::Block, content_name_of_block(registry, block)?)?;
-            sorted_edits.push((local, name_index));
-        }
-        sorted_edits.sort_by_key(|&(local, _)| local);
+        // Palette sections resolve each distinct palette block to a content
+        // index once, then map the already-ascending `(local, slot)` edits
+        // through that table; no per-edit name lookup and no re-sort. Dense
+        // sections keep the pre-palette per-edit path and sort by local.
+        let sorted_edits: Vec<(u16, u16)> = if let Some((blocks, edits)) = edits.palette_parts() {
+            let mut slots: Vec<u16> = Vec::with_capacity(blocks.len());
+            for &block in blocks {
+                slots.push(
+                    table.index_of(ContentKind::Block, content_name_of_block(registry, block)?)?,
+                );
+            }
+            edits
+                .iter()
+                .map(|&(local, slot)| (local, slots[usize::from(slot)]))
+                .collect()
+        } else {
+            let mut sorted_edits: Vec<(u16, u16)> = Vec::with_capacity(edits.len());
+            for (&local, &block) in edits.iter() {
+                let name_index =
+                    table.index_of(ContentKind::Block, content_name_of_block(registry, block)?)?;
+                sorted_edits.push((local, name_index));
+            }
+            sorted_edits.sort_by_key(|&(local, _)| local);
+            sorted_edits
+        };
 
         let mut body = Vec::new();
         opencraft_storage::chunk_section::encode_chunk_section(&mut body, &sorted_edits)?;
@@ -3957,18 +3983,15 @@ fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, P
         if section.len() as u32 != edit_count {
             return Err(PersistenceError::InvalidChunkIndex);
         }
-        let mut edits = FxHashMap::default();
-        for &(local, palette_index) in section.edits() {
-            let content_index = *section.palette().get(usize::from(palette_index)).ok_or(
-                PersistenceError::InvalidChunkSection(StorageError::PaletteIndexOutOfRange {
-                    index: palette_index,
-                    palette_len: section.palette().len() as u16,
-                }),
-            )?;
-            let block = resolver.block_at(content_index)?;
-            edits.insert(local, block);
+        // Resolve every palette entry exactly once, eagerly, inside the load:
+        // a non-block or out-of-range entry fails closed here instead of on a
+        // later chunk access. Ten million edits therefore cost one palette
+        // lookup per distinct block, not one hash insert per edit.
+        let mut blocks: Vec<BlockId> = Vec::with_capacity(section.palette().len());
+        for &content_index in section.palette() {
+            blocks.push(resolver.block_at(content_index)?);
         }
-        chunk_edits.insert(pos, edits);
+        chunk_edits.insert_palette(pos, section, blocks.into_boxed_slice());
     }
 
     // Every crop position must name an immature-wheat edit in the decoded
@@ -4012,6 +4035,7 @@ fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, P
         registry: resolver.registry,
         saved_content: Some(SaveContentMeta { packs, digest }),
         saved_config,
+        crops: Some(crops),
         unresolved,
     })
 }
@@ -4039,6 +4063,7 @@ pub fn load_world_from_owned(
             registry: registry.clone(),
             saved_content: None,
             saved_config: None,
+            crops: None,
             unresolved: 0,
         })
     }
@@ -4066,6 +4091,7 @@ pub fn load_world_from_bytes_with(
             registry: registry.clone(),
             saved_content: None,
             saved_config: None,
+            crops: None,
             unresolved: 0,
         })
     }
@@ -9105,6 +9131,74 @@ mod tests {
         );
         let loaded = load_v10_bytes(v10_archive(&forward, &registry), &registry).expect("loads");
         assert_eq!(loaded.data, forward);
+    }
+
+    #[test]
+    fn v10_decoder_builds_palette_sections_and_returns_crop_candidates() {
+        let registry = ContentRegistry::builtin().clone();
+        let data = v10_rich_data();
+        let loaded = load_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
+
+        // Logical equality holds despite the representation change: the
+        // decoder stores every chunk as Palette, the input map is Dense.
+        assert_eq!(loaded.data, data);
+        assert!(!loaded.data.chunk_edits.is_empty());
+        assert!(
+            loaded
+                .data
+                .chunk_edits
+                .values()
+                .all(EditSection::is_palette),
+            "every decoded v10 chunk section must stay in palette form"
+        );
+        assert_eq!(
+            loaded.crops,
+            Some(vec![IVec3::new(-31, 66, 131)]),
+            "the rich fixture's only immature wheat edit becomes a validated crop candidate"
+        );
+    }
+
+    #[test]
+    fn v10_mixed_palette_and_dense_map_roundtrips_and_resaves_stably() {
+        let registry = ContentRegistry::builtin().clone();
+        let data = v10_rich_data();
+        let original = v10_archive(&data, &registry);
+        let loaded = load_v10_bytes(original.clone(), &registry).expect("loads");
+        assert_eq!(
+            v10_archive(&loaded.data, &loaded.registry),
+            original,
+            "an unmodified palette load re-saves byte-stably"
+        );
+
+        // Convert exactly one palette chunk to Dense while another stays
+        // Palette, then prove the mixed map saves, reloads and preserves every
+        // value (and that the converted save is itself byte-stable).
+        let converted = ChunkPos::new(-1, 2, 4);
+        let untouched = ChunkPos::new(0, 0, 0);
+        let mut mixed = loaded.data;
+        mixed
+            .chunk_edits
+            .insert_block(converted, linear_index(0, 0, 1) as u16, BlockId::Sand);
+        assert!(!mixed.chunk_edits[&converted].is_palette());
+        assert!(mixed.chunk_edits[&untouched].is_palette());
+
+        let mixed_bytes = v10_archive(&mixed, &loaded.registry);
+        let reloaded =
+            load_v10_bytes(mixed_bytes.clone(), &loaded.registry).expect("the mixed map reloads");
+        assert_eq!(reloaded.data, mixed);
+        assert!(
+            reloaded
+                .data
+                .chunk_edits
+                .values()
+                .all(EditSection::is_palette),
+            "the reloaded mixed save is palette again"
+        );
+        assert_eq!(
+            v10_archive(&reloaded.data, &loaded.registry),
+            mixed_bytes,
+            "a decoded mixed save re-saves byte-stably"
+        );
     }
 
     #[test]

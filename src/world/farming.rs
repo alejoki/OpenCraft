@@ -89,6 +89,20 @@ impl CropRuntime {
         runtime
     }
 
+    /// Rebuilds candidates from an already-validated v10 crop section.
+    ///
+    /// Every position was proven at decode time to name an immature-wheat
+    /// edit, so this path does no edit-map scan at all: the 10M-edit load
+    /// cannot pay the [`CropRuntime::from_edits`] pass. Progress restarts at
+    /// `0.0` because progress is not persisted.
+    pub fn from_positions(positions: &[IVec3]) -> Self {
+        let mut runtime = Self::default();
+        for &pos in positions {
+            runtime.growth.insert(pos, 0.0);
+        }
+        runtime
+    }
+
     /// Adds (or restarts) a candidate at progress `0.0`.
     pub fn insert(&mut self, pos: IVec3) {
         self.growth.insert(pos, 0.0);
@@ -320,6 +334,26 @@ mod tests {
         assert_eq!(runtime.progress(IVec3::new(-1, 64, -95)), Some(0.0));
         assert_eq!(runtime.progress(IVec3::new(1, 1, 1)), None);
         assert_eq!(runtime.progress(IVec3::new(8, 8, 8)), None);
+    }
+
+    #[test]
+    fn from_positions_keeps_every_candidate_at_zero_progress() {
+        let positions = [
+            IVec3::new(-3, 70, 4),
+            IVec3::new(0, 0, 0),
+            IVec3::new(31, 70, -1),
+        ];
+        let runtime = CropRuntime::from_positions(&positions);
+        assert_eq!(runtime.len(), positions.len());
+        for pos in positions {
+            assert_eq!(runtime.progress(pos), Some(0.0));
+        }
+        assert_eq!(runtime.progress(IVec3::new(1, 1, 1)), None);
+
+        let mut empty = CropRuntime::from_positions(&[]);
+        assert!(empty.is_empty());
+        empty.insert(IVec3::new(2, 2, 2));
+        assert_eq!(empty.len(), 1);
     }
 
     #[test]

@@ -20,17 +20,19 @@
 //!
 //! Printed lines:
 //! - `cold_load_v9:` / `cold_load_v10:` — the per-fixture distributions;
+//!   the v10 line additionally reports `palette_sections` and `crops`.
 //! - `cold_load_compare:` — same-run v9/v10 p50, speedup, the frozen target
-//!   value (report-only here), both first-area/full-verify phases and both
-//!   checksums;
+//!   value, both first-area/full-verify phases and both checksums;
 //! - `cold_load_target:` — the frozen D316/D321 target line, unchanged from
 //!   S01 (S08 pins its fields);
+//! - `cold_load_gate:` — the guardrail limits the v10 leg must also meet;
 //! - `cold_load_1m_compare:` — the 1M-edit report-only pair (D316/D321);
 //! - `cold_load_migration:` — v9 -> session -> v10 -> reload proof.
 //!
-//! T01 deliberately does **not** assert the 159.815 ms target: today's eager
-//! v10 decoder is expected to miss it (its per-edit map build is the cost S03
-//! removes), and T03 owns enabling the gate.
+//! T03 enables the gate: the v10 decoder stores every chunk section in
+//! palette form, so `storage_session_p50_ms` must meet the frozen 159.815 ms
+//! target, first-area must not regress, and full-verify must stay within the
+//! guardrail. The 1M pair stays report-only.
 //!
 //! Run:
 //!
@@ -306,6 +308,10 @@ struct Distribution {
     checksum: u64,
     crop_scan_ms: f64,
     first_area_ms: f64,
+    /// Sections decoded in Palette form (v10: all of them, v9: zero).
+    palette_sections: usize,
+    /// Crop candidates carried by the v10 crop section (`None`/0 for v9).
+    crops: usize,
 }
 
 impl Distribution {
@@ -397,6 +403,8 @@ fn measure(
     expected_chunks: usize,
     expected_edits: usize,
     targets: &[ChunkPos],
+    expected_palette_sections: usize,
+    expected_crops: usize,
 ) -> Distribution {
     // One warm-up load+session: page cache and lazily-built registry/static
     // state must not land in the measured distribution.
@@ -413,12 +421,34 @@ fn measure(
 
     let mut measured = Vec::with_capacity(samples);
     let mut checksums = Vec::with_capacity(samples);
+    let mut palette_sections = 0usize;
+    let mut crops = 0usize;
     for sample in 0..samples {
         let outer = Instant::now();
         let storage_start = Instant::now();
         let loaded = load_world_from_path_with(path, ContentRegistry::builtin())
             .unwrap_or_else(|error| panic!("sample {sample}: load {}: {error:?}", path.display()));
         let storage_ms = storage_start.elapsed().as_secs_f64() * 1_000.0;
+
+        // Representation and crop-section facts are checked on every sample,
+        // not just once: the decoder must never silently fall back to Dense
+        // (which would still produce correct edits but lose the cold-load
+        // win).
+        palette_sections = loaded
+            .data
+            .chunk_edits
+            .values()
+            .filter(|section| section.is_palette())
+            .count();
+        assert_eq!(
+            palette_sections, expected_palette_sections,
+            "sample {sample}: expected {expected_palette_sections} palette sections, got {palette_sections}"
+        );
+        crops = loaded.crops.as_ref().map_or(0, Vec::len);
+        assert_eq!(
+            crops, expected_crops,
+            "sample {sample}: expected {expected_crops} crop candidates, got {crops}"
+        );
 
         let session_start = Instant::now();
         let session = WorldSession::from_loaded_world(loaded, path.to_path_buf());
@@ -476,6 +506,8 @@ fn measure(
         checksum,
         crop_scan_ms,
         first_area_ms,
+        palette_sections,
+        crops,
     }
 }
 
@@ -504,6 +536,31 @@ fn print_distribution(label: &str, d: &Distribution) {
     );
 }
 
+/// Print the v10 distribution line: the frozen v9 fields plus the palette and
+/// crop-section facts that prove the decoder took the compact path.
+fn print_distribution_v10(d: &Distribution) {
+    println!(
+        "cold_load_v10: edits={} chunks={} samples={} file_bytes={} storage_p50_ms={:.3} storage_p95_ms={:.3} storage_max_ms={:.3} session_p50_ms={:.3} session_p95_ms={:.3} storage_session_p50_ms={:.3} storage_session_p95_ms={:.3} crop_scan_ms={:.3} first_area_ms={:.3} full_verify_p50_ms={:.3} checksum=0x{:016x} palette_sections={} crops={}",
+        d.edits,
+        d.chunks,
+        d.samples.len(),
+        d.file_bytes,
+        d.p50(|sample| sample.storage_ms),
+        d.p95(|sample| sample.storage_ms),
+        d.max(|sample| sample.storage_ms),
+        d.p50(|sample| sample.session_ms),
+        d.p95(|sample| sample.session_ms),
+        d.p50(|sample| sample.storage_session_ms),
+        d.p95(|sample| sample.storage_session_ms),
+        d.crop_scan_ms,
+        d.first_area_ms,
+        d.p50(|sample| sample.full_verify_ms),
+        d.checksum,
+        d.palette_sections,
+        d.crops,
+    );
+}
+
 /// Release-only 10M-edit v9/v10 cold-load baseline, comparison and migration.
 ///
 /// A debug build must never be able to "pass" this harness: it would measure
@@ -526,10 +583,26 @@ fn cold_load_release_baseline() {
     // from the same `WorldSaveData`.
     let fixtures = write_fixtures(dir.path(), "cold_load", EDIT_TARGET, Some(PINNED_V9_10M));
 
-    let v9 = measure(&fixtures.v9, SAMPLES, CHUNK_COUNT, EDIT_TARGET, &targets);
+    let v9 = measure(
+        &fixtures.v9,
+        SAMPLES,
+        CHUNK_COUNT,
+        EDIT_TARGET,
+        &targets,
+        0,
+        0,
+    );
     print_distribution("cold_load_v9", &v9);
-    let v10 = measure(&fixtures.v10, SAMPLES, CHUNK_COUNT, EDIT_TARGET, &targets);
-    print_distribution("cold_load_v10", &v10);
+    let v10 = measure(
+        &fixtures.v10,
+        SAMPLES,
+        CHUNK_COUNT,
+        EDIT_TARGET,
+        &targets,
+        CHUNK_COUNT,
+        0,
+    );
+    print_distribution_v10(&v10);
 
     let same_edits = v9.edits == v10.edits && v9.chunks == v10.chunks;
     let same_checksum = v9.checksum == v10.checksum;
@@ -547,8 +620,6 @@ fn cold_load_release_baseline() {
     let v10_storage_session_p50 = v10.p50(|sample| sample.storage_session_ms);
     let speedup = v9_storage_session_p50 / v10_storage_session_p50;
     let target_p50 = RECORDED_V9_STORAGE_SESSION_P50_MS * TARGET_RATIO;
-    // Report-only in T01: today's eager v10 decoder is expected to miss the
-    // target, and T03 owns the assertion once the lazy palette store lands.
     let target_met = v10_storage_session_p50 <= target_p50;
 
     println!(
@@ -575,6 +646,31 @@ fn cold_load_release_baseline() {
         "cold_load_target: fixture=10m_edits phase=storage+session recorded_v9_p50_ms={recorded:.3} measured_v9_p50_ms={v9_storage_session_p50:.3} target_p50_ms={target_p50:.3} target_ratio={TARGET_RATIO:.2} rule=storage_plus_session_p50_at_most_half_recorded_v9"
     );
 
+    // T03 gate: the palette decoder must clear the frozen target and keep the
+    // two guardrail phases from regressing. The 1M pair below stays
+    // report-only (D316/D321).
+    let v9_full_verify_p50 = v9.p50(|sample| sample.full_verify_ms);
+    let v10_full_verify_p50 = v10.p50(|sample| sample.full_verify_ms);
+    let first_area_limit_ms = v9.first_area_ms * 1.25 + 10.0;
+    let full_verify_limit_ms = v9_full_verify_p50 * 2.0 + 20.0;
+    println!(
+        "cold_load_gate: first_area_limit_ms={first_area_limit_ms:.3} full_verify_limit_ms={full_verify_limit_ms:.3} same_edits={same_edits} same_checksum={same_checksum} target_met={target_met}"
+    );
+    assert!(
+        target_met,
+        "v10 storage+session p50 {v10_storage_session_p50:.3} ms must be at most the frozen target {target_p50:.3} ms (recorded v9 {recorded:.3} ms * {TARGET_RATIO:.2})"
+    );
+    assert!(
+        v10.first_area_ms <= first_area_limit_ms,
+        "v10 first-area drain {:.3} ms must not regress past {first_area_limit_ms:.3} ms (v9 {:.3} ms * 1.25 + 10)",
+        v10.first_area_ms,
+        v9.first_area_ms,
+    );
+    assert!(
+        v10_full_verify_p50 <= full_verify_limit_ms,
+        "v10 full-verify p50 {v10_full_verify_p50:.3} ms must stay within {full_verify_limit_ms:.3} ms (v9 {v9_full_verify_p50:.3} ms * 2 + 20)"
+    );
+
     // 1M two-way report: the autosave fixture shape, report-only per
     // D316/D321 (S03's gate is the 10M cold load; this row records whether the
     // smaller world moves in the same direction).
@@ -586,6 +682,8 @@ fn cold_load_release_baseline() {
         one_million_chunks,
         ONE_MILLION_EDITS,
         &targets,
+        0,
+        0,
     );
     let v10_1m = measure(
         &one_million.v10,
@@ -593,6 +691,8 @@ fn cold_load_release_baseline() {
         one_million_chunks,
         ONE_MILLION_EDITS,
         &targets,
+        one_million_chunks,
+        0,
     );
     assert_eq!(
         v9_1m.checksum, v10_1m.checksum,
