@@ -14,32 +14,23 @@
 #     (a) exit code 0 (the multi-cycle demo watch latched its own shutdown;
 #         a `timeout` kill surfaces as 124 and is an explicit failure here).
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
-#     (c) the save exists, starts with the `MCVX` magic, and its version word
-#         is 9 — the SAVE_VERSION that inserts the content table in the header
-#         and appends the v6 survival header, the v7 mob count, the v8
-#         pack-identity + digest tail, and the v9 config schema + digest tail
-#         after the calendar tail.
-#     (d) day_index (u32 LE at byte offset 134) is exactly 4 — four dawn
-#         crossings, one per demo day.
-#     (e) season_length_days (u32 LE at byte offset 138) is the default 1.
+#     (c) the save is a valid sectioned v10 archive: `MCVX` magic, version
+#         10 at offset 4, flags 0 at offset 8, a 16-byte header, and a
+#         validated contiguous section directory (scripts/save_witness.sh).
+#     (d) section 2 (`day_index` at body offset 32) is exactly 4 — four dawn
+#         crossings, one per demo day — and `season_length_days` (body offset
+#         36) is the default 1.
+#     (e) section 1 holds zero content names, section 5 holds a zero mob
+#         count, and section 9 holds a zero chunk count, proving this fresh
+#         run is edit-free with an empty inventory and no spawned mobs.
 #
-# Why the offsets are fixed: a fresh `--new` run is edit-free by construction
-# (no mining, no placement), so the variable-length chunk section writes a
-# zero edit count and the layout is the header (36) + v8 content table (4
-# bytes: just the zero name count) + hotbar (27) + time_of_day (4) + chunk
-# count (4) + v4 inventory extension (59) = 134 bytes before the v5 calendar
-# tail. The v6 survival header (mode u8, health/hunger/air u16 each, chest
-# count u32 = 11 bytes), the v7 mob count (u32 = 4 bytes), the v8
-# pack-identity + FNV-1a digest tail (u32 pack count + u64 digest = 12 bytes),
-# and the v9 config schema + effective-value digest tail (u16 schema + u64
-# digest = 10 bytes) are appended after that tail, so the calendar offsets
-# 134/138 stay pinned.
-# Those offsets are pinned by the `V8_*` constants in
-# src/world/persistence.rs, so this script and the unit tests cannot drift
-# apart silently; the size check also requires the v6 survival header, v7 mob
-# count, the v8 pack tail, and the v9 config tail to be present. Any header
-# change before the chunk section invalidates those offsets: update the
-# persistence test consts first, then copy them here.
+# Why the old v9 flat offsets are gone: v10 replaces the single flat payload
+# with a 16-byte header, a 21-byte directory entry per section and section
+# bodies. A fresh `--new` run is edit-free by construction (no mining, no
+# placement), so the fixed sections are asserted by id instead of pinning
+# offsets that move whenever a section grows. The historical v9 edit-free
+# layout was 179 bytes with the calendar at offsets 134/138; those offsets
+# live only in docs/SAVE-NOTES.md and the frozen v9 witnesses.
 #
 # Why day 4 after one run: the default clock starts at noon (tick 6000) and
 # the T5 multi-cycle watch completes only after four summed 24,000-tick
@@ -52,23 +43,14 @@
 
 set -u
 
-# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
-# when a desktop session is live. Attach to the running session so winit can
-# create its window. Prefer the Wayland socket: Xwayland's :0 needs an xauth
-# cookie the launching shell may not have, and winit picks the X11 backend
-# whenever DISPLAY is set (it does not fall back cleanly to Wayland).
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
-        export WAYLAND_DISPLAY="wayland-0"
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
-        export DISPLAY=":0"
-    fi
-fi
-
-# Resolve the binary absolutely before changing directory.
+# Resolve the binary absolutely before changing directory, then source the
+# shared v10 archive witness helper and attach to a live display (preferring a
+# wayland-* socket).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/save_witness.sh
+source "$SCRIPT_DIR/save_witness.sh"
+smoke_detect_display
 BIN="$CRATE_ROOT/target/debug/opencraft"
 
 if [[ ! -x "$BIN" ]]; then
@@ -83,27 +65,14 @@ TEMP_DIR="$(mktemp -d /tmp/opencraft-weather-smoke.XXXXXX)" || {
 cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT
 
-# Calendar wire layout (see the header comment and persistence.rs).
-# Legacy offset 130 plus the 4-byte empty v8 content table (36..40).
-LEGACY_V5_SEASON_OFFSET=130
-V8_CONTENT_TABLE_OFFSET=36
-V8_CONTENT_TABLE_LEN=4
-V5_SEASON_OFFSET=$((LEGACY_V5_SEASON_OFFSET + V8_CONTENT_TABLE_LEN))
-V5_SEASON_LEN=8
-V5_DAY_INDEX_OFFSET=$V5_SEASON_OFFSET
-V5_SEASON_LENGTH_OFFSET=$((V5_SEASON_OFFSET + 4))
-# v6 survival tail appended after the calendar: mode u8 + health u16 +
-# hunger u16 + air u16 + chest count u32.
-V6_HEADER_LEN=11
-# v7 mob tail: a u32 count. These runs are edit-free with an empty inventory,
-# so the count sits at 153 and a fresh world writes 0.
-V7_MOB_COUNT_LEN=4
-V7_MOB_COUNT_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN))
-# Tail after the mob count: the v8 u32 pack count (zero in a built-in
-# world) plus the u64 digest (12 bytes), then the v9 u16 config schema plus
-# the u64 effective-value digest (10 bytes).
-V9_TAIL_LEN=22
-V9_SAVE_LEN=$((V7_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN + V9_TAIL_LEN))
+# Section 2 world/player layout (scripts/save_witness.sh documents the full
+# section list): ...; time_of_day u32; day_index u32; season_length_days u32;
+# mode u8; health u16; hunger u16; air u16.
+WORLD_DAY_OFFSET=32
+WORLD_SEASON_OFFSET=36
+CONFIG_SCHEMA_OFFSET=0
+CONFIG_DIGEST_OFFSET=2
+DEFAULT_CONFIG_DIGEST=16927563004400537068
 
 SEED=1
 DEMO_DAYS=4
@@ -114,10 +83,6 @@ EXPECTED_SEASON_LENGTH=1
 # backstop for a hang (a kill here means the demo never latched).
 TIME_SCALE=60
 OUTER_TIMEOUT=180
-
-read_u32_le() {
-    od -An -tu4 --endian=little -j "$2" -N 4 "$1" | tr -d ' '
-}
 
 cd "$TEMP_DIR"
 SAVE="$TEMP_DIR/year.mcvx"
@@ -149,53 +114,49 @@ if [[ ! -f "$SAVE" ]]; then
     exit 1
 fi
 
-SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ $SAVE_SIZE -lt $((V5_SEASON_OFFSET + V5_SEASON_LEN + V6_HEADER_LEN + V7_MOB_COUNT_LEN + V9_TAIL_LEN)) ]]; then
-    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes, too short for the v6 survival header, v7 mob count, v8 pack tail, and v9 config tail after the v5 calendar tail"
-    exit 1
-fi
+assert_mcvx_v10 "$SAVE"
 
-MAGIC=$(head -c 4 "$SAVE")
-if [[ "$MAGIC" != "MCVX" ]]; then
-    echo "WEATHER SMOKE FAIL: save magic is '$MAGIC' (expected MCVX)"
-    exit 1
-fi
-
-VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 9 ]]; then
-    echo "WEATHER SMOKE FAIL: save version is $VERSION (expected 9)"
-    exit 1
-fi
-
-CONTENT_NAME_COUNT=$(read_u32_le "$SAVE" "$V8_CONTENT_TABLE_OFFSET")
+CONTENT_NAME_COUNT=$(mcvx_section_u32 "$SAVE" 1 0)
 if [[ "$CONTENT_NAME_COUNT" -ne 0 ]]; then
-    echo "WEATHER SMOKE FAIL: v8 content table holds $CONTENT_NAME_COUNT names (expected 0 for an edit-free fresh world with an empty inventory)"
+    echo "WEATHER SMOKE FAIL: section 1 content table holds $CONTENT_NAME_COUNT names (expected 0 for an edit-free fresh world with an empty inventory)"
     exit 1
 fi
 
-MOB_COUNT=$(read_u32_le "$SAVE" "$V7_MOB_COUNT_OFFSET")
+MOB_COUNT=$(mcvx_section_u32 "$SAVE" 5 0)
 if [[ "$MOB_COUNT" -ne 0 ]]; then
-    echo "WEATHER SMOKE FAIL: v8 mob count is $MOB_COUNT (expected 0 in an edit-free fresh world)"
+    echo "WEATHER SMOKE FAIL: section 5 mob count is $MOB_COUNT (expected 0 in an edit-free fresh world)"
     exit 1
 fi
 
-SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ "$SAVE_SIZE" -ne "$V9_SAVE_LEN" ]]; then
-    echo "WEATHER SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $V9_SAVE_LEN for an edit-free v9 save with no content names)"
+CHUNK_COUNT=$(mcvx_section_u32 "$SAVE" 9 0)
+if [[ "$CHUNK_COUNT" -ne 0 ]]; then
+    echo "WEATHER SMOKE FAIL: section 9 chunk count is $CHUNK_COUNT (expected 0 in an edit-free fresh world)"
     exit 1
 fi
 
-DAY=$(read_u32_le "$SAVE" "$V5_DAY_INDEX_OFFSET")
-SEASON=$(read_u32_le "$SAVE" "$V5_SEASON_LENGTH_OFFSET")
+CONFIG_SCHEMA=$(mcvx_section_u16 "$SAVE" 7 "$CONFIG_SCHEMA_OFFSET")
+if [[ "$CONFIG_SCHEMA" -ne 1 ]]; then
+    echo "WEATHER SMOKE FAIL: section 7 config schema is $CONFIG_SCHEMA (expected 1)"
+    exit 1
+fi
+
+CONFIG_DIGEST=$(mcvx_section_u64 "$SAVE" 7 "$CONFIG_DIGEST_OFFSET")
+if [[ "$CONFIG_DIGEST" != "$DEFAULT_CONFIG_DIGEST" ]]; then
+    echo "WEATHER SMOKE FAIL: section 7 config digest is $CONFIG_DIGEST (expected $DEFAULT_CONFIG_DIGEST = default config)"
+    exit 1
+fi
+
+DAY=$(mcvx_section_u32 "$SAVE" 2 "$WORLD_DAY_OFFSET")
+SEASON=$(mcvx_section_u32 "$SAVE" 2 "$WORLD_SEASON_OFFSET")
 
 if [[ "$DAY" -ne "$EXPECTED_DAY" ]]; then
-    echo "WEATHER SMOKE FAIL: day_index is $DAY (expected $EXPECTED_DAY after $DEMO_DAYS full cycles from noon)"
+    echo "WEATHER SMOKE FAIL: section 2 day_index is $DAY (expected $EXPECTED_DAY after $DEMO_DAYS full cycles from noon)"
     exit 1
 fi
 
 if [[ "$SEASON" -ne "$EXPECTED_SEASON_LENGTH" ]]; then
-    echo "WEATHER SMOKE FAIL: season_length_days is $SEASON (expected the default $EXPECTED_SEASON_LENGTH)"
+    echo "WEATHER SMOKE FAIL: section 2 season_length_days is $SEASON (expected the default $EXPECTED_SEASON_LENGTH)"
     exit 1
 fi
 
-echo "WEATHER SMOKE PASS: seed $SEED spanned a four-day year in one accelerated session (day_index $DAY, default ${SEASON}-day seasons); the seed-1 sequence Rain -> Clear -> Rain -> Snowfall was derived from the persisted calendar with exit 0 and no panic"
+echo "WEATHER SMOKE PASS: seed $SEED spanned a four-day year in one accelerated session (section 2 day_index $DAY, default ${SEASON}-day seasons); the seed-1 sequence Rain -> Clear -> Rain -> Snowfall was derived from the persisted calendar with exit 0 and no panic; the v10 archive loaded with zero content names, zero mobs, zero chunk edits, and config schema 1"

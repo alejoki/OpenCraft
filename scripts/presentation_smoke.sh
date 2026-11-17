@@ -14,11 +14,14 @@
 #         256-layer block array and item atlas (built-in and pack layers
 #         authored-match), the authored block/item definitions, a production
 #         mesh of the two authored blocks, a production mining break of ruby
-#         ore (61 ticks, authored drop, count, slot, limit), the v9 fixture
+#         ore (61 ticks, authored drop, count, slot, limit), the v10 fixture
 #         reload with zero unresolved names, and the reserved placeholder
 #         policy (face 26, icon 27, unbreakable, mesh layer 26).
-#     (d) the fixture save starts with `MCVX` and the little-endian version
-#         word 9.
+#     (d) the fixture save is a validated v10 archive whose section 1 names
+#         the authored block/item content, whose section 6 records the
+#         mymod-ruby pack identity, whose section 9 holds the one mined chunk
+#         with its section 16 palette, and whose section 7 carries config
+#         schema 1 and the default digest.
 #
 #   Bounded launch leg A: `timeout 10 "$BIN" --save fixture.mcvx` (pack still
 #   selected) must exit 124 with no panic — the real renderer and event loop
@@ -64,22 +67,14 @@ else
     BUILD_ARGS=(build --locked)
 fi
 
-# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
-# when a desktop session is live. Attach to the running session so winit can
-# create its window. Prefer the Wayland socket: Xwayland's :0 needs an xauth
-# cookie the launching shell may not have, and winit picks the X11 backend
-# whenever DISPLAY is set (it does not fall back cleanly to Wayland).
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
-        export WAYLAND_DISPLAY="wayland-0"
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
-        export DISPLAY=":0"
-    fi
-fi
-
+# Resolve the crate root and binary absolutely before changing directory,
+# then source the shared v10 archive witness helper and attach to a live
+# display (preferring a wayland-* socket).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/save_witness.sh
+source "$SCRIPT_DIR/save_witness.sh"
+smoke_detect_display
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
 BUILD_LOG="$(mktemp /tmp/opencraft-presentation-build.XXXXXX.log)" || {
     echo "PRESENTATION SMOKE FAIL: could not create a build log" >&2
@@ -244,10 +239,30 @@ for i in "${!EXPECTED_LINES[@]}"; do
 done
 
 [[ -f "$FIXTURE" ]] || fail "the digest did not write the --save fixture at $FIXTURE"
-MAGIC_HEX="$(od -An -tx1 -N4 "$FIXTURE" | tr -d ' \n')"
-VERSION_HEX="$(od -An -tx1 -j4 -N4 "$FIXTURE" | tr -d ' \n')"
-[[ "$MAGIC_HEX" == "4d435658" ]] || fail "fixture magic is '$MAGIC_HEX' (expected 4d435658 = MCVX)"
-[[ "$VERSION_HEX" == "09000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 09000000 = little-endian 9)"
+assert_mcvx_v10 "$FIXTURE"
+
+CONTENT_NAMES=()
+mapfile -t CONTENT_NAMES < <(mcvx_content_table_names "$FIXTURE")
+EXPECTED_CONTENT_NAMES=("4:mymod:ruby" "1:mymod:ruby_block" "1:mymod:ruby_ore")
+if [[ "${CONTENT_NAMES[*]}" != "${EXPECTED_CONTENT_NAMES[*]}" ]]; then
+    fail "section 1 content table is [${CONTENT_NAMES[*]}] (expected [${EXPECTED_CONTENT_NAMES[*]}], sorted by name then kind)"
+fi
+
+PACK_COUNT=$(mcvx_section_u32 "$FIXTURE" 6 0)
+[[ "$PACK_COUNT" -eq 1 ]] || fail "section 6 pack count is $PACK_COUNT (expected 1: the mymod-ruby pack identity)"
+
+CONFIG_SCHEMA=$(mcvx_section_u16 "$FIXTURE" 7 0)
+[[ "$CONFIG_SCHEMA" -eq 1 ]] || fail "section 7 config schema is $CONFIG_SCHEMA (expected 1)"
+
+CONFIG_DIGEST=$(mcvx_section_u64 "$FIXTURE" 7 2)
+DEFAULT_CONFIG_DIGEST=16927563004400537068
+[[ "$CONFIG_DIGEST" == "$DEFAULT_CONFIG_DIGEST" ]] || fail "section 7 config digest is $CONFIG_DIGEST (expected $DEFAULT_CONFIG_DIGEST = default config)"
+
+CHUNK_COUNT=$(mcvx_section_u32 "$FIXTURE" 9 0)
+[[ "$CHUNK_COUNT" -eq 1 ]] || fail "section 9 chunk count is $CHUNK_COUNT (expected 1: the mined ruby ore chunk)"
+
+CHUNK_SECTION_LEN=$(mcvx_section_len "$FIXTURE" 16)
+[[ "$CHUNK_SECTION_LEN" -gt 0 ]] || fail "chunk palette section 16 is empty (expected the mined ruby ore edit)"
 
 # --- Bounded launch leg A: authored world, pack still selected ------------
 set +e
@@ -303,7 +318,7 @@ cmp -s "$TEMP_DIR/packs-off/ruby_ore.png" "$EXPECTED_DIR/ruby_ore.png" || fail "
 cmp -s "$TEMP_DIR/packs-off/ruby_block.png" "$EXPECTED_DIR/ruby_block.png" || fail "ruby_block.png changed after being moved out of packs/"
 cmp -s "$TEMP_DIR/packs-off/ruby.png" "$EXPECTED_DIR/ruby.png" || fail "ruby.png changed after being moved out of packs/"
 
-echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed all pinned lines byte-for-byte (authored faces 48/49 via a 256-layer array, 61-tick break yielding mymod:ruby), wrote an MCVX v9 fixture, and both the authored world and the placeholder world (pack removed, stack cleared) survived a 10s launch with exit 124 and no panic"
+echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed all pinned lines byte-for-byte (authored faces 48/49 via a 256-layer array, 61-tick break yielding mymod:ruby), wrote a validated MCVX v10 archive whose content table names the authored block/item content and whose chunk section 16 holds the mined edit, and both the authored world and the placeholder world (pack removed, stack cleared) survived a 10s launch with exit 124 and no panic"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PRESENTATION SMOKE EVIDENCE: $line"
 done

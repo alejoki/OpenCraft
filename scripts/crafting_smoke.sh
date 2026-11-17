@@ -18,10 +18,11 @@
 #         break ticks and one-point wear on the production break path, the
 #         authored 7-hunger / 0.8 s hold-to-eat flow, the disabled shortbow
 #         (no preview, no craft), an incomplete grid that matches nothing and
-#         consumes nothing, the v9 pack-tool round-trip (850 remaining), and
+#         consumes nothing, the v10 pack-tool round-trip (850 remaining), and
 #         the pack-removed placeholder (count 1, one unresolved name).
-#     (d) the fixture save starts with `MCVX` and the little-endian version
-#         word 9.
+#     (d) the fixture save is a validated v10 archive whose section 1 content
+#         table carries exactly one mod-tool name, `5:mymod:ruby_pickaxe`, and
+#         whose section 7 config tail carries schema 1 and the default digest.
 #
 #   Bounded launch leg A: `timeout 10 "$BIN" --save fixture.mcvx` with the
 #   reference pack selected must exit 124 with no panic — the real renderer
@@ -66,21 +67,14 @@ else
     BUILD_ARGS=(build --locked)
 fi
 
-# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
-# when a desktop session is live. Attach to the running session so winit can
-# create its window. Prefer the Wayland socket for the same reason as the other
-# smokes.
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
-        export WAYLAND_DISPLAY="wayland-0"
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
-        export DISPLAY=":0"
-    fi
-fi
-
+# Resolve the crate root and binary absolutely before changing directory,
+# then source the shared v10 archive witness helper and attach to a live
+# display (preferring a wayland-* socket).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/save_witness.sh
+source "$SCRIPT_DIR/save_witness.sh"
+smoke_detect_display
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
 CRATE_PACK="$CRATE_ROOT/tests/fixtures/packs/mymod-ruby"
 BUILD_LOG="$(mktemp /tmp/opencraft-crafting-build.XXXXXX.log)" || {
@@ -213,10 +207,20 @@ for i in "${!EXPECTED_LINES[@]}"; do
 done
 
 [[ -f "$FIXTURE" ]] || fail "the digest did not write the --save fixture at $FIXTURE"
-MAGIC_HEX="$(od -An -tx1 -N4 "$FIXTURE" | tr -d ' \n')"
-VERSION_HEX="$(od -An -tx1 -j4 -N4 "$FIXTURE" | tr -d ' \n')"
-[[ "$MAGIC_HEX" == "4d435658" ]] || fail "fixture magic is '$MAGIC_HEX' (expected 4d435658 = MCVX)"
-[[ "$VERSION_HEX" == "09000000" ]] || fail "fixture version word is '$VERSION_HEX' (expected 09000000 = little-endian 9)"
+assert_mcvx_v10 "$FIXTURE"
+
+CONTENT_NAMES=()
+mapfile -t CONTENT_NAMES < <(mcvx_content_table_names "$FIXTURE")
+if [[ ${#CONTENT_NAMES[@]} -ne 1 || "${CONTENT_NAMES[0]}" != "5:mymod:ruby_pickaxe" ]]; then
+    fail "section 1 content table is [${CONTENT_NAMES[*]}] (expected exactly 5:mymod:ruby_pickaxe)"
+fi
+
+CONFIG_SCHEMA=$(mcvx_section_u16 "$FIXTURE" 7 0)
+[[ "$CONFIG_SCHEMA" -eq 1 ]] || fail "section 7 config schema is $CONFIG_SCHEMA (expected 1)"
+
+CONFIG_DIGEST=$(mcvx_section_u64 "$FIXTURE" 7 2)
+DEFAULT_CONFIG_DIGEST=16927563004400537068
+[[ "$CONFIG_DIGEST" == "$DEFAULT_CONFIG_DIGEST" ]] || fail "section 7 config digest is $CONFIG_DIGEST (expected $DEFAULT_CONFIG_DIGEST = default config)"
 
 # --- Bounded launch leg A: reference pack present -------------------------
 set +e
@@ -293,7 +297,7 @@ if grep -q "panicked" "$LAUNCH_C_OUT" || grep -q "RUST_BACKTRACE" "$LAUNCH_C_OUT
 fi
 cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED_DIR/settings-broken.toml" || fail "the broken settings.toml was rewritten during the broken-pack leg"
 
-echo "CRAFTING SMOKE PASS [profile=$PROFILE]: --demo-crafting crafted mymod:ruby_pickaxe at the 4x4 table and mymod:ruby_stew at the 2x2 grid, broke mymod:ruby_ore in 7 ruby ticks vs 10 iron ticks with one-point wear (899/249), ate 7 hunger over the authored 0.8 s hold, proved the disabled shortbow and an incomplete grid never match, round-tripped a v9 pack tool at 850 durability, and degraded the same save to a count-1 placeholder with the pack removed; the real binary survived 10 s launches with the reference pack, no pack and a broken pack (exit 124, no panic)"
+echo "CRAFTING SMOKE PASS [profile=$PROFILE]: --demo-crafting crafted mymod:ruby_pickaxe at the 4x4 table and mymod:ruby_stew at the 2x2 grid, broke mymod:ruby_ore in 7 ruby ticks vs 10 iron ticks with one-point wear (899/249), ate 7 hunger over the authored 0.8 s hold, proved the disabled shortbow and an incomplete grid never match, round-tripped a v10 pack tool at 850 durability, and degraded the same save to a count-1 placeholder with the pack removed; the real binary survived 10 s launches with the reference pack, no pack and a broken pack (exit 124, no panic)"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "CRAFTING SMOKE EVIDENCE: $line"
 done

@@ -52,16 +52,17 @@
 #     the same save previews/crafts count=2 with the one-time content notice.
 #     The release profile runs both demo phases without the watcher leg.
 #
-#   Leg E v8-to-v9: `--demo-save-v9` loads the checked-in v8 fixture, re-saves
-#     v9 with config schema 1 and a digest, reloads with no notice, and leaves
-#     the input bytes untouched; the derived file is exactly input+10 bytes.
-#     Both profiles then prove the one-shot config-mismatch notice: a
-#     `walk_speed = 6.0` edit makes the derived v9 file warn exactly once
-#     (`config changed since this world was saved`), re-save with digest
-#     `0x14092db54f42a9d1` at 446 bytes, and a third run on that output loads
-#     with no notice (the notice is one-shot, not repeated). The debug profile
-#     additionally re-checks the mismatched tree's `--check-config` digest;
-#     release rejects `--check-config` by design (Leg A).
+#   Leg E v8-to-v10: `--demo-save-v10` loads the checked-in v8 fixture,
+#     re-saves a validated sectioned v10 archive with config schema 1 and a
+#     digest, reloads with no notice, and leaves the input bytes untouched;
+#     the derived file keeps the fixture's nine content names and its one
+#     migrated chunk edit. Both profiles then prove the one-shot
+#     config-mismatch notice: a `walk_speed = 6.0` edit makes the derived v10
+#     file warn exactly once (`config changed since this world was saved`),
+#     re-save with digest `0x14092db54f42a9d1`, and a third run on that output
+#     loads with no notice (the notice is one-shot, not repeated). The debug
+#     profile additionally re-checks the mismatched tree's `--check-config`
+#     digest; release rejects `--check-config` by design (Leg A).
 #
 #   Leg F release hygiene (release only): a bare bounded launch in an empty
 #     temp cwd exits 124, does not panic, and creates no packs/ or config/;
@@ -97,25 +98,15 @@ else
     BUILD_ARGS=(build --locked)
 fi
 
-# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
-# when a desktop session is live. Attach to the running session so winit can
-# create its window for the bounded live legs. Prefer the Wayland socket:
-# Xwayland's :0 needs an xauth cookie the launching shell may not have, and
-# winit picks the X11 backend whenever DISPLAY is set (it does not fall back
-# cleanly to Wayland).
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
-        export WAYLAND_DISPLAY="wayland-0"
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
-        export DISPLAY=":0"
-    fi
-fi
-
 # Resolve the crate root and binary absolutely before changing directory (the
-# build and every helper run from an absolute path).
+# build and every helper run from an absolute path), then source the shared
+# v10 archive witness helper and attach to a live display (preferring a
+# wayland-* socket).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/save_witness.sh
+source "$SCRIPT_DIR/save_witness.sh"
+smoke_detect_display
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
 BUILD_LOG="$(mktemp /tmp/opencraft-creator-build.XXXXXX.log)" || {
     echo "CREATOR SMOKE FAIL: could not create a build log" >&2
@@ -677,7 +668,7 @@ expect_stdout_lines "leg D load leg" "$LEG_D/load.out" \
     'restart: ok'
 
 # ---------------------------------------------------------------------------
-# Leg E: v8-to-v9 migration, input untouched, output exactly input+10 bytes.
+# Leg E: v8-to-v10 migration, input untouched, derived v10 archive validated.
 # ---------------------------------------------------------------------------
 LEG_E="$(mktemp -d "$TEMP_DIR/leg-e.XXXXXX")" || fail "mktemp failed for leg E"
 install_config "$LEG_E"
@@ -685,84 +676,94 @@ cp "$CRATE_ROOT/tests/fixtures/saves/v8-baseline.mcvx" "$LEG_E/v8.mcvx" ||
     fail "leg E: cannot copy the v8 baseline fixture"
 cp "$LEG_E/v8.mcvx" "$LEG_E/v8.input.copy" ||
     fail "leg E: cannot snapshot the v8 input bytes"
-V8_INPUT_SIZE="$(wc -c <"$LEG_E/v8.mcvx")"
 
-run_headless "$LEG_E" "$LEG_E/v9.out" "$LEG_E/v9.err" --demo-save-v9 --save v8.mcvx
-V9_RC=$?
-if [[ $V9_RC -ne 0 ]]; then
-    cat "$LEG_E/v9.out" "$LEG_E/v9.err" || true
-    fail "leg E: --demo-save-v9 exit code $V9_RC (expected 0)"
+run_headless "$LEG_E" "$LEG_E/v10.out" "$LEG_E/v10.err" --demo-save-v10 --save v8.mcvx
+V10_RC=$?
+if [[ $V10_RC -ne 0 ]]; then
+    cat "$LEG_E/v10.out" "$LEG_E/v10.err" || true
+    fail "leg E: --demo-save-v10 exit code $V10_RC (expected 0)"
 fi
 
-mapfile -t V9_LINES <"$LEG_E/v9.out"
-[[ ${#V9_LINES[@]} -eq 4 ]] ||
-    fail "leg E: expected 4 stdout lines, found ${#V9_LINES[@]}"
-[[ "${V9_LINES[0]}" == 'save_v9: leg=load version=8 packs=0 saved_config=none notice=none playable=true' ]] ||
-    fail "leg E: load line drifted: [${V9_LINES[0]}]"
-V9_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x[0-9a-f]+ bytes=[0-9]+$'
-[[ "${V9_LINES[1]}" =~ $V9_RESAVE_RE ]] ||
-    fail "leg E: resave line drifted: [${V9_LINES[1]}]"
-[[ "${V9_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
-    fail "leg E: match line drifted: [${V9_LINES[2]}]"
-[[ "${V9_LINES[3]}" == 'save_v9: ok' ]] ||
-    fail "leg E: ok line drifted: [${V9_LINES[3]}]"
+mapfile -t V10_LINES <"$LEG_E/v10.out"
+[[ ${#V10_LINES[@]} -eq 4 ]] ||
+    fail "leg E: expected 4 stdout lines, found ${#V10_LINES[@]}"
+[[ "${V10_LINES[0]}" == 'save_v10: leg=load version=8 packs=0 saved_config=none notice=none playable=true' ]] ||
+    fail "leg E: load line drifted: [${V10_LINES[0]}]"
+V10_RESAVE_RE='^save_v10: leg=resave version=10 config_schema=1 config_digest=0x[0-9a-f]+ bytes=[0-9]+ sections=[0-9]+$'
+[[ "${V10_LINES[1]}" =~ $V10_RESAVE_RE ]] ||
+    fail "leg E: resave line drifted: [${V10_LINES[1]}]"
+[[ "${V10_LINES[2]}" == 'save_v10: leg=match notice=none playable=true' ]] ||
+    fail "leg E: match line drifted: [${V10_LINES[2]}]"
+[[ "${V10_LINES[3]}" == 'save_v10: ok' ]] ||
+    fail "leg E: ok line drifted: [${V10_LINES[3]}]"
 
 assert_file_unchanged "leg E v8 input" "$LEG_E/v8.mcvx" "$LEG_E/v8.input.copy"
-[[ -f "$LEG_E/v8.v9.mcvx" ]] || fail "leg E: derived v8.v9.mcvx was not written"
-V9_OUTPUT_SIZE="$(wc -c <"$LEG_E/v8.v9.mcvx")"
-V9_EXPECTED_SIZE=$((V8_INPUT_SIZE + 10))
-[[ "$V9_OUTPUT_SIZE" -eq "$V9_EXPECTED_SIZE" ]] ||
-    fail "leg E: v9 size $V9_OUTPUT_SIZE (expected $V9_EXPECTED_SIZE = input+10)"
+[[ -f "$LEG_E/v8.v10.mcvx" ]] || fail "leg E: derived v8.v10.mcvx was not written"
+assert_mcvx_v10 "$LEG_E/v8.v10.mcvx"
+V10_OUTPUT_SIZE="$(wc -c <"$LEG_E/v8.v10.mcvx")"
+V10_RESAVE_BYTES="${V10_LINES[1]##*bytes=}"
+V10_RESAVE_BYTES="${V10_RESAVE_BYTES%% *}"
+[[ "$V10_OUTPUT_SIZE" -eq "$V10_RESAVE_BYTES" ]] ||
+    fail "leg E: resave line reports $V10_RESAVE_BYTES bytes but v8.v10.mcvx is $V10_OUTPUT_SIZE bytes"
+V10_SECTION_COUNT=$(mcvx_section_count "$LEG_E/v8.v10.mcvx")
+[[ "$V10_SECTION_COUNT" -eq 10 ]] ||
+    fail "leg E: derived v10 archive has $V10_SECTION_COUNT sections (expected 10: nine fixed sections plus the migrated chunk)"
+V10_CONTENT_NAME_COUNT=$(mcvx_content_table_count "$LEG_E/v8.v10.mcvx")
+[[ "$V10_CONTENT_NAME_COUNT" -eq 9 ]] ||
+    fail "leg E: derived v10 content table holds $V10_CONTENT_NAME_COUNT names (expected the fixture's 9)"
+V10_CHUNK_COUNT=$(mcvx_section_u32 "$LEG_E/v8.v10.mcvx" 9 0)
+[[ "$V10_CHUNK_COUNT" -eq 1 ]] ||
+    fail "leg E: derived v10 chunk index holds $V10_CHUNK_COUNT chunks (expected the fixture's 1 migrated edit)"
 
 # --- One-shot config mismatch (both profiles) ------------------------------
-# The derived v9 file is now a saved-config witness. Editing the config makes
-# the next load warn exactly once, re-save the same 446-byte shape with the
-# new digest, and the third run on that output is silent: the notice is
-# one-shot, not repeated on every load.
-cp "$LEG_E/v8.v9.mcvx" "$LEG_E/v8.v9.snapshot" ||
-    fail "leg E: cannot snapshot the derived v9 output"
-V9_SNAPSHOT_SIZE="$(wc -c <"$LEG_E/v8.v9.snapshot")"
-[[ "$V9_SNAPSHOT_SIZE" -eq 446 ]] ||
-    fail "leg E: v9 snapshot size $V9_SNAPSHOT_SIZE (expected 446)"
+# The derived v10 file is now a saved-config witness. Editing the config makes
+# the next load warn exactly once, re-save the same v10 shape with the new
+# digest, and the third run on that output is silent: the notice is one-shot,
+# not repeated on every load.
+cp "$LEG_E/v8.v10.mcvx" "$LEG_E/v8.v10.snapshot" ||
+    fail "leg E: cannot snapshot the derived v10 output"
+V10_SNAPSHOT_SIZE="$(wc -c <"$LEG_E/v8.v10.snapshot")"
 
 sed -i 's/^walk_speed = 4$/walk_speed = 6.0/' "$LEG_E/config/player.toml" ||
     fail "leg E: cannot apply the config-mismatch edit"
 
-run_headless "$LEG_E" "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" --demo-save-v9 --save v8.v9.mcvx
+run_headless "$LEG_E" "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" --demo-save-v10 --save v8.v10.mcvx
 MISMATCH_RC=$?
 if [[ $MISMATCH_RC -ne 0 ]]; then
     cat "$LEG_E/mismatch.out" "$LEG_E/mismatch.err" || true
-    fail "leg E: config-mismatch --demo-save-v9 exit code $MISMATCH_RC (expected 0)"
+    fail "leg E: config-mismatch --demo-save-v10 exit code $MISMATCH_RC (expected 0)"
 fi
 mapfile -t MISMATCH_LINES <"$LEG_E/mismatch.out"
 [[ ${#MISMATCH_LINES[@]} -eq 4 ]] ||
     fail "leg E: config-mismatch run printed ${#MISMATCH_LINES[@]} stdout lines (expected 4)"
-[[ "${MISMATCH_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=config changed since this world was saved playable=true' ]] ||
+[[ "${MISMATCH_LINES[0]}" == 'save_v10: leg=load version=10 packs=0 saved_config=some notice=config changed since this world was saved playable=true' ]] ||
     fail "leg E: config-mismatch load line drifted: [${MISMATCH_LINES[0]}]"
-MISMATCH_RESAVE_RE='^save_v9: leg=resave version=9 config_schema=1 config_digest=0x14092db54f42a9d1 bytes=[0-9]+$'
+MISMATCH_RESAVE_RE='^save_v10: leg=resave version=10 config_schema=1 config_digest=0x14092db54f42a9d1 bytes=[0-9]+ sections=[0-9]+$'
 [[ "${MISMATCH_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
     fail "leg E: config-mismatch resave line drifted: [${MISMATCH_LINES[1]}]"
 MISMATCH_BYTES="${MISMATCH_LINES[1]##*bytes=}"
-[[ "$MISMATCH_BYTES" -eq "$V9_SNAPSHOT_SIZE" ]] ||
-    fail "leg E: resave bytes $MISMATCH_BYTES (expected snapshot size $V9_SNAPSHOT_SIZE)"
-[[ "${MISMATCH_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
+MISMATCH_BYTES="${MISMATCH_BYTES%% *}"
+[[ "$MISMATCH_BYTES" -eq "$V10_SNAPSHOT_SIZE" ]] ||
+    fail "leg E: resave bytes $MISMATCH_BYTES (expected snapshot size $V10_SNAPSHOT_SIZE)"
+[[ "${MISMATCH_LINES[2]}" == 'save_v10: leg=match notice=none playable=true' ]] ||
     fail "leg E: config-mismatch match line drifted: [${MISMATCH_LINES[2]}]"
-[[ "${MISMATCH_LINES[3]}" == 'save_v9: ok' ]] ||
+[[ "${MISMATCH_LINES[3]}" == 'save_v10: ok' ]] ||
     fail "leg E: config-mismatch ok line drifted: [${MISMATCH_LINES[3]}]"
 
-assert_file_unchanged "leg E config-mismatch input" "$LEG_E/v8.v9.mcvx" "$LEG_E/v8.v9.snapshot"
-[[ -f "$LEG_E/v8.v9.v9.mcvx" ]] ||
-    fail "leg E: config-mismatch run did not write v8.v9.v9.mcvx"
-V9_MISMATCH_OUTPUT_SIZE="$(wc -c <"$LEG_E/v8.v9.v9.mcvx")"
-[[ "$V9_MISMATCH_OUTPUT_SIZE" -eq "$V9_SNAPSHOT_SIZE" ]] ||
-    fail "leg E: v8.v9.v9.mcvx size $V9_MISMATCH_OUTPUT_SIZE (expected $V9_SNAPSHOT_SIZE)"
+assert_file_unchanged "leg E config-mismatch input" "$LEG_E/v8.v10.mcvx" "$LEG_E/v8.v10.snapshot"
+[[ -f "$LEG_E/v8.v10.v10.mcvx" ]] ||
+    fail "leg E: config-mismatch run did not write v8.v10.v10.mcvx"
+assert_mcvx_v10 "$LEG_E/v8.v10.v10.mcvx"
+V10_MISMATCH_OUTPUT_SIZE="$(wc -c <"$LEG_E/v8.v10.v10.mcvx")"
+[[ "$V10_MISMATCH_OUTPUT_SIZE" -eq "$V10_SNAPSHOT_SIZE" ]] ||
+    fail "leg E: v8.v10.v10.mcvx size $V10_MISMATCH_OUTPUT_SIZE (expected $V10_SNAPSHOT_SIZE)"
 expect_regex_count "leg E config mismatch" 1 "$LEG_E/mismatch.out" \
     'notice=config changed since this world was saved'
 
 if [[ "$PROFILE" == "debug" ]]; then
     # `--check-config` is dev-only (Leg A pins the release rejection), so only
     # debug can re-check the mismatched tree's effective digest from outside
-    # the save proof. The resave line above already pins the digest above.
+    # the save proof. The resave line above already pins the digest.
     run_headless "$LEG_E" "$LEG_E/check-mismatch.out" "$LEG_E/check-mismatch.err" --check-config
     CHECK_RC=$?
     if [[ $CHECK_RC -ne 0 ]]; then
@@ -775,22 +776,22 @@ if [[ "$PROFILE" == "debug" ]]; then
         fail "leg E: config-mismatch summary drifted: [$LEG_E_SUMMARY]"
 fi
 
-run_headless "$LEG_E" "$LEG_E/one-shot.out" "$LEG_E/one-shot.err" --demo-save-v9 --save v8.v9.v9.mcvx
+run_headless "$LEG_E" "$LEG_E/one-shot.out" "$LEG_E/one-shot.err" --demo-save-v10 --save v8.v10.v10.mcvx
 ONE_SHOT_RC=$?
 if [[ $ONE_SHOT_RC -ne 0 ]]; then
     cat "$LEG_E/one-shot.out" "$LEG_E/one-shot.err" || true
-    fail "leg E: one-shot --demo-save-v9 exit code $ONE_SHOT_RC (expected 0)"
+    fail "leg E: one-shot --demo-save-v10 exit code $ONE_SHOT_RC (expected 0)"
 fi
 mapfile -t ONE_SHOT_LINES <"$LEG_E/one-shot.out"
 [[ ${#ONE_SHOT_LINES[@]} -eq 4 ]] ||
     fail "leg E: one-shot run printed ${#ONE_SHOT_LINES[@]} stdout lines (expected 4)"
-[[ "${ONE_SHOT_LINES[0]}" == 'save_v9: leg=load version=9 packs=0 saved_config=some notice=none playable=true' ]] ||
+[[ "${ONE_SHOT_LINES[0]}" == 'save_v10: leg=load version=10 packs=0 saved_config=some notice=none playable=true' ]] ||
     fail "leg E: one-shot load line drifted: [${ONE_SHOT_LINES[0]}]"
 [[ "${ONE_SHOT_LINES[1]}" =~ $MISMATCH_RESAVE_RE ]] ||
     fail "leg E: one-shot resave line drifted: [${ONE_SHOT_LINES[1]}]"
-[[ "${ONE_SHOT_LINES[2]}" == 'save_v9: leg=match notice=none playable=true' ]] ||
+[[ "${ONE_SHOT_LINES[2]}" == 'save_v10: leg=match notice=none playable=true' ]] ||
     fail "leg E: one-shot match line drifted: [${ONE_SHOT_LINES[2]}]"
-[[ "${ONE_SHOT_LINES[3]}" == 'save_v9: ok' ]] ||
+[[ "${ONE_SHOT_LINES[3]}" == 'save_v10: ok' ]] ||
     fail "leg E: one-shot ok line drifted: [${ONE_SHOT_LINES[3]}]"
 
 # ---------------------------------------------------------------------------
@@ -831,4 +832,4 @@ if [[ "$PROFILE" == "release" ]]; then
     expect_regex_count "leg F config+pack launch" 0 "$LEG_F_PACK/live.log" '^creator: '
 fi
 
-echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, all-domain live config (six files), block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v9 migration with one-shot config mismatch, and profile-appropriate release hygiene all passed"
+echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, all-domain live config (six files), block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v10 migration with one-shot config mismatch, and profile-appropriate release hygiene all passed"
