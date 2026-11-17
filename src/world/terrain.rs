@@ -4763,7 +4763,7 @@ mod tests {
         for y in 0..32u32 {
             blocks.push(PrefabBlock {
                 position: [2, y, 2],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             });
         }
         let prefab = Prefab {

@@ -52,12 +52,14 @@ fn load_catalog() -> PrefabCatalog {
 }
 
 fn block_at(prefab: &Prefab, position: [u32; 3]) -> BlockId {
-    prefab
-        .blocks
-        .iter()
-        .find(|block| block.position == position)
-        .unwrap_or_else(|| panic!("{} has no block at {position:?}", prefab.name))
-        .block
+    BlockId::from_raw(
+        prefab
+            .blocks
+            .iter()
+            .find(|block| block.position == position)
+            .unwrap_or_else(|| panic!("{} has no block at {position:?}", prefab.name))
+            .block,
+    )
 }
 
 #[test]
@@ -123,10 +125,10 @@ fn reference_prefabs_match_the_pinned_geometry_contract() {
         );
         for block in &prefab.blocks {
             assert!(
-                block.block.to_raw() < BUILTIN_BLOCK_COUNT,
+                block.block < BUILTIN_BLOCK_COUNT,
                 "{} uses non-built-in block {:?} at {:?}",
                 reference.name,
-                block.block,
+                BlockId::from_raw(block.block),
                 block.position
             );
         }
@@ -134,7 +136,7 @@ fn reference_prefabs_match_the_pinned_geometry_contract() {
             prefab
                 .blocks
                 .iter()
-                .any(|block| block.block == BlockId::Air),
+                .any(|block| BlockId::from_raw(block.block) == BlockId::Air),
             "{} must contain at least one air block",
             reference.name
         );
@@ -195,7 +197,7 @@ fn small_house_contains_exactly_one_chest() {
         prefab
             .blocks
             .iter()
-            .filter(|block| block.block == BlockId::Chest)
+            .filter(|block| BlockId::from_raw(block.block) == BlockId::Chest)
             .count(),
         1
     );
@@ -209,11 +211,11 @@ fn wheat_farm_contains_farmland_and_stage_zero_crops_only() {
     assert!(prefab
         .blocks
         .iter()
-        .any(|block| block.block == BlockId::Farmland));
+        .any(|block| BlockId::from_raw(block.block) == BlockId::Farmland));
     assert!(prefab
         .blocks
         .iter()
-        .any(|block| block.block == BlockId::WheatStage0));
+        .any(|block| BlockId::from_raw(block.block) == BlockId::WheatStage0));
 
     for stage in [
         BlockId::WheatStage1,
@@ -221,7 +223,10 @@ fn wheat_farm_contains_farmland_and_stage_zero_crops_only() {
         BlockId::WheatStage3,
     ] {
         assert!(
-            !prefab.blocks.iter().any(|block| block.block == stage),
+            !prefab
+                .blocks
+                .iter()
+                .any(|block| BlockId::from_raw(block.block) == stage),
             "wheat_farm must not contain {stage:?}"
         );
     }

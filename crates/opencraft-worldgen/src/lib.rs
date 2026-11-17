@@ -14,6 +14,7 @@ pub mod block;
 pub mod height;
 pub mod loot;
 mod noise;
+pub mod prefab;
 pub mod ruin;
 pub mod spawn;
 pub mod tree;

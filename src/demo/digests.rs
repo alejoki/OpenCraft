@@ -2268,7 +2268,7 @@ pub fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
             parsed
                 .blocks
                 .iter()
-                .filter(|block| block.block == BlockId::SocketMarker)
+                .filter(|block| BlockId::from_raw(block.block) == BlockId::SocketMarker)
                 .count()
         })
         .unwrap_or(0);
@@ -2283,7 +2283,7 @@ pub fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
                 .blocks
                 .iter()
                 .find(|block| block.position == [cell[0] as u32, cell[1] as u32, cell[2] as u32])
-                .map(|block| block.block)
+                .map(|block| BlockId::from_raw(block.block))
         }
         _ => None,
     };

@@ -1124,7 +1124,7 @@ impl VillagePlan<'_> {
                 {
                     continue;
                 }
-                insert_village_cell(&mut cells, world, block.block);
+                insert_village_cell(&mut cells, world, BlockId::from_raw(block.block));
             }
         }
 
@@ -3266,7 +3266,7 @@ junction = ["test_hub"]
                         placement.base_y + block.position[1] as i32,
                         placement.origin_z + dz,
                     ],
-                    block.block,
+                    BlockId::from_raw(block.block),
                 );
             }
         }
@@ -3391,7 +3391,7 @@ junction = ["test_hub"]
             let world = [root.origin_x + dx, root.base_y, root.origin_z + dz];
             assert_eq!(
                 cells.get(&world),
-                Some(&block.block),
+                Some(&BlockId::from_raw(block.block)),
                 "root bottom block at {world:?}"
             );
             bottom_blocks += 1;
@@ -3761,11 +3761,11 @@ junction = ["test_hub"]
         hub.blocks = vec![
             PrefabBlock {
                 position: [0, 0, 0],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             },
             PrefabBlock {
                 position: [1, 0, 1],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             },
         ];
         let mut definition = synthetic_definition(

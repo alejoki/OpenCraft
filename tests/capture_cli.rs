@@ -192,7 +192,7 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
         parsed
             .blocks
             .iter()
-            .all(|block| block.block != BlockId::SocketMarker),
+            .all(|block| BlockId::from_raw(block.block) != BlockId::SocketMarker),
         "no prefab cell may serialize a socket marker"
     );
     let block_at = |x: u32, y: u32, z: u32| {
@@ -200,7 +200,7 @@ fn clean_demo_writes_one_prefab_and_validates_it() {
             .blocks
             .iter()
             .find(|block| block.position == [x, y, z])
-            .map(|block| block.block)
+            .map(|block| BlockId::from_raw(block.block))
     };
     assert_eq!(block_at(2, 1, 0), Some(BlockId::Air), "marker cell is air");
     assert_eq!(

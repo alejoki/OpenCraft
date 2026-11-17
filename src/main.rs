@@ -16770,7 +16770,7 @@ stack = 64
             parsed
                 .blocks
                 .iter()
-                .all(|block| block.block != BlockId::SocketMarker),
+                .all(|block| BlockId::from_raw(block.block) != BlockId::SocketMarker),
             "no prefab cell may serialize the socket marker"
         );
         let marker_cell = parsed
@@ -16778,7 +16778,11 @@ stack = 64
             .iter()
             .find(|block| block.position == [2, 1, 0])
             .expect("the marker cell is emitted");
-        assert_eq!(marker_cell.block, BlockId::Air, "the marker cell is air");
+        assert_eq!(
+            BlockId::from_raw(marker_cell.block),
+            BlockId::Air,
+            "the marker cell is air"
+        );
     }
 
     /// S06-T04: an ambiguous marker names its real coordinate on the one
@@ -17101,7 +17105,7 @@ stack = 64
             size: [1, 1, 1],
             blocks: vec![opencraft::world::prefab::PrefabBlock {
                 position: [0, 0, 0],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
         };
