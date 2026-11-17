@@ -8895,6 +8895,58 @@ stack = 64
     }
 
     #[test]
+    fn content_digest_pins_the_checked_in_reference_stack() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs");
+        let reference = pack::spec::load_spec_from_dir(&root.join("mymod-ruby"));
+        let overlay = pack::spec::load_spec_from_dir(&root.join("ruby-overlay"));
+
+        let (reference_registry, reference_report) =
+            build_session_registry(std::slice::from_ref(&reference));
+        assert_eq!(
+            reference_report.errors(),
+            0,
+            "the reference pack is clean: {reference_report:?}"
+        );
+        assert_eq!(
+            reference_registry.digest(),
+            0xbacb_c160_bdf7_6d08,
+            "the reference pack digest is pinned"
+        );
+
+        let (stacked, stacked_report) =
+            build_session_registry(&[reference.clone(), overlay.clone()]);
+        assert_eq!(
+            stacked_report.errors(),
+            0,
+            "the reference stack is clean: {stacked_report:?}"
+        );
+        assert_eq!(
+            stacked.digest(),
+            0xabb6_212a_d750_6661,
+            "reference + texture overlay digest is pinned"
+        );
+
+        // The overlay authors no content, so the reverse stack order resolves
+        // the same definitions and the same digest.
+        let (reversed, reversed_report) = build_session_registry(&[overlay, reference]);
+        assert_eq!(
+            reversed_report.errors(),
+            0,
+            "the reversed reference stack is clean: {reversed_report:?}"
+        );
+        assert_eq!(
+            reversed.digest(),
+            stacked.digest(),
+            "stack order never moves an overlay-only digest"
+        );
+
+        let (builtin, builtin_report) = build_session_registry(&[]);
+        assert_eq!(builtin_report.errors(), 0);
+        assert_eq!(builtin.digest(), opencraft::content::EMPTY_DIGEST);
+        assert_eq!(builtin.digest(), 0xcbf2_9ce4_8422_2325);
+    }
+
+    #[test]
     fn crafting_demo_pins_the_checked_in_reference_pack_line_set() {
         let pack_dir = Path::new("tests/fixtures/packs/mymod-ruby");
         assert!(

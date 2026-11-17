@@ -1,9 +1,11 @@
 //! Immutable content registry and built-in content definitions.
 //!
-//! [`ContentRegistry::builtin`] is the single authoritative built-in content
-//! table. [`registry::build_registry`] folds an ordered pack stack over it into
-//! one deterministic, immutable [`ContentRegistry`]. Later slices freeze the
-//! result behind `Arc<ContentRegistry>` once modded content is live.
+//! [`ContentRegistry`] is the game adapter over the neutral
+//! `opencraft-content` catalog: [`ContentRegistry::builtin`] is the single
+//! authoritative built-in table and [`registry::build_registry`] converts it to
+//! a neutral base, folds an ordered pack stack and converts every row back into
+//! game types. Later slices freeze the result behind `Arc<ContentRegistry>`
+//! once modded content is live.
 //!
 //! This module deliberately has no render, audio, settings, filesystem or pack
 //! dependency: content identity must stay decoupled from presentation and
@@ -16,6 +18,10 @@ pub mod names;
 pub mod registry;
 pub mod spec;
 
+pub use opencraft_content::catalog::{
+    LayerSource, EMPTY_DIGEST, PACK_ICON_BASE, PACK_ICON_CAP, PACK_LAYER_BASE, PACK_LAYER_CAP,
+    PLACEHOLDER_BLOCK_LAYER, PLACEHOLDER_ICON_LAYER,
+};
 pub use registry::{build_registry, ContentLoadReport, PackIdentity};
 pub use spec::{ContentDiagnostic, PackContentSpec, Severity};
 
@@ -28,37 +34,6 @@ use crate::player::inventory::{
 use crate::player::tools::{self, ToolRules};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 use crate::world::terrain::Biome;
-
-/// First texture-array layer reserved for pack-authored block faces.
-///
-/// Mirrors [`crate::render::texture::NUM_TEX_LAYERS`] as a literal so `content`
-/// stays render-free; S04 grows the array to [`PACK_LAYER_CAP`].
-pub const PACK_LAYER_BASE: u8 = 48;
-
-/// Exclusive upper bound for pack-authored block face layers (160 pack layers).
-pub const PACK_LAYER_CAP: u8 = 208;
-
-/// First reserved block face layer used when a pack asset is missing or the
-/// layer space overflows: the built-in checker placeholder.
-///
-/// Starts at 26 so a fallback never aliases layer 25, the built-in
-/// socket-marker art that packs cannot override.
-pub const PLACEHOLDER_BLOCK_LAYER: u8 = 26;
-
-/// First icon layer reserved for pack-authored item/tool icons.
-pub const PACK_ICON_BASE: u8 = 32;
-
-/// Exclusive upper bound for pack-authored icon layers (192 pack icons).
-pub const PACK_ICON_CAP: u8 = 224;
-
-/// Reserved icon layer used when a pack icon is missing or icon space overflows.
-pub const PLACEHOLDER_ICON_LAYER: u8 = 27;
-
-/// Digest of a registry with no packs: the FNV-1a 64 offset basis.
-///
-/// The digest excludes built-in definitions, asset bytes and diagnostics, so
-/// the built-in registry is exactly the empty-stack digest.
-pub const EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// A reference to an item identity before `ItemId`/`RecipeId` widening.
 ///
@@ -295,21 +270,6 @@ impl BlockDef {
             placeholder: false,
         })
     }
-}
-
-/// Provenance of one frozen pack-authored block layer or icon.
-///
-/// `path` is the pack-relative authored path exactly as the pack names it
-/// (the bare file name for fixed-name layers). A source is metadata only: it
-/// identifies which `(pack, path)` produced a GPU layer, so a live edit can
-/// rewrite that layer without re-deriving allocation. Sources never enter the
-/// content digest.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LayerSource {
-    /// Pack folder name (stable identity inside `packs/`).
-    pub folder: String,
-    /// Pack-relative authored path.
-    pub path: String,
 }
 
 /// Immutable, session-scoped registry of content definitions.

@@ -31,12 +31,46 @@ pub fn builtin_material_by_name(name: &str) -> Option<Material> {
         .map(|index| MATERIAL_VALUES[index])
 }
 
+/// Frozen table index of `material` in [`MATERIAL_ID_NAMES`].
+///
+/// This is the neutral catalog's `ItemRef::BuiltinMaterial` payload; the
+/// table is complete by construction, so every `Material` has an index.
+pub(crate) fn builtin_material_index(material: Material) -> u8 {
+    let index = MATERIAL_VALUES
+        .iter()
+        .position(|candidate| *candidate == material)
+        .expect("every material has a frozen vocabulary index");
+    index as u8
+}
+
+/// The material at a frozen table index, or `None` when it is out of range.
+pub(crate) fn builtin_material_by_index(index: u8) -> Option<Material> {
+    MATERIAL_VALUES.get(usize::from(index)).copied()
+}
+
 /// Reverse lookup for a built-in tool tier short name.
 pub fn builtin_tier_by_name(name: &str) -> Option<ToolTier> {
     TIER_ID_NAMES
         .iter()
         .position(|candidate| *candidate == name)
         .map(|index| TIER_VALUES[index])
+}
+
+/// Frozen table index of `tier` in [`TIER_ID_NAMES`].
+///
+/// This is the neutral catalog's `ItemRef::BuiltinTool` tier payload; the
+/// table is complete by construction, so every `ToolTier` has an index.
+pub(crate) fn builtin_tier_index(tier: ToolTier) -> u8 {
+    let index = TIER_VALUES
+        .iter()
+        .position(|candidate| *candidate == tier)
+        .expect("every tier has a frozen vocabulary index");
+    index as u8
+}
+
+/// The tier at a frozen table index, or `None` when it is out of range.
+pub(crate) fn builtin_tier_by_index(index: u8) -> Option<ToolTier> {
+    TIER_VALUES.get(usize::from(index)).copied()
 }
 
 /// Reverse lookup for a built-in constructible tool short name.
