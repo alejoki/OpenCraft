@@ -157,7 +157,7 @@ pub fn startup_session_with(
         session.clock = GameClock::from_time(COMBAT_DUSK_TICK);
     }
     // Ephemeral population gate (M009/S05-T03): the pinned `combat_demo:`
-    // digest and every bounded demo's v9 save tail must describe only what that
+    // digest and every bounded demo's v10 save tail must describe only what that
     // demo placed, so ambient spawning and daylight burning stay off for the
     // whole run. Production sessions never touch this switch.
     if demo_owns_world_witness(cli) {

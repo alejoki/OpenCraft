@@ -158,24 +158,6 @@ pub const COMBAT_PINNED_HEALTH: [u16; 4] = [4, 7, 11, 14];
 /// behind a default facing.
 pub const COMBAT_PINNED_YAW: [f32; 4] = [0.25, 0.75, -1.25, 2.5];
 
-/// Measured byte length of the fresh `--demo-combat` save (seed 12345), after
-/// the Drops stage earns the wood sword plus the pig/cow drops and the Shot
-/// stage earns the wood bow and its arrows, and the Save stage writes the two
-/// surviving hostile records.
-///
-/// Measured by running the fresh leg (`combat_demo_fresh_leg_writes_and_verifies_a_v9_save`)
-/// and reading the file back, never computed by hand: every earned stack changes
-/// the serialized inventory size. The same run measures the mob-count offset.
-/// Test-only pins: nothing in production reads the file length.
-pub const COMBAT_SAVE_BYTES: usize = 317;
-/// Bytes of the v8 pack-identity + digest tail (12) plus the v9 config tail
-/// (10) after the mob records.
-pub const COMBAT_SAVE_TAIL_BYTES: usize = 22;
-/// Measured offset of the v9 mob-count word in that save: the 19-byte Zombie
-/// record starts 4 bytes later and the Skeleton record follows it, so the tail
-/// ends [`COMBAT_SAVE_TAIL_BYTES`] bytes before [`COMBAT_SAVE_BYTES`].
-pub const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
-
 /// The scripted combat loop's fixed stage order. Each stage is fed once per
 /// `about_to_wait` call; Settle returns `false` until the fresh Survival
 /// spawn chunks are resident.
@@ -220,8 +202,8 @@ pub const COMBAT_SAVE_MOB_COUNT_OFFSET: usize = 253;
 /// to Creative rules — no target selection, no melee, no arrows, no damage —
 /// and then that one melee swing and one charge-0 arrow each one-shot a
 /// full-health Zombie with the pinned drop table intact. It consumes exactly
-/// the two rotten-flesh units its kills earned, so the measured 317-byte v9
-/// witness and every earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
+/// the two rotten-flesh units its kills earned, so the saved inventory witness and every
+/// earlier digest stay byte-identical. Full order: `Settle -> Ambient ->
 /// Spawn -> Walk -> Fight -> Drops -> Hostile -> Shot -> Skeleton -> Creative ->
 /// Save -> Restore -> Done`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1944,8 +1926,8 @@ pub fn combat_grounded_feet_y(session: &WorldSession, position: Vec3) -> Option<
 ///   frame count). On the debug profile this is a no-op — the body already
 ///   rests there — so every pinned digest stays byte-identical;
 /// * the player pose is restored afterwards, so the Shot stage and the Save
-///   witness start from the same pinned pose (the v9 layout itself is measured
-///   by the fresh-leg test, never by this stage).
+///   witness start from the same pinned pose (the v10 archive itself is
+///   measured by the fresh-leg test, never by this stage).
 ///
 /// The Skeleton is left where Drops left it is hostile and will chase, but
 /// it has no attack profile, so it can never add a damage event.
@@ -1973,7 +1955,7 @@ pub fn combat_hostile_stage(demo: &mut CombatDemo, session: &mut WorldSession) -
     // standing cell and all eight candidates are rejected. Snapping onto the
     // world's real block top first is a no-op on the debug profile (the body
     // already rests there), which is what keeps every pinned digest and the
-    // 317-byte v9 witness byte-identical; a mid-fall release pose becomes the
+    // saved inventory witness byte-identical; a mid-fall release pose becomes the
     // exact resting pose the debug run reaches instead of aborting the demo.
     let pose_before_settle = session.player.position;
     let Some(grounded_y) = combat_grounded_feet_y(session, pose_before_settle) else {
@@ -2736,7 +2718,7 @@ pub fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) 
     // into the empty cell above the standing cell and every candidate is
     // rejected. Snapping onto the world's real block top first is a no-op on
     // the debug profile (the body already rests there), which is what keeps
-    // every pinned digest and the 317-byte v9 witness byte-identical.
+    // every pinned digest and the saved inventory witness byte-identical.
     let pose_before_settle = session.player.position;
     let Some(grounded_y) = combat_grounded_feet_y(session, pose_before_settle) else {
         demo.abort(
@@ -3155,7 +3137,7 @@ pub fn combat_skeleton_stage(demo: &mut CombatDemo, session: &mut WorldSession) 
 ///    the real projectile sweep, granting exactly one more rotten flesh.
 /// 4. **Witness conservation.** Both earned rotten-flesh units are consumed
 ///    again and the inventory total must return to its pre-stage value, which
-///    is what keeps the measured 317-byte v9 save byte-identical.
+///    is what keeps the saved inventory witness byte-identical.
 ///
 /// Documented demo pins, not gameplay rules: the two survivors are parked 20
 /// blocks behind the camera (position *and* leash anchor, so the synthetic
@@ -3478,7 +3460,7 @@ pub fn combat_creative_stage(demo: &mut CombatDemo, session: &mut WorldSession) 
         .retain(|mob| mob.home.distance_squared(spot) > 1e-6);
 
     // 4. Conserve the save witness: both earned units are consumed again, so
-    //    the inventory section (and therefore the measured 317-byte v9 layout)
+    //    the inventory section (and therefore the saved inventory witness)
     //    is byte-identical.
     if session.player.consume_item(flesh_id).is_none()
         || session.player.consume_item(flesh_id).is_none()

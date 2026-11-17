@@ -44,7 +44,6 @@ use opencraft::demo::combat::{
     combat_creative_stage, combat_drops_stage, combat_fight_stage, combat_grounded_feet_y,
     combat_inventory_units, combat_inventory_units_total, combat_quartet, combat_shot_stage,
     combat_skeleton_stage, CombatStage, COMBAT_DUSK_TICK, COMBAT_PINNED_HEALTH, COMBAT_PINNED_YAW,
-    COMBAT_SAVE_BYTES, COMBAT_SAVE_MOB_COUNT_OFFSET, COMBAT_SAVE_TAIL_BYTES,
 };
 use opencraft::demo::combat::{combat_demo_step, CombatDemo, COMBAT_DEMO_DEADLINE_SECS};
 #[cfg(test)]
@@ -55,7 +54,7 @@ use opencraft::demo::content::{content_demo_step, ContentDemo, CONTENT_DEMO_DEAD
 #[cfg(test)]
 use opencraft::demo::digests::crafting_demo_grid;
 use opencraft::demo::digests::{
-    capture_demo_lines, crafting_demo_lines, demo_restart_lines, demo_save_v9_lines,
+    capture_demo_lines, crafting_demo_lines, demo_restart_lines, demo_save_v10_lines,
     palette_demo_lines, presentation_demo_lines, village_demo_lines, worldgen_demo_lines,
 };
 #[cfg(test)]
@@ -193,7 +192,9 @@ use opencraft::world::persistence::{
     load_world_from_path_with, CliConfig, DEFAULT_BACKGROUND_SAVE_PATH, DEFAULT_SAVE_PATH,
 };
 #[cfg(test)]
-use opencraft::world::persistence::{save_world_to_path_with, SavedPlayerState, WorldSaveData};
+use opencraft::world::persistence::{
+    save_world_to_path_with, SavedPlayerState, WorldSaveData, SAVED_MOB_LEN,
+};
 #[cfg(test)]
 use opencraft::world::season::DEFAULT_SEASON_LENGTH_DAYS;
 use opencraft::world::season::{season_of, weather_of_with, Weather};
@@ -7057,7 +7058,7 @@ impl ApplicationHandler for GameApp {
             }
             // The Hostile stage's digest follows the Ambient line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` lines and the
-            // measured 317-byte v9 witness keep their exact bytes.
+            // saved inventory witness keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -7067,8 +7068,8 @@ impl ApplicationHandler for GameApp {
             }
             // The Shot stage's digest follows the Hostile line for the same
             // reason: the pinned `combat_demo:` / `combat_spawn:` /
-            // `combat_hostile:` lines and the v9 witness keep their exact
-            // bytes.
+            // `combat_hostile:` lines and the saved inventory witness keep
+            // their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -7086,8 +7087,8 @@ impl ApplicationHandler for GameApp {
                 let _ = writeln!(stdout, "{line}");
             }
             // The Creative stage's digest follows the Skeleton line for the
-            // same reason: every earlier line and the 317-byte v9 witness keep
-            // their exact bytes.
+            // same reason: every earlier line and the saved inventory witness
+            // keep their exact bytes.
             if let Some(line) = self
                 .combat_demo
                 .as_ref()
@@ -7419,15 +7420,15 @@ fn main() {
         return;
     }
 
-    // `--demo-save-v9` is the headless v8-to-v9 save proof: it loads the
-    // `--save` input through the production decoder, writes the derived v9
-    // file next to it through the one production save site, and reloads that
-    // output under the effective config. It runs after the palette digest and
+    // `--demo-save-v10` is the headless v1-v9-to-v10 save proof: it loads the
+    // `--save` input through the production decoder, writes the derived v10
+    // sectioned file next to it through the one production save site, and
+    // reloads that output under the effective config. It runs after the palette digest and
     // before `StartupContent::load`, so no window, GPU, audio engine, event
     // loop, settings write, pack load, or world startup happens here.
-    if cli.demo_save_v9 {
+    if cli.demo_save_v10 {
         let config = ConfigRuntime::load_dir(Path::new(opencraft::config::CONFIG_DIR));
-        let (lines, ok) = demo_save_v9_lines(&cli.save_path, &config);
+        let (lines, ok) = demo_save_v10_lines(&cli.save_path, &config);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -7443,7 +7444,7 @@ fn main() {
     // `--demo-restart` is the headless two-run recipe restart proof: leg one
     // pins day 3 / tick 6000 and saves the explicit `--save` fixture; leg two
     // loads that save in a fresh process against the edited registry and
-    // previews/crafts the new recipe count. It runs after the v9 proof and
+    // previews/crafts the new recipe count. It runs after the v10 save proof and
     // before the pack-aware startup content is built, so no window, GPU,
     // audio engine, or event loop happens here. The default save path is
     // refused inside the proof, and the switch is deliberately not
@@ -8220,8 +8221,8 @@ mod tests {
     }
 
     #[test]
-    fn main_demo_save_v9_short_circuit_precedes_world_startup() {
-        // The v8-to-v9 proof must run after the palette digest and before any
+    fn main_demo_save_v10_short_circuit_precedes_world_startup() {
+        // The v1-v9-to-v10 proof must run after the palette digest and before any
         // world/session startup: no settings write, pack load, window, GPU,
         // audio engine, event loop, or world startup is allowed here.
         let source = include_str!("main.rs");
@@ -8232,40 +8233,40 @@ mod tests {
         let demo_palette_at = body
             .find("cli.demo_palette")
             .expect("fn main must branch on cli.demo_palette");
-        let demo_save_v9_at = body
-            .find("cli.demo_save_v9")
-            .expect("fn main must branch on cli.demo_save_v9");
+        let demo_save_v10_at = body
+            .find("cli.demo_save_v10")
+            .expect("fn main must branch on cli.demo_save_v10");
         let proof_at = body
-            .find("demo_save_v9_lines(")
-            .expect("fn main must call demo_save_v9_lines");
+            .find("demo_save_v10_lines(")
+            .expect("fn main must call demo_save_v10_lines");
         let startup_at = body
             .find("StartupContent::load(")
             .expect("fn main must build StartupContent before starting a session");
         assert!(
-            demo_palette_at < demo_save_v9_at,
-            "the v9 proof must follow the palette branch"
+            demo_palette_at < demo_save_v10_at,
+            "the v10 save proof must follow the palette branch"
         );
         assert!(
-            demo_save_v9_at < startup_at,
-            "cli.demo_save_v9 must precede startup"
+            demo_save_v10_at < startup_at,
+            "cli.demo_save_v10 must precede startup"
         );
         assert!(
             proof_at < startup_at,
-            "demo_save_v9_lines must precede startup"
+            "demo_save_v10_lines must precede startup"
         );
     }
 
     #[test]
-    fn demo_save_v9_is_a_launch_switch_and_never_a_world_intent() {
+    fn demo_save_v10_is_a_launch_switch_and_never_a_world_intent() {
         // The flag alone must not bypass the menus: it is a headless proof,
         // not a world parameter.
         let bare = CliConfig::parse_args(Vec::<String>::new());
-        let save_v9 = CliConfig::parse_args(["--demo-save-v9"]);
-        assert!(!cli_has_world_intent(&save_v9));
-        assert_eq!(cli_has_world_intent(&save_v9), cli_has_world_intent(&bare));
+        let save_v10 = CliConfig::parse_args(["--demo-save-v10"]);
+        assert!(!cli_has_world_intent(&save_v10));
+        assert_eq!(cli_has_world_intent(&save_v10), cli_has_world_intent(&bare));
         // A real world flag still grants intent; the proof flag is not
         // persisted or turned into a world parameter.
-        let with_new = CliConfig::parse_args(["--new", "--demo-save-v9"]);
+        let with_new = CliConfig::parse_args(["--new", "--demo-save-v10"]);
         assert!(cli_has_world_intent(&with_new));
     }
 
@@ -8284,7 +8285,7 @@ mod tests {
 
     #[test]
     fn main_demo_restart_short_circuit_precedes_world_startup() {
-        // The two-run restart proof must run after the v9 proof and before any
+        // The two-run restart proof must run after the v10 save proof and before any
         // world/session startup: no settings write, window, GPU, audio engine,
         // event loop, or world startup is allowed on this launch. Pin the
         // ordering in the real binary source so a later refactor cannot
@@ -8294,9 +8295,9 @@ mod tests {
             .split("fn main()")
             .nth(1)
             .expect("main.rs must define fn main");
-        let demo_save_v9_at = body
-            .find("cli.demo_save_v9")
-            .expect("fn main must branch on cli.demo_save_v9");
+        let demo_save_v10_at = body
+            .find("cli.demo_save_v10")
+            .expect("fn main must branch on cli.demo_save_v10");
         let demo_restart_at = body
             .find("cli.demo_restart")
             .expect("fn main must branch on cli.demo_restart");
@@ -8307,8 +8308,8 @@ mod tests {
             .find("StartupContent::load(")
             .expect("fn main must build StartupContent before starting a session");
         assert!(
-            demo_save_v9_at < demo_restart_at,
-            "the restart proof must follow the v9 proof"
+            demo_save_v10_at < demo_restart_at,
+            "the restart proof must follow the v10 save proof"
         );
         assert!(
             demo_restart_at < startup_at,
@@ -8724,7 +8725,7 @@ mod tests {
             "cli.check_config",
             "check_config_lines",
             "cli.validate_pack",
-            "cli.demo_save_v9",
+            "cli.demo_save_v10",
             "StartupContent::load",
         ] {
             assert!(
@@ -10482,7 +10483,7 @@ stack = 64
         assert!(!session.player.can_fly());
         assert!(
             !session.ambient_spawning(),
-            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v9 save tail"
+            "the scripted run pins the population gate closed so ambient spawns\n             cannot perturb the combat_demo: digest or the v10 save tail"
         );
         assert!(
             session.spawn_settle_pending(),
@@ -11959,13 +11960,12 @@ stack = 64
         assert_eq!(session.player.pitch, -0.25);
     }
 
-    /// The fresh leg writes the v9 save through the production save site, and
-    /// the file itself carries the two surviving hostile records plus the earned
-    /// inventory. The file length and the mob-count offset are MEASURED by
-    /// running the fresh leg, never computed by hand: they depend on the exact
-    /// serialized size of the inventory stacks the demo earns.
+    /// The fresh leg writes the v10 save through the production save site, and
+    /// section 5 carries the two surviving hostile records plus the earned
+    /// inventory. The archive is parsed as a sectioned image; there is no
+    /// hand-computed file length or mob-count offset to drift.
     #[test]
-    fn combat_demo_fresh_leg_writes_and_verifies_a_v9_save() {
+    fn combat_demo_fresh_leg_writes_and_verifies_a_v10_save() {
         let dir = tempfile::tempdir().expect("tempdir");
         let seed = 12345;
         let save_path = dir.path().join("combat-fresh-leg.mcvx");
@@ -11978,50 +11978,45 @@ stack = 64
         assert!(digest.contains("saved=2 records=2"), "{digest}");
         assert!(digest.contains("ok=true"), "{digest}");
 
+        use opencraft_storage::archive::{SaveImage, SectionId};
+
         let bytes = std::fs::read(&save_path).expect("read save");
+        let image = SaveImage::parse(bytes).expect("v10 archive parses");
+        assert_eq!(image.version(), 10, "v10 version word");
+        assert_eq!(image.flags(), 0);
+
+        // Section 5 is the mob count plus the canonical sorted records.
+        let mobs = image.section(SectionId(5)).expect("v10 mobs section");
         assert_eq!(
-            bytes.len(),
-            COMBAT_SAVE_BYTES,
-            "measured fresh-leg save length"
+            mobs.len(),
+            4 + 2 * SAVED_MOB_LEN,
+            "the mobs section holds exactly two records"
         );
-        // Locate the mob count by scanning for the exact two-record tail: the
-        // Zombie record starts immediately after the u32 count. This cross-check
-        // keeps the pinned offset honest if a future stage changes the layout
-        // without re-measuring.
+        let count = u32::from_le_bytes(mobs[..4].try_into().expect("mob count word"));
+        assert_eq!(count, 2, "two surviving hostile records");
+        let zombie = &mobs[4..4 + SAVED_MOB_LEN];
+        let skeleton = &mobs[4 + SAVED_MOB_LEN..];
+        assert_eq!(zombie[0], 2, "Zombie tag");
+        assert_eq!(
+            u16::from_le_bytes(
+                zombie[SAVED_MOB_LEN - 2..]
+                    .try_into()
+                    .expect("Zombie health word")
+            ),
+            11,
+            "Zombie health"
+        );
+        assert_eq!(skeleton[0], 3, "Skeleton tag");
+        assert_eq!(
+            u16::from_le_bytes(
+                skeleton[SAVED_MOB_LEN - 2..]
+                    .try_into()
+                    .expect("Skeleton health word")
+            ),
+            14,
+            "Skeleton health"
+        );
         let (positions, _) = combat_quartet(session.player.position, session.player.yaw, seed);
-        let mut tail: Vec<u8> = Vec::new();
-        for kind in [MobKind::Zombie, MobKind::Skeleton] {
-            let index = MobKind::ALL
-                .iter()
-                .position(|candidate| *candidate == kind)
-                .expect("kind index");
-            tail.push(kind.tag());
-            for c in positions[index].to_array() {
-                tail.extend_from_slice(&c.to_le_bytes());
-            }
-            tail.extend_from_slice(&COMBAT_PINNED_YAW[index].to_le_bytes());
-            tail.extend_from_slice(&COMBAT_PINNED_HEALTH[index].to_le_bytes());
-        }
-        let tail_start = bytes
-            .windows(tail.len())
-            .position(|window| window == tail.as_slice())
-            .expect("two-record mob tail in the save");
-        assert_eq!(
-            tail_start - 4,
-            COMBAT_SAVE_MOB_COUNT_OFFSET,
-            "pinned mob-count offset"
-        );
-        assert_eq!(&bytes[4..8], &9u32.to_le_bytes(), "v9 version word");
-        assert_eq!(
-            &bytes[COMBAT_SAVE_MOB_COUNT_OFFSET..COMBAT_SAVE_MOB_COUNT_OFFSET + 4],
-            &2u32.to_le_bytes(),
-            "mob count at the measured offset"
-        );
-        assert_eq!(
-            COMBAT_SAVE_MOB_COUNT_OFFSET + 4 + tail.len() + COMBAT_SAVE_TAIL_BYTES,
-            bytes.len(),
-            "the mob tail is followed only by the pack-identity, digest, and config tail"
-        );
 
         let loaded = load_world_from_path(&save_path).expect("load save");
         assert_eq!(loaded.mobs.len(), 2);
@@ -14694,7 +14689,7 @@ stack = 64
             "leg=place: one ruby block is consumed"
         );
 
-        // (12) Save v9, reload against the same stack, and prove the writer is
+        // (12) Save v10, reload against the same stack, and prove the writer is
         // deterministic.
         save_current_world(&mut session).expect("leg=save: the session save writes");
         let bytes = std::fs::read(&save_path).expect("leg=save: the save file is readable");
@@ -14707,7 +14702,7 @@ stack = 64
                 .try_into()
                 .expect("leg=save: the version word is present"),
         );
-        assert_eq!(version, 9, "leg=save: the file is v9");
+        assert_eq!(version, 10, "leg=save: the file is v10");
         let loaded = load_world_from_path_with(&save_path, full_reg.as_ref())
             .expect("leg=reload: the save loads");
         assert_eq!(
@@ -14752,7 +14747,7 @@ stack = 64
         .expect("leg=reload: the loaded world re-saves");
         assert_eq!(
             resaved, bytes,
-            "leg=reload: a loaded v9 save re-saves byte-identically"
+            "leg=reload: a loaded v10 save re-saves byte-identically"
         );
     }
 
@@ -27894,11 +27889,11 @@ stack = 64
         let bytes = std::fs::read(&save_path).expect("read the saved world");
         assert_eq!(
             u32::from_le_bytes(bytes[4..8].try_into().expect("the version word")),
-            9,
-            "the production save site writes v9"
+            10,
+            "the production save site writes v10"
         );
         let loaded = load_world_from_path_with(&save_path, ContentRegistry::builtin())
-            .expect("the v9 save loads");
+            .expect("the v10 save loads");
         assert_eq!(
             loaded.saved_config,
             Some(expected),

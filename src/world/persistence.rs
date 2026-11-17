@@ -1,18 +1,17 @@
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufWriter, Cursor, Read, Write};
+#[cfg(test)]
+use std::fs;
+use std::fs::File;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use glam::IVec3;
 use rustc_hash::FxHashMap;
 
-#[cfg(test)]
 use crate::world::chunk::{
     linear_index, local_coords_from_index, world_to_chunk_and_local, CHUNK_SIZE,
 };
-#[cfg(test)]
 use opencraft_storage::archive::{encode_archive, SaveImage, SectionId};
-#[cfg(test)]
 use opencraft_storage::chunk_section::ChunkSection;
 use opencraft_storage::StorageError;
 
@@ -38,7 +37,7 @@ pub const DEFAULT_SAVE_PATH: &str = "saves/default.mcvx";
 /// appear in the Load Game screen or be deleted from it.
 pub const DEFAULT_BACKGROUND_SAVE_PATH: &str = "saves/background/background.mcvx";
 pub const SAVE_MAGIC: &[u8; 4] = b"MCVX";
-pub const SAVE_VERSION: u32 = 9;
+pub const SAVE_VERSION: u32 = 10;
 /// First save version that carries the sorted save-local content string table,
 /// `u16` name indices for every persisted content reference, and the
 /// pack-identity + digest tail.
@@ -53,49 +52,31 @@ pub const CONFIG_TAIL_LEN: usize = 10;
 // v10 sectioned format (D323)
 // ---------------------------------------------------------------------
 
-/// v10 archive version. Production still writes [`SAVE_VERSION`] until the
-/// T03 cutover; the v10 writer/reader are built and pinned behind direct
-/// tests first so the format risk retires before any live file changes.
-#[cfg(test)]
-const V10_SAVE_VERSION: u32 = 10;
 /// Sorted kind-tagged content table (the v10 header replacement).
-#[cfg(test)]
 const V10_SECTION_CONTENT_TABLE: u32 = 1;
 /// Seed, player pose, clock, calendar, mode and vitals.
-#[cfg(test)]
 const V10_SECTION_WORLD_PLAYER: u32 = 2;
 /// 36 inventory slots, cursor, player grid and table grid.
-#[cfg(test)]
 const V10_SECTION_INVENTORY: u32 = 3;
 /// Chest count plus sorted chest records.
-#[cfg(test)]
 const V10_SECTION_CHESTS: u32 = 4;
 /// Mob count plus canonically sorted mob records.
-#[cfg(test)]
 const V10_SECTION_MOBS: u32 = 5;
 /// Sorted pack identities plus the registry digest.
-#[cfg(test)]
 const V10_SECTION_CONTENT_META: u32 = 6;
 /// Config schema plus effective-value digest.
-#[cfg(test)]
 const V10_SECTION_CONFIG: u32 = 7;
 /// Sorted world positions of immature wheat crops.
-#[cfg(test)]
 const V10_SECTION_CROPS: u32 = 8;
 /// Sorted non-empty chunk index: `{x, y, z, edit_count}` records.
-#[cfg(test)]
 const V10_SECTION_CHUNK_INDEX: u32 = 9;
 /// First per-chunk palette section id; chunk `i` lives at this base + `i`.
-#[cfg(test)]
 const V10_CHUNK_SECTION_BASE: u32 = 16;
 /// Ids between the fixed sections and the chunk range are reserved.
-#[cfg(test)]
 const V10_RESERVED_SECTION_IDS: std::ops::RangeInclusive<u32> = 10..=15;
 /// Upper bound on persisted immature-wheat crop positions.
-#[cfg(test)]
 const MAX_SAVED_CROPS: usize = 1_000_000;
 /// Upper bound on persisted non-empty chunk records (same as v9).
-#[cfg(test)]
 const MAX_SAVED_CHUNKS: usize = 1_000_000;
 /// Version the frozen test-only legacy encoder emits.
 #[cfg(test)]
@@ -322,15 +303,15 @@ pub struct CliConfig {
     /// opens a window, GPU, audio engine, event loop or settings write, and
     /// never writes a save.
     pub demo_palette: bool,
-    /// Whether the headless v8-to-v9 save proof (`--demo-save-v9`,
-    /// M014/S04-T05) is requested. Same bare-switch contract as
-    /// `demo_palette`: it takes no value, is deliberately NOT a world intent
-    /// (so it never affects `cli_has_world_intent`), and is never persisted.
-    /// `main` consumes it before `StartupContent::load`, so the proof never
-    /// opens a window, GPU, audio engine, event loop, settings write, or pack
-    /// load. Its only writes are the derived v9 file next to `--save`; the
-    /// input is never overwritten.
-    pub demo_save_v9: bool,
+    /// Whether the headless v1-v9-to-v10 save proof (`--demo-save-v10`,
+    /// M018/S02) is requested. Same bare-switch contract as `demo_palette`: it
+    /// takes no value, is deliberately NOT a world intent (so it never affects
+    /// `cli_has_world_intent`), and is never persisted. `main` consumes it
+    /// before `StartupContent::load`, so the proof never opens a window, GPU,
+    /// audio engine, event loop, settings write, or pack load. Its only writes
+    /// are the derived v10 file next to `--save`; the input is never
+    /// overwritten.
+    pub demo_save_v10: bool,
     /// Whether the headless two-run recipe restart proof (`--demo-restart`,
     /// M014/S09-T02) is requested. A bare launch switch: it takes no value,
     /// is deliberately NOT a world intent (so it never affects
@@ -418,7 +399,7 @@ impl CliConfig {
         let mut demo_worldgen = false;
         let mut demo_village = false;
         let mut demo_palette = false;
-        let mut demo_save_v9 = false;
+        let mut demo_save_v10 = false;
         let mut demo_restart = false;
         let mut validate_pack = None;
         let mut validate_worldgen = None;
@@ -529,15 +510,15 @@ impl CliConfig {
                     // short-circuits on this before `StartupContent::load`.
                     demo_palette = true;
                 }
-                "--demo-save-v9" => {
+                "--demo-save-v10" => {
                     // Same bare-switch rule as `--demo-palette`. `main`
                     // short-circuits on this before `StartupContent::load`;
                     // the next token stays available as an independent
                     // argument (normally `--save <input>`).
-                    demo_save_v9 = true;
+                    demo_save_v10 = true;
                 }
                 "--demo-restart" => {
-                    // Same bare-switch rule as `--demo-save-v9`. `main`
+                    // Same bare-switch rule as `--demo-save-v10`. `main`
                     // short-circuits on this before the startup content is
                     // built; the next token stays available as an independent
                     // argument (normally `--save <fixture>`).
@@ -624,7 +605,7 @@ impl CliConfig {
             demo_worldgen,
             demo_village,
             demo_palette,
-            demo_save_v9,
+            demo_save_v10,
             demo_restart,
             validate_pack,
             validate_worldgen,
@@ -1243,7 +1224,7 @@ fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), Per
     Ok(())
 }
 
-/// Writes a v9 save using the built-in content registry.
+/// Writes a v10 save using the built-in content registry.
 ///
 /// Callers that loaded a world with a pack stack should use
 /// [`save_world_to_bytes_with`] so modded names round-trip instead of being
@@ -1473,6 +1454,7 @@ fn content_name_of_block(
 }
 
 /// The save name of an item reference.
+#[cfg(test)]
 fn content_name_of_item(registry: &ContentRegistry, item: Item) -> Result<&str, PersistenceError> {
     match item.id() {
         ItemId::Block(block) => content_name_of_block(registry, block),
@@ -1638,11 +1620,13 @@ trait ContentTable {
 }
 
 /// Sorted, unique save-local content names plus their `u16` wire indices.
+#[cfg(test)]
 struct ContentNameTable {
     names: Vec<String>,
     index: FxHashMap<String, u16>,
 }
 
+#[cfg(test)]
 impl ContentNameTable {
     /// Collects every referenced name in one pre-write pass.
     ///
@@ -1670,6 +1654,7 @@ impl ContentNameTable {
     }
 }
 
+#[cfg(test)]
 impl ContentTable for ContentNameTable {
     fn index_of(&self, _kind: ContentKind, name: &str) -> Result<u16, PersistenceError> {
         self.index
@@ -1865,6 +1850,7 @@ fn checked_sorted_mobs(data: &WorldSaveData) -> Result<(u32, Vec<SavedMob>), Per
 /// The version parameter exists so the frozen `#[cfg(test)]` v8/v9 witness
 /// writers can keep producing the exact pre-v10 bytes after production flips;
 /// every other byte stays identical across versions.
+#[cfg(test)]
 fn write_world_with_version(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
@@ -2071,7 +2057,7 @@ pub(crate) fn save_v9_world_to_path(
     write_save_file(path, &bytes)
 }
 
-/// Writes a v9 save using `registry` to name every content reference.
+/// Writes a v10 save using `registry` to name every content reference.
 ///
 /// Delegates with the registry-default config metadata so existing callers
 /// keep their signature; production save sites that hold a [`ConfigRuntime`]
@@ -2084,7 +2070,8 @@ pub fn save_world_to_bytes_with(
     save_world_to_bytes_with_config(out, data, registry, ConfigRuntime::defaults().meta())
 }
 
-/// Writes a v9 save using `registry` and an explicit config schema + digest.
+/// Writes a v10 sectioned save using `registry` and an explicit config schema
+/// + digest.
 ///
 /// Rejects the whole payload before the first output byte if any reference is
 /// unnameable, any name exceeds the wire cap, the pack metadata is invalid, or
@@ -2095,7 +2082,7 @@ pub fn save_world_to_bytes_with_config(
     registry: &ContentRegistry,
     config: SaveConfigMeta,
 ) -> Result<(), PersistenceError> {
-    write_world_with_version(out, data, registry, config, SAVE_VERSION)
+    write_v10_world(out, data, registry, config)
 }
 
 fn read_u8<R: Read>(r: &mut R) -> Result<u8, PersistenceError> {
@@ -2696,7 +2683,7 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
     }
 
     let version = read_u32(&mut cur)?;
-    if !(CONTENT_TABLE_VERSION..=SAVE_VERSION).contains(&version) {
+    if !(CONTENT_TABLE_VERSION..=CONFIG_TAIL_VERSION).contains(&version) {
         return Err(PersistenceError::UnsupportedVersion(version));
     }
 
@@ -2990,12 +2977,10 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
 /// Entries are keyed by `(name, kind)` and wire-indexed in that order, which
 /// removes the v8 "guess the kind from context" ambiguity. Chunk palettes may
 /// only reference block (`kind` 1) entries.
-#[cfg(test)]
 struct V10ContentTable {
     entries: Vec<(String, ContentKind)>,
 }
 
-#[cfg(test)]
 impl V10ContentTable {
     /// Collects the same references as the v9 name-only table, but keeps the
     /// wire kind and sorts by `(name, kind)`.
@@ -3030,7 +3015,6 @@ impl V10ContentTable {
     }
 }
 
-#[cfg(test)]
 impl ContentTable for V10ContentTable {
     fn index_of(&self, kind: ContentKind, name: &str) -> Result<u16, PersistenceError> {
         self.entries
@@ -3055,7 +3039,6 @@ impl ContentTable for V10ContentTable {
 }
 
 /// Immature wheat is every wheat stage except the mature harvest stage.
-#[cfg(test)]
 fn is_immature_wheat(block: BlockId) -> bool {
     block.is_wheat_stage() && block != BlockId::WheatStage3
 }
@@ -3063,9 +3046,8 @@ fn is_immature_wheat(block: BlockId) -> bool {
 /// Validates the whole payload, then builds every v10 section body in memory.
 ///
 /// The caller gets a complete section list or a typed error: no output byte is
-/// emitted for a rejected save, matching the v9 writer's atomic-rejection
+/// emitted for a rejected save, matching the flat v9 writer's atomic-rejection
 /// contract.
-#[cfg(test)]
 fn build_v10_sections(
     data: &WorldSaveData,
     registry: &ContentRegistry,
@@ -3265,7 +3247,6 @@ fn build_v10_sections(
 }
 
 /// Encodes a v10 archive into `out` through the neutral storage crate.
-#[cfg(test)]
 fn write_v10_world(
     out: &mut Vec<u8>,
     data: &WorldSaveData,
@@ -3277,13 +3258,12 @@ fn write_v10_world(
         .iter()
         .map(|(id, body)| (SectionId(*id), body.as_slice()))
         .collect();
-    let archive = encode_archive(V10_SAVE_VERSION, 0, &borrowed)?;
+    let archive = encode_archive(SAVE_VERSION, 0, &borrowed)?;
     out.extend_from_slice(&archive);
     Ok(())
 }
 
 /// One eagerly resolved v10 content-table entry.
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResolvedContent {
     Block(BlockId),
@@ -3301,7 +3281,6 @@ enum ResolvedContent {
     ModToolPlaceholder(u16),
 }
 
-#[cfg(test)]
 fn content_kind_from_tag(tag: u8) -> Option<ContentKind> {
     match tag {
         1 => Some(ContentKind::Block),
@@ -3319,7 +3298,6 @@ fn content_kind_from_tag(tag: u8) -> Option<ContentKind> {
 /// is resolved eagerly in table order. Placeholders are therefore appended in
 /// `(name, kind)` order, which is intentionally different from the v9
 /// first-reference order and pinned by a test.
-#[cfg(test)]
 struct V10Resolver {
     entries: Vec<(ContentKind, String)>,
     resolved: Vec<ResolvedContent>,
@@ -3327,7 +3305,6 @@ struct V10Resolver {
     unresolved: usize,
 }
 
-#[cfg(test)]
 impl V10Resolver {
     fn parse(body: &[u8], base: &ContentRegistry) -> Result<Self, PersistenceError> {
         let mut cur = Cursor::new(body);
@@ -3500,7 +3477,6 @@ impl V10Resolver {
 }
 
 /// Reads one v10 item record, enforcing wire-tag/kind agreement.
-#[cfg(test)]
 fn read_v10_item<R: Read>(
     r: &mut R,
     resolver: &V10Resolver,
@@ -3590,7 +3566,6 @@ fn read_v10_item<R: Read>(
     }
 }
 
-#[cfg(test)]
 fn read_v10_grid<R: Read>(
     r: &mut R,
     resolver: &V10Resolver,
@@ -3609,7 +3584,6 @@ fn read_v10_grid<R: Read>(
     CraftingGrid::from_slots(kind, slots).map_err(|_| PersistenceError::InvalidCraftingState)
 }
 
-#[cfg(test)]
 fn read_v10_inventory_extension<R: Read>(
     r: &mut R,
     resolver: &V10Resolver,
@@ -3635,9 +3609,8 @@ fn read_v10_inventory_extension<R: Read>(
 /// before any name is resolved, and every section body must be fully consumed.
 /// A forged payload fails closed with a typed error; this decoder never
 /// panics.
-#[cfg(test)]
 fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, PersistenceError> {
-    if image.version() != V10_SAVE_VERSION {
+    if image.version() != SAVE_VERSION {
         return Err(PersistenceError::UnsupportedVersion(image.version()));
     }
 
@@ -4043,15 +4016,49 @@ fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, P
     })
 }
 
+/// Loads any supported save version, taking ownership of the archive bytes.
+///
+/// A v10 payload is parsed and decoded in place: [`SaveImage::parse`] owns
+/// the vector and [`decode_v10`] only borrows section bodies, so no second
+/// full-image copy is made. v8-v9 payloads decode through the flat reader and
+/// v1-v7 payloads through the frozen legacy reader.
+pub fn load_world_from_owned(
+    bytes: Vec<u8>,
+    registry: &ContentRegistry,
+) -> Result<LoadedWorld, PersistenceError> {
+    let version = peek_save_version(&bytes)?;
+    ensure_supported_version(version)?;
+    if version == SAVE_VERSION {
+        let image = SaveImage::parse(bytes)?;
+        decode_v10(image, registry)
+    } else if version >= CONTENT_TABLE_VERSION {
+        decode_v8(&bytes, registry)
+    } else {
+        Ok(LoadedWorld {
+            data: decode_legacy(&bytes)?,
+            registry: registry.clone(),
+            saved_content: None,
+            saved_config: None,
+            unresolved: 0,
+        })
+    }
+}
+
 /// Loads any supported save version, returning the placeholder-augmented
-/// registry and v8/v9 content metadata alongside the world data.
+/// registry and content metadata alongside the world data.
+///
+/// A v10 payload is copied once so the owned decoder can avoid a second copy;
+/// v8-v9 payloads decode straight from the borrow, and v1-v7 payloads decode
+/// through the frozen legacy reader.
 pub fn load_world_from_bytes_with(
     bytes: &[u8],
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
     let version = peek_save_version(bytes)?;
     ensure_supported_version(version)?;
-    if version >= CONTENT_TABLE_VERSION {
+    if version == SAVE_VERSION {
+        load_world_from_owned(bytes.to_vec(), registry)
+    } else if version >= CONTENT_TABLE_VERSION {
         decode_v8(bytes, registry)
     } else {
         Ok(LoadedWorld {
@@ -4262,32 +4269,22 @@ fn read_inventory_extension<R: Read>(
     ))
 }
 
-/// Writes `bytes` atomically with the established tmp + rename sequence.
+/// Writes `bytes` atomically through the neutral storage crate.
+///
+/// The helper creates the parent directory, writes a sibling `.mcvx.tmp`,
+/// flushes and syncs it, then renames over the target, so a failed or
+/// interrupted write never replaces the previous save. Images above
+/// [`MAX_SAVE_FILE_BYTES`] are rejected before the filesystem is touched.
 fn write_save_file(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-
-    let tmp_path = path.with_extension("mcvx.tmp");
-    {
-        let file = File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        writer.write_all(bytes)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-    }
-    fs::rename(&tmp_path, path)?;
-    Ok(())
+    opencraft_storage::file::write_atomic(path, bytes).map_err(PersistenceError::from)
 }
 
-/// Writes a v9 save using the built-in content registry, atomically.
+/// Writes a v10 save using the built-in content registry, atomically.
 pub fn save_world_to_path(path: &Path, data: &WorldSaveData) -> Result<(), PersistenceError> {
     save_world_to_path_with(path, data, ContentRegistry::builtin())
 }
 
-/// Writes a v9 save using `registry`, atomically.
+/// Writes a v10 save using `registry`, atomically.
 ///
 /// Delegates with the registry-default config metadata; production save sites
 /// that hold a [`ConfigRuntime`] should use [`save_world_to_path_with_config`].
@@ -4299,7 +4296,7 @@ pub fn save_world_to_path_with(
     save_world_to_path_with_config(path, data, registry, ConfigRuntime::defaults().meta())
 }
 
-/// Writes a v9 save using `registry` and an explicit config schema + digest,
+/// Writes a v10 save using `registry` and an explicit config schema + digest,
 /// atomically.
 pub fn save_world_to_path_with_config(
     path: &Path,
@@ -4312,65 +4309,38 @@ pub fn save_world_to_path_with_config(
     write_save_file(path, &bytes)
 }
 
-/// Rejects a save longer than [`MAX_SAVE_FILE_BYTES`] before it is read.
-fn reject_oversized_save(len: u64) -> Result<(), PersistenceError> {
-    if len > MAX_SAVE_FILE_BYTES {
-        return Err(PersistenceError::SaveTooLarge {
-            len,
-            limit: MAX_SAVE_FILE_BYTES,
-        });
-    }
-    Ok(())
-}
-
-/// Opens a save for reading, rejecting non-regular paths before `File::open`.
+/// Opens a save for reading through the bounded neutral file helper.
 ///
-/// `std::fs::metadata` follows symlinks and never opens the path, so a FIFO
-/// is rejected without waiting for a writer. A directory opens on Linux but
-/// every read fails with `EISDIR`; it is rejected here with the same typed
-/// error on every OS.
+/// Non-regular paths (directory, FIFO, socket, device) are rejected from
+/// metadata before the path is opened, so a FIFO can never block the reader.
 fn open_save_file(path: &Path) -> Result<File, PersistenceError> {
-    let metadata = fs::metadata(path)?;
-    if !metadata.is_file() {
-        return Err(PersistenceError::NotRegularFile);
-    }
-    reject_oversized_save(metadata.len())?;
-
-    let file = File::open(path)?;
-    // Recheck type and length from the opened handle: the path can change
-    // between metadata and open (benign TOCTOU).
-    let opened = file.metadata()?;
-    if !opened.is_file() {
-        return Err(PersistenceError::NotRegularFile);
-    }
-    reject_oversized_save(opened.len())?;
-    Ok(file)
+    opencraft_storage::file::open_file_bounded(path, MAX_SAVE_FILE_BYTES)
+        .map_err(PersistenceError::from)
 }
 
 /// Reads a whole save file while refusing to allocate more than
 /// [`MAX_SAVE_FILE_BYTES`].
 fn read_save_bytes(path: &Path) -> Result<Vec<u8>, PersistenceError> {
-    let file = open_save_file(path)?;
-    let mut bytes = Vec::new();
-    file.take(MAX_SAVE_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    // A file that grew between the metadata check and the read is still
-    // rejected here rather than silently truncated.
-    reject_oversized_save(bytes.len() as u64)?;
-    Ok(bytes)
+    opencraft_storage::file::read_file_bounded(path, MAX_SAVE_FILE_BYTES)
+        .map_err(PersistenceError::from)
 }
 
 pub fn load_world_from_path(path: &Path) -> Result<WorldSaveData, PersistenceError> {
     let bytes = read_save_bytes(path)?;
-    load_world_from_bytes(&bytes)
+    load_world_from_owned(bytes, ContentRegistry::builtin()).map(|loaded| loaded.data)
 }
 
 /// Loads any supported save version with `registry`, atomically from disk.
+///
+/// v10 archives are decoded from the owned read buffer, so the load pays one
+/// allocation (plus [`SaveImage`]'s owned directory) and never a second copy of
+/// the full image.
 pub fn load_world_from_path_with(
     path: &Path,
     registry: &ContentRegistry,
 ) -> Result<LoadedWorld, PersistenceError> {
     let bytes = read_save_bytes(path)?;
-    load_world_from_bytes_with(&bytes, registry)
+    load_world_from_owned(bytes, registry)
 }
 
 /// Probes whether `path` carries a save header this build can play.
@@ -4483,7 +4453,8 @@ mod tests {
             chunk_edits: edits,
         };
 
-        assert_eq!(SAVE_VERSION, CONFIG_TAIL_VERSION);
+        assert_eq!(SAVE_VERSION, 10);
+        assert_eq!(CONFIG_TAIL_VERSION, 9);
         assert_eq!(CONFIG_TAIL_VERSION, CONTENT_TABLE_VERSION + 1);
         assert_eq!(CONTENT_TABLE_VERSION, MOB_VERSION + 1);
         assert_eq!(MOB_VERSION, SURVIVAL_VERSION + 1);
@@ -4527,7 +4498,7 @@ mod tests {
             usize::from(BUILTIN_BLOCK_COUNT) - 1,
             "every built-in raw id minus water"
         );
-        assert_eq!(SAVE_VERSION, 9, "socket_marker ships inside v9");
+        assert_eq!(SAVE_VERSION, 10, "socket_marker ships inside v10");
 
         let mut edits = ChunkEditMap::default();
         edits.insert(ChunkPos::new(0, 0, 0), chunk);
@@ -6242,7 +6213,8 @@ mod tests {
 
     #[test]
     fn test_version_constants_are_coupled() {
-        assert_eq!(SAVE_VERSION, CONFIG_TAIL_VERSION);
+        assert_eq!(SAVE_VERSION, 10);
+        assert_eq!(CONFIG_TAIL_VERSION, 9);
         assert_eq!(CONFIG_TAIL_VERSION, CONTENT_TABLE_VERSION + 1);
         assert_eq!(CONTENT_TABLE_VERSION, MOB_VERSION + 1);
         assert_eq!(CONFIG_TAIL_LEN, 10);
@@ -6288,8 +6260,16 @@ mod tests {
 
     #[test]
     fn test_v6_canonicalizes_the_header_fly_byte_through_the_mode() {
-        // Header layout: magic, version, seed, position, yaw, pitch, fly.
-        const V3_FLY_OFFSET: usize = 32;
+        // v10 world/player section body: seed(4) + position(12) + yaw(4) +
+        // pitch(4), then the fly byte.
+        const V10_FLY_OFFSET: usize = 24;
+
+        fn world_fly_byte(bytes: &[u8]) -> u8 {
+            let image = SaveImage::parse(bytes.to_vec()).expect("v10 archive parses");
+            image
+                .section(SectionId(V10_SECTION_WORLD_PLAYER))
+                .expect("world/player section")[V10_FLY_OFFSET]
+        }
 
         let mut survival = sample_data(sample_player());
         assert!(survival.player.fly_mode);
@@ -6297,7 +6277,8 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &survival).unwrap();
         assert_eq!(
-            bytes[V3_FLY_OFFSET], 0,
+            world_fly_byte(&bytes),
+            0,
             "a Survival save may not carry a flying player"
         );
         let loaded = load_world_from_bytes(&bytes).unwrap();
@@ -6308,7 +6289,7 @@ mod tests {
         creative.mode = GameMode::Creative;
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &creative).unwrap();
-        assert_eq!(bytes[V3_FLY_OFFSET], 1);
+        assert_eq!(world_fly_byte(&bytes), 1);
         let loaded = load_world_from_bytes(&bytes).unwrap();
         assert!(loaded.player.fly_mode);
     }
@@ -7294,10 +7275,10 @@ mod tests {
     }
 
     #[test]
-    fn test_demo_save_v9_parses_as_a_bare_switch() {
+    fn test_demo_save_v10_parses_as_a_bare_switch() {
         // Absent keeps the seam off, and every other demo seam stays off too.
         let bare = CliConfig::parse_args(Vec::<String>::new());
-        assert!(!bare.demo_save_v9);
+        assert!(!bare.demo_save_v10);
         assert!(!bare.demo_palette);
         assert!(!bare.demo_worldgen);
         assert!(!bare.demo_crafting);
@@ -7305,8 +7286,8 @@ mod tests {
         assert!(!bare.demo_ui);
 
         // The flag alone sets exactly its own seam and consumes no value.
-        let flag = CliConfig::parse_args(["--demo-save-v9"]);
-        assert!(flag.demo_save_v9);
+        let flag = CliConfig::parse_args(["--demo-save-v10"]);
+        assert!(flag.demo_save_v10);
         assert!(!flag.demo_palette);
         assert!(!flag.demo_worldgen);
         assert!(!flag.demo_crafting);
@@ -7318,16 +7299,16 @@ mod tests {
 
         // A following `--save fixture.mcvx` is parsed as the save path, not
         // swallowed as the switch's value.
-        let with_save = CliConfig::parse_args(["--demo-save-v9", "--save", "fixture.mcvx"]);
-        assert!(with_save.demo_save_v9);
+        let with_save = CliConfig::parse_args(["--demo-save-v10", "--save", "fixture.mcvx"]);
+        assert!(with_save.demo_save_v10);
         assert_eq!(
             with_save.save_path,
             std::path::PathBuf::from("fixture.mcvx")
         );
 
         // A stray non-flag token after the switch never becomes the seed.
-        let stray = CliConfig::parse_args(["--demo-save-v9", "5"]);
-        assert!(stray.demo_save_v9);
+        let stray = CliConfig::parse_args(["--demo-save-v10", "5"]);
+        assert!(stray.demo_save_v10);
         assert_eq!(stray.seed_override, None);
     }
 
@@ -7336,12 +7317,12 @@ mod tests {
         // Absent keeps the seam off, and every sibling demo seam stays off.
         let bare = CliConfig::parse_args(Vec::<String>::new());
         assert!(!bare.demo_restart);
-        assert!(!bare.demo_save_v9);
+        assert!(!bare.demo_save_v10);
 
         // The flag alone sets exactly its own seam and consumes no value.
         let flag = CliConfig::parse_args(["--demo-restart"]);
         assert!(flag.demo_restart);
-        assert!(!flag.demo_save_v9);
+        assert!(!flag.demo_save_v10);
         assert!(!flag.force_new_world);
         assert_eq!(flag.seed_override, None);
         assert_eq!(flag.save_path, std::path::PathBuf::from(DEFAULT_SAVE_PATH));
@@ -8337,7 +8318,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_writer_rejects_wrong_schema_before_first_byte() {
+    fn v10_writer_rejects_wrong_schema_before_first_byte() {
         let data = sample_data(sample_player());
         for schema in [0u16, CONFIG_SCHEMA_VERSION + 1] {
             let mut out = Vec::new();
@@ -8356,7 +8337,7 @@ mod tests {
     }
 
     #[test]
-    fn v9_roundtrip_preserves_config_meta() {
+    fn v10_roundtrip_preserves_config_meta() {
         let data = sample_data(sample_player());
         let meta = SaveConfigMeta {
             schema: CONFIG_SCHEMA_VERSION,
@@ -8365,19 +8346,19 @@ mod tests {
 
         let mut bytes = Vec::new();
         save_world_to_bytes_with_config(&mut bytes, &data, ContentRegistry::builtin(), meta)
-            .expect("v9 save with explicit config meta must succeed");
+            .expect("v10 save with explicit config meta must succeed");
         let loaded = load_world_from_bytes_with(&bytes, ContentRegistry::builtin())
-            .expect("v9 save must load");
+            .expect("v10 save must load");
 
         assert_eq!(loaded.saved_config, Some(meta));
         assert_eq!(loaded.data, data);
     }
 
     #[test]
-    fn v9_witness_matches_the_production_writer_byte_for_byte() {
-        // A rich payload touches every traversal branch the witness writer
-        // shares with the live writer: chunk edits, the 36 slots, the cursor,
-        // both grids, chests, mobs, the pack tail and the config tail.
+    fn v10_production_writer_supersedes_the_frozen_v9_witness() {
+        // A rich payload touches every traversal branch the frozen v9 witness
+        // and the live v10 writer share: chunk edits, the 36 slots, the
+        // cursor, both grids, chests, mobs, the pack tail and the config tail.
         let registry = ruby_tool_registry();
         let mut data = migration_data(MOB_VERSION);
         data.time_of_day = 4_321;
@@ -8399,10 +8380,23 @@ mod tests {
         let mut witness = Vec::new();
         write_v9_world(&mut witness, &data, &registry, config)
             .expect("v9 witness encodes the rich payload");
-        assert_eq!(
+
+        assert_eq!(&production[4..8], &SAVE_VERSION.to_le_bytes());
+        assert_eq!(&production[8..12], &0u32.to_le_bytes());
+        assert_eq!(&witness[4..8], &CONFIG_TAIL_VERSION.to_le_bytes());
+        assert_ne!(
             witness, production,
-            "the frozen v9 witness must stay byte-identical to the production writer"
+            "v10 is a sectioned archive, not a flat v9 payload"
         );
+
+        let production_loaded =
+            load_world_from_bytes_with(&production, &registry).expect("v10 production loads");
+        let witness_loaded =
+            load_world_from_bytes_with(&witness, &registry).expect("frozen v9 witness loads");
+        assert_eq!(production_loaded.data, data);
+        assert_eq!(witness_loaded.data, data);
+        assert_eq!(production_loaded.saved_config, Some(config));
+        assert_eq!(witness_loaded.saved_config, Some(config));
     }
 
     #[test]
@@ -8558,39 +8552,39 @@ mod tests {
     /// Loads the fixture for one legacy version, then proves the public v8
     /// path is deterministic: v -> load -> v8 -> load -> v8 is byte-stable and
     /// never changes the decoded domain values.
-    fn assert_migrates_to_v8(fixture: &[u8], version: u32) {
+    fn assert_migrates_to_current(fixture: &[u8], version: u32) {
         let loaded =
             load_world_from_bytes(fixture).expect("legacy fixture must load before migration");
 
         let mut v8 = Vec::new();
         save_world_to_bytes(&mut v8, &loaded)
-            .unwrap_or_else(|error| panic!("v{version} -> v8 save failed: {error:?}"));
+            .unwrap_or_else(|error| panic!("v{version} -> v{SAVE_VERSION} save failed: {error:?}"));
         assert_eq!(
             &v8[4..8],
             &SAVE_VERSION.to_le_bytes(),
-            "v{version} must re-save as v8"
+            "v{version} must re-save as the current version"
         );
 
         let reloaded = load_world_from_bytes(&v8)
-            .unwrap_or_else(|error| panic!("v{version} v8 reload failed: {error:?}"));
+            .unwrap_or_else(|error| panic!("v{version} v{SAVE_VERSION} reload failed: {error:?}"));
         assert_eq!(
             reloaded, loaded,
-            "v{version} -> v8 -> v8 must preserve every domain value"
+            "v{version} -> current -> current must preserve every domain value"
         );
 
         let mut again = Vec::new();
-        save_world_to_bytes(&mut again, &reloaded).expect("v8 re-save must succeed");
+        save_world_to_bytes(&mut again, &reloaded).expect("current re-save must succeed");
         assert_eq!(again, v8, "v{version} migration must be byte-stable");
     }
 
     #[test]
-    fn v1_to_v7_fixtures_migrate_to_v8_and_resave_byte_stably() {
-        assert_migrates_to_v8(&hand_built_v1_bytes(), 1);
-        assert_migrates_to_v8(&valid_v2_bytes(), 2);
-        assert_migrates_to_v8(&hand_built_v3_bytes(&hotbar_sample()), 3);
+    fn v1_to_v7_fixtures_migrate_and_resave_byte_stably() {
+        assert_migrates_to_current(&hand_built_v1_bytes(), 1);
+        assert_migrates_to_current(&valid_v2_bytes(), 2);
+        assert_migrates_to_current(&hand_built_v3_bytes(&hotbar_sample()), 3);
         for version in 4..=7 {
             let fixture = legacy_world_bytes(&migration_data(version), version);
-            assert_migrates_to_v8(&fixture, version);
+            assert_migrates_to_current(&fixture, version);
         }
     }
 
@@ -8900,7 +8894,7 @@ mod tests {
             .iter()
             .map(|(id, body)| (SectionId(*id), body.as_slice()))
             .collect();
-        encode_archive(V10_SAVE_VERSION, 0, &borrowed).expect("v10 archive encodes")
+        encode_archive(SAVE_VERSION, 0, &borrowed).expect("v10 archive encodes")
     }
 
     fn decode_v10_bytes(
@@ -8948,11 +8942,11 @@ mod tests {
         let bytes = v10_archive(&data, &registry);
 
         assert_eq!(&bytes[..4], &SAVE_MAGIC[..]);
-        assert_eq!(&bytes[4..8], &V10_SAVE_VERSION.to_le_bytes());
+        assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
         assert_eq!(&bytes[8..12], &0u32.to_le_bytes());
 
         let image = SaveImage::parse(bytes.clone()).expect("archive parses");
-        assert_eq!(image.version(), V10_SAVE_VERSION);
+        assert_eq!(image.version(), SAVE_VERSION);
         assert_eq!(
             image.section_count(),
             9 + data.chunk_edits.len(),
@@ -9041,7 +9035,7 @@ mod tests {
         assert_eq!(bytes.len(), 353);
         let image = SaveImage::parse(bytes.clone()).expect("archive parses");
         assert_eq!(image.section_count(), 9);
-        assert_eq!(image.version(), V10_SAVE_VERSION);
+        assert_eq!(image.version(), SAVE_VERSION);
         assert_eq!(image.flags(), 0);
 
         let loaded = decode_v10_bytes(bytes, &registry).expect("loads");
@@ -9551,8 +9545,7 @@ mod tests {
             .iter()
             .map(|(id, body)| (SectionId(*id), body.as_slice()))
             .collect();
-        let bytes =
-            encode_archive(V10_SAVE_VERSION + 1, 0, &borrowed).expect("encode future version");
+        let bytes = encode_archive(SAVE_VERSION + 1, 0, &borrowed).expect("encode future version");
         assert!(matches!(
             decode_v10_bytes(bytes, &registry),
             Err(PersistenceError::UnsupportedVersion(11))

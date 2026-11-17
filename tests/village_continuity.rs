@@ -2,7 +2,7 @@
 //!
 //! Villages are generated content and are never persisted: a save carries only
 //! `chunk_edits`. These tests drive the real production funnel — the session's
-//! `to_save_data` projection, the v9 codec, and a reloaded `WorldSession` — and
+//! `to_save_data` projection, the v10 codec, and a reloaded `WorldSession` — and
 //! prove that a mined village block wins over regeneration while every
 //! unedited village cell regenerates identically, including for a world saved
 //! before M015 existed.
@@ -357,11 +357,11 @@ fn pre_m015_world_gains_villages_and_keeps_its_edit() {
 }
 
 #[test]
-fn save_is_v9_and_carries_no_prefab_name() {
+fn save_is_v10_and_carries_no_prefab_name() {
     let _heavy = lock_streaming_pool();
     let catalog = load_catalog();
     let dir = tempfile::tempdir().expect("tempdir");
-    let save_path = dir.path().join("v9.mcvx");
+    let save_path = dir.path().join("v10.mcvx");
     let (mut session, _) = streamed_village_session(&catalog, &save_path);
 
     // One real edit so the save carries a non-trivial edit table.
@@ -380,13 +380,13 @@ fn save_is_v9_and_carries_no_prefab_name() {
         .set_block_immediate(mined[0], mined[1], mined[2], BlockId::Air);
 
     let data = session.to_save_data();
-    assert_eq!(SAVE_VERSION, 9, "the save format must stay v9");
-    save_world_to_path(&save_path, &data).expect("write the v9 save");
+    assert_eq!(SAVE_VERSION, 10, "the save format must stay v10");
+    save_world_to_path(&save_path, &data).expect("write the v10 save");
     let bytes = std::fs::read(&save_path).expect("read the written save bytes");
     assert_eq!(
         &bytes[4..8],
         &SAVE_VERSION.to_le_bytes(),
-        "the file header must name version 9"
+        "the file header must name version 10"
     );
 
     // The file decodes through the same production codec.

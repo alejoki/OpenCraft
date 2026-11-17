@@ -3,7 +3,7 @@
 //! The frame thread projects the session into a [`WorldSaveData`] snapshot,
 //! hands that snapshot plus the registry, path, and config metadata to this
 //! worker, and returns immediately. Encoding and the atomic disk write happen
-//! on the worker thread through the unchanged single v9 writer
+//! on the worker thread through the unchanged single v10 writer
 //! ([`save_world_to_path_with_config`], D268), so the frame thread pays only
 //! the snapshot cost.
 //!
@@ -206,7 +206,7 @@ mod tests {
         let mut expected = Vec::new();
         save_world_to_bytes_with_config(&mut expected, &data, registry.as_ref(), config)
             .expect("expected bytes encode");
-        assert_eq!(written, expected, "worker writes the unchanged v9 bytes");
+        assert_eq!(written, expected, "worker writes the unchanged v10 bytes");
     }
 
     #[test]

@@ -4,8 +4,8 @@
 //! integration test) so S02's frozen `#[cfg(test)]` v9 witness encoder can be
 //! used in the same run. It reuses the deterministic fixture shape from
 //! `tests/autosave_budget.rs`: 500 `BlockId::Stone` edits in each of 20,000
-//! chunks, written by the live v9 writer and then cold-loaded five times after
-//! one warm-up.
+//! chunks, written by the frozen v9 witness writer and then cold-loaded five
+//! times after one warm-up.
 //!
 //! Measured phases:
 //! - `storage_load_ms`: open + header/content table/index/section decode;
@@ -109,8 +109,9 @@ fn edit_totals(edits: &ChunkEditMap) -> (usize, usize) {
 /// The edit map is moved into the save payload and dropped explicitly after
 /// the write so the five measured loads do not coexist with the generator's
 /// copy. The header is read back from disk to prove the frozen witness writer
-/// emitted v9 (`SAVE_VERSION == 9` in S01), and the measured length plus edit
-/// checksum pin the fixture byte-for-byte to the S01 baseline (D316).
+/// emitted the pre-v10 v9 baseline even though the live writer is now v10, and
+/// the measured length plus edit checksum pin the fixture byte-for-byte to the
+/// S01 baseline (D316).
 fn write_fixture(path: &Path) -> u64 {
     let mut data =
         WorldSession::new_session(WORLD_SEED, path.to_path_buf(), DEFAULT_SEASON_LENGTH_DAYS)
@@ -139,8 +140,8 @@ fn write_fixture(path: &Path) -> u64 {
     let version = u32::from_le_bytes(header[4..8].try_into().expect("4-byte version word"));
     assert_eq!(version, 9, "S01 fixture is a v9 save");
     assert_eq!(
-        SAVE_VERSION, 9,
-        "S01 freezes the v9 baseline; the version bump belongs to S02"
+        SAVE_VERSION, 10,
+        "the live writer is v10; the S01 frozen fixture stays v9"
     );
 
     let file_bytes = std::fs::metadata(path)

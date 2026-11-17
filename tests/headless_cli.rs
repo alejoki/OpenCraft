@@ -140,12 +140,13 @@ fn png_bomb_bytes(width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-/// Assert the written save starts with the MCVX magic and version 9.
-fn assert_mcvx_v9(path: &Path) {
+/// Assert the written save is a v10 archive: MCVX magic, version 10, zero
+/// flags, and at least the nine fixed sections every v10 save carries.
+fn assert_mcvx_v10(path: &Path) {
     let bytes =
         std::fs::read(path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
     assert!(
-        bytes.len() >= 8,
+        bytes.len() >= 16,
         "{} is too short: {bytes:?}",
         path.display()
     );
@@ -157,8 +158,24 @@ fn assert_mcvx_v9(path: &Path) {
     );
     assert_eq!(
         &bytes[4..8],
-        &9u32.to_le_bytes(),
-        "{} is not version 9",
+        &10u32.to_le_bytes(),
+        "{} is not version 10",
+        path.display()
+    );
+    assert_eq!(
+        &bytes[8..12],
+        &0u32.to_le_bytes(),
+        "{} carries nonzero archive flags",
+        path.display()
+    );
+    let section_count = u32::from_le_bytes(
+        bytes[12..16]
+            .try_into()
+            .expect("the 16-byte header carries a section count"),
+    );
+    assert!(
+        section_count >= 9,
+        "{} has only {section_count} sections; every v10 save carries at least nine fixed sections",
         path.display()
     );
 }
@@ -232,7 +249,7 @@ fn demo_presentation_digest_runs_headlessly() {
         "{}",
         report(&output)
     );
-    assert_mcvx_v9(&temp.path().join("presentation.mcvx"));
+    assert_mcvx_v10(&temp.path().join("presentation.mcvx"));
 }
 
 #[test]
@@ -248,7 +265,7 @@ fn demo_crafting_digest_runs_headlessly() {
         "{}",
         report(&output)
     );
-    assert_mcvx_v9(&temp.path().join("crafting.mcvx"));
+    assert_mcvx_v10(&temp.path().join("crafting.mcvx"));
 }
 
 #[test]

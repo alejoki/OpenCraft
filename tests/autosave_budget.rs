@@ -97,7 +97,7 @@ fn edit_totals(edits: &ChunkEditMap) -> (usize, usize) {
 /// Build a session carrying `edit_target` edits without generating chunks.
 ///
 /// `session_from_save` installs the edit map directly, and is also the load
-/// path under test. The expected v9 bytes are encoded from the session's own
+/// path under test. The expected v10 bytes are encoded from the session's own
 /// `to_save_data()` because constructing from save normalizes fields (fly
 /// mode, selection) that would otherwise differ from the pre-session struct.
 fn big_session(edit_target: usize, dir: &Path) -> (WorldSession, Vec<u8>) {
@@ -115,7 +115,7 @@ fn big_session(edit_target: usize, dir: &Path) -> (WorldSession, Vec<u8>) {
         session.registry.as_ref(),
         session.save_config(),
     )
-    .expect("expected v9 bytes encode");
+    .expect("expected v10 bytes encode");
     (session, expected)
 }
 

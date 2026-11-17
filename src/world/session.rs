@@ -1784,7 +1784,7 @@ impl WorldSession {
         }
     }
 
-    /// The single synchronous v9 writer: projection + atomic write, clearing
+    /// The single synchronous v10 writer: projection + atomic write, clearing
     /// the unsaved flag only after the write succeeds.
     ///
     /// An in-flight autosave is joined and any coalesced request dropped
@@ -6682,7 +6682,7 @@ mod tests {
     }
 
     #[test]
-    fn session_save_writes_the_unchanged_v9_bytes() {
+    fn session_save_writes_the_unchanged_v10_bytes() {
         use crate::world::persistence::save_world_to_bytes_with_config;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6709,9 +6709,9 @@ mod tests {
 
         assert_eq!(
             bytes, expected,
-            "session save writes the v9 bytes unchanged"
+            "session save writes the v10 bytes unchanged"
         );
-        assert_eq!(&bytes[4..8], &9u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &10u32.to_le_bytes());
     }
 
     #[test]
@@ -6751,7 +6751,7 @@ mod tests {
             async_bytes, sync_bytes,
             "R064: the worker writes exactly the session save's bytes"
         );
-        assert_eq!(&async_bytes[4..8], &9u32.to_le_bytes());
+        assert_eq!(&async_bytes[4..8], &10u32.to_le_bytes());
     }
 
     #[test]
@@ -7013,7 +7013,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_mob_save_keeps_the_179_byte_edit_free_length() {
+    fn empty_mob_save_keeps_the_353_byte_edit_free_length() {
+        use opencraft_storage::archive::{SaveImage, SectionId};
+
         use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
 
         let data = make_save(9183u32);
@@ -7021,14 +7023,16 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("empty mob save encodes");
 
-        // Measured v9 shape: the empty content table adds four bytes before
-        // the hotbar, so the mob count moves from 149 to 153, and the v8 pack
-        // + digest tail plus the 10-byte config tail complete the payload.
-        assert_eq!(bytes.len(), 179);
+        // Measured v10 shape: a 16-byte header plus nine 21-byte directory
+        // entries and the fixed section bodies. Section 5 is the mob count.
+        assert_eq!(bytes.len(), 353);
+        let image = SaveImage::parse(bytes.clone()).expect("v10 archive parses");
+        assert_eq!(image.version(), 10);
+        assert_eq!(image.section_count(), 9);
         assert_eq!(
-            &bytes[153..157],
-            &0u32.to_le_bytes(),
-            "the v9 mob count sits at offset 153"
+            image.section(SectionId(5)),
+            Some(&0u32.to_le_bytes()[..]),
+            "the v10 mobs section holds only a zero count"
         );
         let loaded = load_world_from_bytes(&bytes).expect("empty mob save decodes");
         assert!(loaded.mobs.is_empty());
@@ -8193,12 +8197,12 @@ mod tests {
             "respawn forgets the projectile cause too"
         );
 
-        // Arrows have no wire representation: the v9 save stays the same
-        // 179-byte edit-free layout and a reload starts in flight-free air.
+        // Arrows have no wire representation: the v10 save stays the same
+        // 353-byte edit-free layout and a reload starts in flight-free air.
         let data = make_save(62);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save encodes");
-        assert_eq!(bytes.len(), 179, "arrows add no save bytes");
+        assert_eq!(bytes.len(), 353, "arrows add no save bytes");
         let restored = WorldSession::session_from_save(
             load_world_from_bytes(&bytes).expect("save decodes"),
             PathBuf::from("/tmp/arrow-reload.mcvx"),
