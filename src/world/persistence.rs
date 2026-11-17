@@ -656,7 +656,7 @@ fn legacy_hotbar_projection(inventory: &Inventory) -> Hotbar {
     Hotbar::from_slots(slots)
 }
 
-pub type ChunkEditMap = FxHashMap<ChunkPos, FxHashMap<u16, BlockId>>;
+pub use crate::world::edit_store::{ChunkEditMap, EditSection};
 
 /// Persisted world chests keyed by their absolute block position. Every chest
 /// owns exactly [`CHEST_SLOTS`] validated item slots, including an all-empty
@@ -1138,7 +1138,7 @@ fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), Per
     // before the variable-length chunk section (absolute offset 63).
     out.extend_from_slice(&data.time_of_day.clamp(0, DAY_TICKS).to_le_bytes());
 
-    let mut non_empty_chunks: Vec<(&ChunkPos, &FxHashMap<u16, BlockId>)> = data
+    let mut non_empty_chunks: Vec<(&ChunkPos, &EditSection)> = data
         .chunk_edits
         .iter()
         .filter(|(_, edits)| !edits.is_empty())
@@ -1923,7 +1923,7 @@ fn write_world_with_version(
 
     out.extend_from_slice(&data.time_of_day.clamp(0, DAY_TICKS).to_le_bytes());
 
-    let mut non_empty_chunks: Vec<(&ChunkPos, &FxHashMap<u16, BlockId>)> = data
+    let mut non_empty_chunks: Vec<(&ChunkPos, &EditSection)> = data
         .chunk_edits
         .iter()
         .filter(|(_, edits)| !edits.is_empty())
@@ -2195,7 +2195,7 @@ fn decode_legacy(bytes: &[u8]) -> Result<WorldSaveData, PersistenceError> {
         return Err(PersistenceError::InvalidPlayerState);
     }
 
-    let mut chunk_edits: ChunkEditMap = FxHashMap::default();
+    let mut chunk_edits: ChunkEditMap = ChunkEditMap::default();
     for _ in 0..chunk_count {
         let cx = read_i32(&mut cur)?;
         let cy = read_i32(&mut cur)?;
@@ -2745,7 +2745,7 @@ fn decode_v8(bytes: &[u8], base: &ContentRegistry) -> Result<LoadedWorld, Persis
         return Err(PersistenceError::InvalidPlayerState);
     }
 
-    let mut chunk_edits: ChunkEditMap = FxHashMap::default();
+    let mut chunk_edits: ChunkEditMap = ChunkEditMap::default();
     for _ in 0..chunk_count {
         let cx = read_i32(&mut cur)?;
         let cy = read_i32(&mut cur)?;
@@ -3072,7 +3072,7 @@ fn build_v10_sections(
     let (mob_count, sorted_mobs) = checked_sorted_mobs(data)?;
     let packs = checked_packs(registry)?;
 
-    let mut non_empty_chunks: Vec<(&ChunkPos, &FxHashMap<u16, BlockId>)> = data
+    let mut non_empty_chunks: Vec<(&ChunkPos, &EditSection)> = data
         .chunk_edits
         .iter()
         .filter(|(_, edits)| !edits.is_empty())
@@ -3946,7 +3946,7 @@ fn decode_v10(image: SaveImage, base: &ContentRegistry) -> Result<LoadedWorld, P
         }
     }
 
-    let mut chunk_edits: ChunkEditMap = FxHashMap::default();
+    let mut chunk_edits: ChunkEditMap = ChunkEditMap::default();
     for (ordinal, (pos, edit_count)) in records.into_iter().enumerate() {
         let id = V10_CHUNK_SECTION_BASE + ordinal as u32;
         let section_body = image
@@ -8892,8 +8892,7 @@ mod tests {
     /// edits over `chunk_count` chunks, mirroring the release-only budget
     /// harness in `tests/autosave_budget.rs`.
     fn big_edit_map(chunk_count: usize, per_chunk: usize) -> ChunkEditMap {
-        let mut edits: ChunkEditMap =
-            ChunkEditMap::with_capacity_and_hasher(chunk_count, Default::default());
+        let mut edits: ChunkEditMap = ChunkEditMap::with_capacity(chunk_count);
         for i in 0..chunk_count {
             let mut chunk =
                 rustc_hash::FxHashMap::with_capacity_and_hasher(per_chunk, Default::default());
@@ -8904,10 +8903,7 @@ mod tests {
         }
         assert_eq!(edits.len(), chunk_count);
         assert_eq!(
-            edits
-                .values()
-                .map(rustc_hash::FxHashMap::len)
-                .sum::<usize>(),
+            edits.values().map(EditSection::len).sum::<usize>(),
             chunk_count * per_chunk
         );
         edits
@@ -8944,7 +8940,7 @@ mod tests {
             loaded
                 .chunk_edits
                 .values()
-                .map(rustc_hash::FxHashMap::len)
+                .map(EditSection::len)
                 .sum::<usize>(),
             1_000_000
         );
@@ -9236,11 +9232,11 @@ mod tests {
         assert!(out.is_empty(), "rejection must emit no byte");
 
         let mut unnameable = v10_rich_data();
-        unnameable
-            .chunk_edits
-            .entry(ChunkPos::new(9, 9, 9))
-            .or_default()
-            .insert(0, BlockId::Modded(BUILTIN_BLOCK_COUNT));
+        unnameable.chunk_edits.insert_block(
+            ChunkPos::new(9, 9, 9),
+            0,
+            BlockId::Modded(BUILTIN_BLOCK_COUNT),
+        );
         let mut out = Vec::new();
         assert!(matches!(
             write_v10_world(

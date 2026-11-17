@@ -5362,7 +5362,6 @@ mod tests {
 
         let mut edits = ChunkEditMap::default();
         let chunk = ChunkPos::new(0, 0, 0);
-        let inner = edits.entry(chunk).or_default();
         for (index, block) in [
             (linear_index(1, 2, 3), BlockId::WheatStage0),
             (linear_index(2, 2, 3), BlockId::WheatStage1),
@@ -5370,7 +5369,7 @@ mod tests {
             (linear_index(4, 2, 3), BlockId::WheatStage3),
             (linear_index(5, 2, 3), BlockId::Farmland),
         ] {
-            inner.insert(index as u16, block);
+            edits.insert_block(chunk, index as u16, block);
         }
         let mut data = make_save(1);
         data.chunk_edits = edits;

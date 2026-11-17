@@ -256,10 +256,7 @@ mod tests {
         (x, y, z): (usize, usize, usize),
         block: BlockId,
     ) {
-        edits
-            .entry(chunk)
-            .or_default()
-            .insert(linear_index(x, y, z) as u16, block);
+        edits.insert_block(chunk, linear_index(x, y, z) as u16, block);
     }
 
     fn runtime_at(positions: &[IVec3]) -> CropRuntime {

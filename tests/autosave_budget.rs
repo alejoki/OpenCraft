@@ -62,8 +62,7 @@ const REAP_DEADLINE: Duration = Duration::from_secs(30);
 /// are pre-sized so construction stays linear.
 fn big_edits(edit_target: usize) -> (ChunkEditMap, usize) {
     let chunk_count = edit_target.div_ceil(EDITS_PER_CHUNK);
-    let mut edits: ChunkEditMap =
-        ChunkEditMap::with_capacity_and_hasher(chunk_count, Default::default());
+    let mut edits: ChunkEditMap = ChunkEditMap::with_capacity(chunk_count);
     let mut remaining = edit_target;
     for i in 0..chunk_count {
         let in_chunk = remaining.min(EDITS_PER_CHUNK);

@@ -107,8 +107,7 @@ const PINNED_V9_10M: FixturePin = FixturePin {
 /// indices are the first `n` values in each chunk; every value is Stone.
 fn big_edits(edit_target: usize) -> (ChunkEditMap, usize) {
     let chunk_count = edit_target.div_ceil(EDITS_PER_CHUNK);
-    let mut edits: ChunkEditMap =
-        ChunkEditMap::with_capacity_and_hasher(chunk_count, Default::default());
+    let mut edits: ChunkEditMap = ChunkEditMap::with_capacity(chunk_count);
     let mut remaining = edit_target;
     for i in 0..chunk_count {
         let in_chunk = remaining.min(EDITS_PER_CHUNK);

@@ -1154,9 +1154,7 @@ impl WorldManager {
         self.light_epoch = self.light_epoch.wrapping_add(1);
 
         self.chunk_edits
-            .entry(cpos)
-            .or_default()
-            .insert(linear_index(lx, ly, lz) as u16, block);
+            .insert_block(cpos, linear_index(lx, ly, lz) as u16, block);
         self.unsaved_changes = true;
 
         // A block edit changes sky light. Recompute the edit's chunk-column
@@ -1846,10 +1844,11 @@ mod tests {
         let origin = ChunkPos::new(0, 0, 0);
         let (lx, ly, lz) = (5usize, 10usize, 5usize);
         let mut edits = ChunkEditMap::default();
-        edits
-            .entry(origin)
-            .or_default()
-            .insert(linear_index(lx, ly, lz) as u16, BlockId::WheatStage1);
+        edits.insert_block(
+            origin,
+            linear_index(lx, ly, lz) as u16,
+            BlockId::WheatStage1,
+        );
         let (wx, wy, wz) = (lx as i32, ly as i32, lz as i32);
 
         let mut mgr = WorldManager::with_seed_and_edits(4, seed, edits.clone());
