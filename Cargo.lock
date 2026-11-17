@@ -1686,6 +1686,7 @@ dependencies = [
  "opencraft-pathfinding",
  "opencraft-physics",
  "opencraft-storage",
+ "opencraft-worldgen",
  "png",
  "rayon",
  "rodio",
@@ -1753,6 +1754,13 @@ dependencies = [
 [[package]]
 name = "opencraft-worldgen"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-content",
+ "opencraft-core",
+ "tempfile",
+ "toml",
+]
 
 [[package]]
 name = "orbclient"
