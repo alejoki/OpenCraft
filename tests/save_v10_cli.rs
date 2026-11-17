@@ -52,9 +52,11 @@ fn copy_config(dest: &Path) -> PathBuf {
     config
 }
 
-/// Copy the frozen v8 fixture into `dest` under `name`.
-fn copy_fixture(dest: &Path, name: &str) -> Vec<u8> {
-    let from = Path::new(MANIFEST_DIR).join("tests/fixtures/saves/v8-baseline.mcvx");
+/// Copy a frozen save fixture into `dest` under `name`.
+fn copy_fixture(dest: &Path, fixture: &str, name: &str) -> Vec<u8> {
+    let from = Path::new(MANIFEST_DIR)
+        .join("tests/fixtures/saves")
+        .join(fixture);
     let bytes = std::fs::read(&from)
         .unwrap_or_else(|error| panic!("read fixture {}: {error}", from.display()));
     std::fs::write(dest.join(name), &bytes)
@@ -203,7 +205,7 @@ fn sorted_entries(dir: &Path) -> Vec<String> {
 fn v8_fixture_migrates_to_v10_and_reloads_silently() {
     let temp = tempfile::tempdir().expect("temp dir");
     copy_config(temp.path());
-    let original = copy_fixture(temp.path(), "v8.mcvx");
+    let original = copy_fixture(temp.path(), "v8-baseline.mcvx", "v8.mcvx");
 
     let output = run_demo(temp.path(), "v8.mcvx");
     assert!(output.status.success(), "{}", report(&output));
@@ -271,10 +273,82 @@ fn v8_fixture_migrates_to_v10_and_reloads_silently() {
 }
 
 #[test]
+fn v9_fixture_migrates_to_v10_and_reloads_silently() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    copy_config(temp.path());
+    let original = copy_fixture(temp.path(), "v9-baseline.mcvx", "v9.mcvx");
+    assert_eq!(&original[4..8], &9u32.to_le_bytes(), "the input is v9");
+
+    let output = run_demo(temp.path(), "v9.mcvx");
+    assert!(output.status.success(), "{}", report(&output));
+
+    let lines = stdout_lines(&output);
+    // The fixture was written with the in-code defaults digest, while the CLI
+    // loads the checked-in `config/` tree: the mismatch is exactly the
+    // non-blocking config notice a real user would see after editing config.
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some(
+            "save_v10: leg=load version=9 packs=0 saved_config=some \
+             notice=config changed since this world was saved playable=true"
+        ),
+        "{}",
+        report(&output)
+    );
+    let resave = lines.get(1).expect("resave line").as_str();
+    let parsed = parse_resave(resave);
+    assert_eq!(parsed.digest, DEFAULTS_DIGEST, "{resave}");
+    assert_eq!(
+        lines.get(2).map(String::as_str),
+        Some("save_v10: leg=match notice=none playable=true"),
+        "the v10 output must reload silently\n{}",
+        report(&output)
+    );
+    assert_eq!(
+        lines.get(3).map(String::as_str),
+        Some("save_v10: ok"),
+        "{}",
+        report(&output)
+    );
+    assert_eq!(lines.len(), 4, "{}", report(&output));
+
+    // The frozen v9 input is never overwritten.
+    let after_input = std::fs::read(temp.path().join("v9.mcvx")).expect("read input");
+    assert_eq!(
+        after_input, original,
+        "the input save must stay byte-identical"
+    );
+    assert_eq!(&after_input[4..8], &9u32.to_le_bytes());
+
+    let derived = std::fs::read(temp.path().join("v9.v10.mcvx")).expect("read derived v10");
+    let section_count = assert_v10_header(&derived);
+    assert_eq!(
+        parsed.sections, section_count as usize,
+        "the resave line reports the archive section count"
+    );
+    assert_eq!(
+        parsed.bytes,
+        derived.len(),
+        "the resave line reports the file length"
+    );
+    assert_eq!(
+        config_section(&derived),
+        (DEFAULTS_SCHEMA, DEFAULTS_DIGEST),
+        "the derived archive carries the defaults config section"
+    );
+
+    assert_eq!(
+        sorted_entries(temp.path()),
+        vec!["config", "v9.mcvx", "v9.v10.mcvx"],
+        "the proof must create no startup state"
+    );
+}
+
+#[test]
 fn v10_to_v10_resave_is_byte_stable() {
     let temp = tempfile::tempdir().expect("temp dir");
     copy_config(temp.path());
-    copy_fixture(temp.path(), "v8.mcvx");
+    copy_fixture(temp.path(), "v8-baseline.mcvx", "v8.mcvx");
 
     let first = run_demo(temp.path(), "v8.mcvx");
     assert!(first.status.success(), "{}", report(&first));
@@ -317,7 +391,7 @@ fn v10_to_v10_resave_is_byte_stable() {
 fn changed_config_moves_only_the_config_section_digest() {
     let temp = tempfile::tempdir().expect("temp dir");
     let config = copy_config(temp.path());
-    copy_fixture(temp.path(), "v8.mcvx");
+    copy_fixture(temp.path(), "v8-baseline.mcvx", "v8.mcvx");
 
     // First leg: v8 -> v10 under the default config.
     let first = run_demo(temp.path(), "v8.mcvx");
@@ -410,7 +484,7 @@ fn missing_input_fails_closed() {
 fn corrupted_archives_fail_closed_before_writing_output() {
     let temp = tempfile::tempdir().expect("temp dir");
     copy_config(temp.path());
-    copy_fixture(temp.path(), "v8.mcvx");
+    copy_fixture(temp.path(), "v8-baseline.mcvx", "v8.mcvx");
 
     // Produce a real v10 archive first, then corrupt copies of it.
     let output = run_demo(temp.path(), "v8.mcvx");

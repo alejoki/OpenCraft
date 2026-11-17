@@ -4977,8 +4977,9 @@ mod tests {
 
     /// Builds a byte-valid v4-v7 fixture with the frozen legacy encoder.
     ///
-    /// The live writer emits v8, whose wider item vocabulary and header
-    /// content table make "truncate the current payload" invalid. This helper
+    /// The live writer emits v10, whose archive layout makes "truncate the
+    /// current payload" invalid (and the frozen v8 witness has a wider item
+    /// vocabulary and header content table). This helper
     /// always encodes the full v7 layout first, then drops the newer tails and
     /// patches the version word.
     fn legacy_world_bytes(data: &WorldSaveData, version: u32) -> Vec<u8> {
@@ -6033,7 +6034,7 @@ mod tests {
 
         // The record-layout pins belong to the frozen v7 vocabulary; read a
         // legacy fixture for them, then prove the same domain values through
-        // the public v8 writer.
+        // the current writer.
         let legacy = legacy_world_bytes(&data, ITEM_VOCAB_VERSION);
         assert_eq!(&legacy[4..8], &ITEM_VOCAB_VERSION.to_le_bytes());
 
@@ -6067,16 +6068,16 @@ mod tests {
         assert_eq!(&legacy[bow + 3..bow + 5], &3u16.to_le_bytes());
 
         let mut bytes = Vec::new();
-        save_world_to_bytes(&mut bytes, &data).expect("v8 item vocabulary must save");
+        save_world_to_bytes(&mut bytes, &data).expect("the current writer must save");
         assert_eq!(&bytes[4..8], &SAVE_VERSION.to_le_bytes());
-        let loaded = load_world_from_bytes(&bytes).expect("v8 item vocabulary must load");
+        let loaded = load_world_from_bytes(&bytes).expect("the current writer must load");
         assert_eq!(loaded, data);
 
         let mut again = Vec::new();
         save_world_to_bytes(&mut again, &loaded).expect("re-save must succeed");
         assert_eq!(
             again, bytes,
-            "a loaded v8 item save re-saves byte-identically"
+            "a loaded current-version save re-saves byte-identically"
         );
     }
 
@@ -8453,7 +8454,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // v1-v7 migration into the public v8 format
+    // v1-v7 migration into the current v10 writer
     // ------------------------------------------------------------------
 
     /// Representative migrated world for the legacy encoder: chunk edit,
@@ -8513,8 +8514,40 @@ mod tests {
         std::fs::write(path, &bytes).expect("write frozen v8 fixture");
     }
 
+    /// Writes `tests/fixtures/saves/v9-baseline.mcvx` once with the frozen v9
+    /// witness writer: the v8 fixture payload plus the defaults config tail.
+    /// The no-op-if-present guard is deliberate: the checked-in artifact must
+    /// never be overwritten.
     #[test]
-    fn frozen_v8_fixture_loads_without_config_metadata_and_resaves_as_v9() {
+    #[ignore]
+    fn write_frozen_v9_fixture() {
+        let path = Path::new("tests/fixtures/saves/v9-baseline.mcvx");
+        if path.exists() {
+            return;
+        }
+        assert_eq!(SAVE_VERSION, 10, "the live writer is already v10");
+        assert_eq!(
+            CONFIG_TAIL_VERSION, 9,
+            "the frozen fixture must carry the v9 config tail"
+        );
+
+        let mut bytes = Vec::new();
+        write_v9_world(
+            &mut bytes,
+            &v8_fixture_data(),
+            ContentRegistry::builtin(),
+            ConfigRuntime::defaults().meta(),
+        )
+        .expect("v9 baseline encodes");
+        assert_eq!(&bytes[4..8], &CONFIG_TAIL_VERSION.to_le_bytes());
+
+        let parent = path.parent().expect("fixture path has a parent");
+        std::fs::create_dir_all(parent).expect("create fixture directory");
+        std::fs::write(path, &bytes).expect("write frozen v9 fixture");
+    }
+
+    #[test]
+    fn frozen_v8_fixture_loads_without_config_metadata_and_migrates_to_v10() {
         let bytes: &[u8] = include_bytes!("../../tests/fixtures/saves/v8-baseline.mcvx");
         assert_eq!(
             &bytes[4..8],
@@ -8523,7 +8556,7 @@ mod tests {
         );
 
         let loaded = load_world_from_bytes_with(bytes, ContentRegistry::builtin())
-            .expect("frozen v8 must load through the v9 path");
+            .expect("frozen v8 must load through the current reader");
         assert!(loaded.saved_content.is_some(), "v8 carries content meta");
         assert!(
             loaded.saved_config.is_none(),
@@ -8547,25 +8580,76 @@ mod tests {
             .expect("re-saved v9 must load");
         assert_eq!(reloaded.saved_config, Some(defaults));
         assert_eq!(reloaded.data, loaded.data);
+
+        // Production has flipped to v10: a frozen v8 file also migrates
+        // straight through the live writer without losing any domain value.
+        let mut v10 = Vec::new();
+        save_world_to_bytes(&mut v10, &loaded.data)
+            .expect("a frozen v8 world must re-save through the production writer");
+        assert_eq!(&v10[4..8], &SAVE_VERSION.to_le_bytes());
+        let v10_reloaded = load_world_from_bytes_with(&v10, ContentRegistry::builtin())
+            .expect("the migrated v10 payload must load");
+        assert_eq!(v10_reloaded.saved_config, Some(defaults));
+        assert_eq!(v10_reloaded.data, loaded.data);
     }
 
-    /// Loads the fixture for one legacy version, then proves the public v8
-    /// path is deterministic: v -> load -> v8 -> load -> v8 is byte-stable and
-    /// never changes the decoded domain values.
+    #[test]
+    fn frozen_v9_fixture_loads_with_metadata_and_migrates_to_v10() {
+        let bytes: &[u8] = include_bytes!("../../tests/fixtures/saves/v9-baseline.mcvx");
+        assert_eq!(
+            bytes.len(),
+            446,
+            "the frozen v9 artifact must never be rewritten"
+        );
+        assert_eq!(
+            &bytes[4..8],
+            &CONFIG_TAIL_VERSION.to_le_bytes(),
+            "the frozen artifact must stay a v9 payload"
+        );
+
+        let defaults = ConfigRuntime::defaults().meta();
+        let loaded = load_world_from_bytes_with(bytes, ContentRegistry::builtin())
+            .expect("frozen v9 must load through the current reader");
+        assert!(loaded.saved_content.is_some(), "v9 carries content meta");
+        assert_eq!(loaded.saved_config, Some(defaults));
+        assert_eq!(loaded.unresolved, 0);
+        assert_eq!(loaded.data, v8_fixture_data());
+
+        let mut resaved = Vec::new();
+        save_world_to_bytes_with_config(&mut resaved, &loaded.data, &loaded.registry, defaults)
+            .expect("a frozen v9 world must re-save as v10");
+        assert_eq!(&resaved[..4], &SAVE_MAGIC[..]);
+        assert_eq!(&resaved[4..8], &SAVE_VERSION.to_le_bytes());
+        assert_eq!(&resaved[8..12], &0u32.to_le_bytes());
+
+        let reloaded = load_world_from_bytes_with(&resaved, ContentRegistry::builtin())
+            .expect("re-saved v10 must load");
+        assert_eq!(reloaded.saved_config, Some(defaults));
+        assert_eq!(reloaded.data, loaded.data);
+
+        let mut again = Vec::new();
+        save_world_to_bytes_with_config(&mut again, &reloaded.data, &reloaded.registry, defaults)
+            .expect("a decoded v10 world must re-save");
+        assert_eq!(again, resaved, "v10 resave must be byte-stable");
+    }
+
+    /// Loads the fixture for one legacy version, then proves the current
+    /// writer is deterministic: v -> load -> current -> load -> current is
+    /// byte-stable and never changes the decoded domain values.
     fn assert_migrates_to_current(fixture: &[u8], version: u32) {
         let loaded =
             load_world_from_bytes(fixture).expect("legacy fixture must load before migration");
 
-        let mut v8 = Vec::new();
-        save_world_to_bytes(&mut v8, &loaded)
+        let mut current = Vec::new();
+        save_world_to_bytes(&mut current, &loaded)
             .unwrap_or_else(|error| panic!("v{version} -> v{SAVE_VERSION} save failed: {error:?}"));
         assert_eq!(
-            &v8[4..8],
+            &current[4..8],
             &SAVE_VERSION.to_le_bytes(),
             "v{version} must re-save as the current version"
         );
 
-        let reloaded = load_world_from_bytes(&v8)
+        let reloaded = load_world_from_bytes(&current)
             .unwrap_or_else(|error| panic!("v{version} v{SAVE_VERSION} reload failed: {error:?}"));
         assert_eq!(
             reloaded, loaded,
@@ -8574,7 +8658,7 @@ mod tests {
 
         let mut again = Vec::new();
         save_world_to_bytes(&mut again, &reloaded).expect("current re-save must succeed");
-        assert_eq!(again, v8, "v{version} migration must be byte-stable");
+        assert_eq!(again, current, "v{version} migration must be byte-stable");
     }
 
     #[test]
@@ -8897,12 +8981,14 @@ mod tests {
         encode_archive(SAVE_VERSION, 0, &borrowed).expect("v10 archive encodes")
     }
 
-    fn decode_v10_bytes(
+    /// Decodes through the production public load path (version dispatch,
+    /// archive parse and section decode) so every fail-closed case below is
+    /// proven at the same boundary a real save file crosses.
+    fn load_v10_bytes(
         bytes: Vec<u8>,
         registry: &ContentRegistry,
     ) -> Result<LoadedWorld, PersistenceError> {
-        let image = SaveImage::parse(bytes).map_err(PersistenceError::from)?;
-        decode_v10(image, registry)
+        load_world_from_owned(bytes, registry)
     }
 
     fn v10_section_mut(sections: &mut [(u32, Vec<u8>)], id: u32) -> &mut Vec<u8> {
@@ -8960,7 +9046,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
 
-        let loaded = decode_v10_bytes(bytes.clone(), &registry).expect("v10 loads");
+        let loaded = load_v10_bytes(bytes.clone(), &registry).expect("v10 loads");
         assert_eq!(loaded.data, data);
         assert_eq!(loaded.unresolved, 0);
         assert_eq!(loaded.saved_config, Some(ConfigRuntime::defaults().meta()));
@@ -9021,7 +9107,7 @@ mod tests {
             v10_archive(&reverse, &registry),
             "chunk insertion order cannot leak into the archive"
         );
-        let loaded = decode_v10_bytes(v10_archive(&forward, &registry), &registry).expect("loads");
+        let loaded = load_v10_bytes(v10_archive(&forward, &registry), &registry).expect("loads");
         assert_eq!(loaded.data, forward);
     }
 
@@ -9038,7 +9124,7 @@ mod tests {
         assert_eq!(image.version(), SAVE_VERSION);
         assert_eq!(image.flags(), 0);
 
-        let loaded = decode_v10_bytes(bytes, &registry).expect("loads");
+        let loaded = load_v10_bytes(bytes, &registry).expect("loads");
         assert_eq!(loaded.data, data);
         assert_eq!(loaded.unresolved, 0);
     }
@@ -9070,7 +9156,7 @@ mod tests {
         }
         assert_eq!(cur.position(), body.len() as u64);
 
-        let loaded = decode_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
+        let loaded = load_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
         assert_eq!(loaded.data, data);
         assert_eq!(loaded.unresolved, 0);
     }
@@ -9088,7 +9174,7 @@ mod tests {
         player.inventory = Inventory::from_parts(slots, None);
         let data = sample_data(player);
 
-        let loaded = decode_v10_bytes(v10_archive(&data, &source), ContentRegistry::builtin())
+        let loaded = load_v10_bytes(v10_archive(&data, &source), ContentRegistry::builtin())
             .expect("v10 loads");
         assert_eq!(loaded.unresolved, 2);
         assert_eq!(
@@ -9175,19 +9261,19 @@ mod tests {
 
         let truncated = bytes[..bytes.len() - 1].to_vec();
         assert!(matches!(
-            decode_v10_bytes(truncated, &registry),
+            load_v10_bytes(truncated, &registry),
             Err(PersistenceError::InvalidArchive(_))
         ));
         let short_header = bytes[..12].to_vec();
         assert!(matches!(
-            decode_v10_bytes(short_header, &registry),
+            load_v10_bytes(short_header, &registry),
             Err(PersistenceError::InvalidArchive(StorageError::Truncated))
         ));
 
         let mut flagged = bytes.clone();
         flagged[8..12].copy_from_slice(&1u32.to_le_bytes());
         assert!(matches!(
-            decode_v10_bytes(flagged, &registry),
+            load_v10_bytes(flagged, &registry),
             Err(PersistenceError::InvalidArchive(
                 StorageError::UnsupportedFlags(1)
             ))
@@ -9198,11 +9284,44 @@ mod tests {
         let mut codec = bytes;
         codec[36] = 9;
         assert!(matches!(
-            decode_v10_bytes(codec, &registry),
+            load_v10_bytes(codec, &registry),
             Err(PersistenceError::InvalidArchive(
                 StorageError::UnknownCodec(9)
             ))
         ));
+    }
+
+    #[test]
+    fn v10_fail_closed_errors_reach_the_path_and_owned_loaders() {
+        let registry = ContentRegistry::builtin().clone();
+        let mut trailing = v10_archive(&v10_rich_data(), &registry);
+        trailing.push(0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trailing.mcvx");
+        std::fs::write(&path, &trailing).unwrap();
+
+        // The disk path and the owned-buffer entry points share the same
+        // dispatch and must surface the same typed decode error.
+        assert!(matches!(
+            load_world_from_path_with(&path, &registry),
+            Err(PersistenceError::InvalidArchive(
+                StorageError::TrailingBytes(1)
+            ))
+        ));
+        assert!(matches!(
+            load_world_from_owned(trailing.clone(), &registry),
+            Err(PersistenceError::InvalidArchive(
+                StorageError::TrailingBytes(1)
+            ))
+        ));
+
+        let valid = v10_archive(&v10_rich_data(), &registry);
+        std::fs::write(&path, &valid).unwrap();
+        let from_path = load_world_from_path_with(&path, &registry).expect("path load");
+        let from_owned = load_world_from_owned(valid, &registry).expect("owned load");
+        assert_eq!(from_path.data, v10_rich_data());
+        assert_eq!(from_owned.data, v10_rich_data());
     }
 
     #[test]
@@ -9213,23 +9332,29 @@ mod tests {
         let mut missing = sections.clone();
         missing.retain(|(id, _)| *id != V10_SECTION_WORLD_PLAYER);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&missing), &registry),
+            load_v10_bytes(v10_archive_from_sections(&missing), &registry),
             Err(PersistenceError::MissingSection {
                 id: V10_SECTION_WORLD_PLAYER
             })
         ));
 
-        let mut reserved = sections.clone();
-        reserved.push((10, vec![0]));
-        assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&reserved), &registry),
-            Err(PersistenceError::InvalidArchive(_))
-        ));
+        // Every reserved fixed id 10-15 is rejected, not just the first.
+        for id in 10..=15 {
+            let mut reserved = sections.clone();
+            reserved.push((id, vec![0]));
+            assert!(
+                matches!(
+                    load_v10_bytes(v10_archive_from_sections(&reserved), &registry),
+                    Err(PersistenceError::InvalidArchive(_))
+                ),
+                "reserved section id {id} must fail closed"
+            );
+        }
 
         let mut orphan = sections.clone();
         orphan.push((V10_CHUNK_SECTION_BASE, vec![0]));
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&orphan), &registry),
+            load_v10_bytes(v10_archive_from_sections(&orphan), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
 
@@ -9238,14 +9363,14 @@ mod tests {
         let mut hole = v10_sections(&rich, &registry);
         hole.retain(|(id, _)| *id != V10_CHUNK_SECTION_BASE + 1);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&hole), &registry),
+            load_v10_bytes(v10_archive_from_sections(&hole), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
 
         let mut missing_crops = sections;
         missing_crops.retain(|(id, _)| *id != V10_SECTION_CROPS);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&missing_crops), &registry),
+            load_v10_bytes(v10_archive_from_sections(&missing_crops), &registry),
             Err(PersistenceError::MissingSection {
                 id: V10_SECTION_CROPS
             })
@@ -9270,7 +9395,7 @@ mod tests {
             body[offset..offset + 4].copy_from_slice(&0u32.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&zero), &registry),
+            load_v10_bytes(v10_archive_from_sections(&zero), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
 
@@ -9286,7 +9411,7 @@ mod tests {
             body[first + 16..first + 32].copy_from_slice(&record);
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&duplicate), &registry),
+            load_v10_bytes(v10_archive_from_sections(&duplicate), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
 
@@ -9304,7 +9429,7 @@ mod tests {
             body[offset..offset + 4].copy_from_slice(&1u32.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&mismatch), &registry),
+            load_v10_bytes(v10_archive_from_sections(&mismatch), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
 
@@ -9316,7 +9441,7 @@ mod tests {
             body.extend_from_slice(&(MAX_SAVED_CHUNKS as u32 + 1).to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
+            load_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
             Err(PersistenceError::InvalidChunkIndex)
         ));
     }
@@ -9360,7 +9485,7 @@ mod tests {
             let mut broken = sections.clone();
             *v10_section_mut(&mut broken, V10_SECTION_CONTENT_TABLE) = body;
             assert!(matches!(
-                decode_v10_bytes(v10_archive_from_sections(&broken), &registry),
+                load_v10_bytes(v10_archive_from_sections(&broken), &registry),
                 Err(PersistenceError::InvalidContentTable)
             ));
         }
@@ -9368,7 +9493,7 @@ mod tests {
         let mut trailing = sections.clone();
         v10_section_mut(&mut trailing, V10_SECTION_CONTENT_TABLE).push(0);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&trailing), &registry),
+            load_v10_bytes(v10_archive_from_sections(&trailing), &registry),
             Err(PersistenceError::InvalidContentTable)
         ));
 
@@ -9376,7 +9501,7 @@ mod tests {
         *v10_section_mut(&mut reserved, V10_SECTION_CONTENT_TABLE) =
             content_table(&[(1, b"minecraft:stone")]);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&reserved), &registry),
+            load_v10_bytes(v10_archive_from_sections(&reserved), &registry),
             Err(PersistenceError::InvalidContentName(_))
         ));
     }
@@ -9389,7 +9514,7 @@ mod tests {
         let mut empty = sections.clone();
         *v10_section_mut(&mut empty, V10_CHUNK_SECTION_BASE) = Vec::new();
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&empty), &registry),
+            load_v10_bytes(v10_archive_from_sections(&empty), &registry),
             Err(PersistenceError::InvalidChunkSection(_))
         ));
 
@@ -9405,7 +9530,7 @@ mod tests {
             body.extend_from_slice(&1u16.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&bad_index), &registry),
+            load_v10_bytes(v10_archive_from_sections(&bad_index), &registry),
             Err(PersistenceError::InvalidChunkSection(
                 StorageError::PaletteIndexOutOfRange { .. }
             ))
@@ -9431,7 +9556,7 @@ mod tests {
             body.extend_from_slice(&0u16.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&non_block), &registry),
+            load_v10_bytes(v10_archive_from_sections(&non_block), &registry),
             Err(PersistenceError::InvalidContentName(name)) if name == "stick"
         ));
 
@@ -9448,14 +9573,14 @@ mod tests {
             body.extend_from_slice(&0u16.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&outside_table), &registry),
+            load_v10_bytes(v10_archive_from_sections(&outside_table), &registry),
             Err(PersistenceError::InvalidContentTable)
         ));
 
         let mut trailing = sections;
         v10_section_mut(&mut trailing, V10_CHUNK_SECTION_BASE).push(0);
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&trailing), &registry),
+            load_v10_bytes(v10_archive_from_sections(&trailing), &registry),
             Err(PersistenceError::InvalidChunkSection(
                 StorageError::TrailingBytes(_)
             ))
@@ -9474,7 +9599,7 @@ mod tests {
             body.extend_from_slice(&(MAX_SAVED_CROPS as u32 + 1).to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
+            load_v10_bytes(v10_archive_from_sections(&over_cap), &registry),
             Err(PersistenceError::InvalidCrops)
         ));
 
@@ -9489,7 +9614,7 @@ mod tests {
             body.extend_from_slice(&0i32.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&stray), &registry),
+            load_v10_bytes(v10_archive_from_sections(&stray), &registry),
             Err(PersistenceError::InvalidCrops)
         ));
 
@@ -9506,7 +9631,7 @@ mod tests {
             body[..4].copy_from_slice(&2u32.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&unsorted), &registry),
+            load_v10_bytes(v10_archive_from_sections(&unsorted), &registry),
             Err(PersistenceError::InvalidCrops)
         ));
     }
@@ -9529,7 +9654,7 @@ mod tests {
         for (id, label) in expected {
             let mut broken = sections.clone();
             v10_section_mut(&mut broken, id).push(0);
-            let result = decode_v10_bytes(v10_archive_from_sections(&broken), &registry);
+            let result = load_v10_bytes(v10_archive_from_sections(&broken), &registry);
             assert!(
                 result.is_err(),
                 "trailing bytes in the {label} section must fail closed"
@@ -9547,7 +9672,7 @@ mod tests {
             .collect();
         let bytes = encode_archive(SAVE_VERSION + 1, 0, &borrowed).expect("encode future version");
         assert!(matches!(
-            decode_v10_bytes(bytes, &registry),
+            load_v10_bytes(bytes, &registry),
             Err(PersistenceError::UnsupportedVersion(11))
         ));
     }
@@ -9572,7 +9697,7 @@ mod tests {
             "mymod:ruby_pickaxe".len()
         );
 
-        let loaded = decode_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
+        let loaded = load_v10_bytes(v10_archive(&data, &registry), &registry).expect("loads");
         assert_eq!(loaded.data, data);
 
         // A saved durability over the authored maximum clamps (policy), while
@@ -9583,7 +9708,7 @@ mod tests {
             assert_eq!(body[0], ITEM_TAG_MOD_TOOL);
             body[3..5].copy_from_slice(&1000u16.to_le_bytes());
         }
-        let loaded = decode_v10_bytes(v10_archive_from_sections(&clamped), &registry)
+        let loaded = load_v10_bytes(v10_archive_from_sections(&clamped), &registry)
             .expect("clamped durability loads");
         let tool = loaded.data.player.inventory.slots()[0]
             .as_ref()
@@ -9596,7 +9721,7 @@ mod tests {
             body[3..5].copy_from_slice(&0u16.to_le_bytes());
         }
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&zero), &registry),
+            load_v10_bytes(v10_archive_from_sections(&zero), &registry),
             Err(PersistenceError::InvalidItem(ItemError::InvalidDurability))
         ));
 
@@ -9605,7 +9730,7 @@ mod tests {
         let mut cross_kind = sections;
         v10_section_mut(&mut cross_kind, V10_SECTION_INVENTORY)[0] = ITEM_TAG_GENERIC;
         assert!(matches!(
-            decode_v10_bytes(v10_archive_from_sections(&cross_kind), &registry),
+            load_v10_bytes(v10_archive_from_sections(&cross_kind), &registry),
             Err(PersistenceError::InvalidContentName(_))
         ));
     }
