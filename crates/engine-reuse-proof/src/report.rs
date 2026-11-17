@@ -1,4 +1,4 @@
-//! Aggregated, deterministic [`ProofReport`] over the five proof areas.
+//! Aggregated, deterministic [`ProofReport`] over the six proof areas.
 //!
 //! The report is the runnable surface of the consumer: the `engine-reuse-proof`
 //! bin prints it and exits 0. Every line is a `key=value` pair, floats use a
@@ -13,6 +13,7 @@ use crate::gfx::GfxProof;
 use crate::motion::MotionProof;
 use crate::physics::PhysicsProof;
 use crate::storage::StorageProof;
+use crate::worldgen::WorldgenProof;
 
 /// The aggregated result of one device-free consumer proof run.
 #[derive(Clone, Copy, Debug)]
@@ -27,6 +28,8 @@ pub struct ProofReport {
     pub storage: StorageProof,
     /// Pack-parse and asset-pipeline proof.
     pub content: ContentProof,
+    /// In-memory prefab/village planning proof.
+    pub worldgen: WorldgenProof,
 }
 
 /// Format a proof float with fixed precision, normalizing negative zero.
@@ -98,6 +101,16 @@ impl fmt::Display for ProofReport {
             "content.catalog_digest=0x{:016x}",
             self.content.catalog_digest
         )?;
+
+        writeln!(
+            f,
+            "worldgen.village_plan=cell={},{},prefabs={},links={},roads={}",
+            self.worldgen.village_cell.0,
+            self.worldgen.village_cell.1,
+            self.worldgen.prefabs,
+            self.worldgen.links,
+            self.worldgen.roads
+        )?;
         Ok(())
     }
 }
@@ -106,7 +119,7 @@ impl fmt::Display for ProofReport {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 20] = [
+    const KEYS: [&str; 21] = [
         "physics.landing_y=",
         "physics.wall_x=",
         "physics.ray_block=",
@@ -127,6 +140,7 @@ mod tests {
         "storage.chunk_edits=",
         "content.pack_entries=",
         "content.catalog_digest=",
+        "worldgen.village_plan=",
     ];
 
     #[test]
@@ -137,6 +151,7 @@ mod tests {
             motion: crate::motion::run(),
             storage: crate::storage::run(),
             content: crate::content::run(),
+            worldgen: crate::worldgen::run(),
         };
         let rendered = report.to_string();
 

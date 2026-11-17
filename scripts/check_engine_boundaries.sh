@@ -178,6 +178,16 @@ self_test() {
         fail "self-test accepted wgpu in opencraft-content"
     fi
 
+    local neutral_worldgen_tree=$'opencraft-worldgen v0.1.0\n├── opencraft-core v0.1.0\n├── opencraft-content v0.1.0\n├── glam v0.27.0\n└── toml v1.1.8+spec-1.1.0'
+    if violation=$(tree_violation opencraft-worldgen "$neutral_worldgen_tree"); then
+        fail "self-test rejected a neutral opencraft-worldgen tree: $violation"
+    fi
+
+    local worldgen_storage_tree=$'opencraft-worldgen v0.1.0\n└── opencraft-storage v0.1.0'
+    if ! violation=$(tree_violation opencraft-worldgen "$worldgen_storage_tree"); then
+        fail "self-test accepted a worldgen -> storage edge"
+    fi
+
     echo "PASS: boundary self-test"
 }
 

@@ -602,6 +602,7 @@ dependencies = [
  "opencraft-pathfinding",
  "opencraft-physics",
  "opencraft-storage",
+ "opencraft-worldgen",
 ]
 
 [[package]]

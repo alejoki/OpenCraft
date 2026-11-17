@@ -28,8 +28,8 @@ The repository has two layers:
 | `crates/opencraft-pathfinding` | `opencraft-pathfinding` | `0.1.0` | Steering primitives plus deterministic nav-grid A* over `BlockQuery`. |
 | `crates/opencraft-storage` | `opencraft-storage` | `0.1.0` | Neutral sectioned save archive, canonical chunk-section codec and bounded file I/O; depends on `opencraft-core` only. |
 | `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Neutral pack format and validation: `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement/caps, PNG decode, 16x16 resample, deterministic allocation, patch precedence, placeholders, the FNV digest over raw u16 ids and the deterministic `--validate-pack` renderer. The game's `ContentRegistry` is a thin adapter. Depends on `opencraft-core`, `toml` and `png`. |
-| `crates/opencraft-worldgen` | `opencraft-worldgen` | `0.1.0` | Skeleton; M018/S06-S07 will add worldgen. |
-| `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the engine crates; proves reuse without the game. |
+| `crates/opencraft-worldgen` | `opencraft-worldgen` | `0.1.0` | Neutral world generation: biome/height/ruin/tree/spawn queries, the loot vocabulary, the prefab codec/catalog/serializer behind a two-method `BlockNameResolver`, and the village codec/catalog/fingerprint/plan/chunk-local emission over raw `u16` ids. Depends on `opencraft-core`, `opencraft-content`, `toml` and `glam`, with `tempfile` as a dev-dependency only; no storage, GPU, windowing or game edge. |
+| `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the engine crates; proves reuse without the game, including a device-free village plan in its deterministic 21-line `ProofReport`. |
 
 Workspace rules:
 
@@ -56,7 +56,7 @@ opencraft (game)
 └── opencraft-storage ───> opencraft-core
 
 opencraft-content ────> opencraft-core + toml + png
-opencraft-worldgen   (skeleton: no crate dependencies yet)
+opencraft-worldgen ───> opencraft-core + opencraft-content + toml + glam
 
 engine-reuse-proof
 ├── opencraft-content
@@ -64,7 +64,8 @@ engine-reuse-proof
 ├── opencraft-gfx
 ├── opencraft-physics
 ├── opencraft-pathfinding
-└── opencraft-storage
+├── opencraft-storage
+└── opencraft-worldgen
 ```
 
 - `opencraft-core` depends on `glam` only. It has no GPU, windowing or game
@@ -83,13 +84,21 @@ engine-reuse-proof
   `tempfile` as a dev-dependency only. It has no game, GPU, windowing, audio,
   storage or worldgen edge. Its file I/O is the bounded pack reader
   (`read_manifest_text`, `read_asset_bytes`, `decode_png_rgba`), which caps
-  every read and rejects non-regular files. `opencraft-worldgen` is still a
-  dependency-free skeleton; it must not depend on `opencraft-storage` (it may
-  depend on `opencraft-content` once S06 lands).
-- `engine-reuse-proof` depends only on the six engine crates plus `glam 0.27`.
+  every read and rejects non-regular files.
+- `opencraft-worldgen` depends on `opencraft-core`, `opencraft-content`, `toml`
+  and `glam`, with `tempfile` as a dev-dependency only. It owns neutral
+  biome/height/ruin/tree/spawn queries, the loot vocabulary, the prefab
+  codec/catalog/serializer behind a two-method `BlockNameResolver`, and the
+  village codec/catalog/fingerprint/plan/chunk-local emission over raw `u16`
+  block ids. It never imports a game
+  `BlockId`/`ItemId`/`ContentRegistry`/`Chunk`/`WorldSession`, and it must not
+  depend on `opencraft-storage`, `opencraft-gfx`, a windowing crate or the game.
+- `engine-reuse-proof` depends only on the seven engine crates plus `glam 0.27`.
   Its manifest has no direct GPU, windowing, serialization or temp-file
   dependency. Its `wgpu` edge is transitive through `opencraft-gfx` and is never
-  called: the consumer is device-free.
+  called: the consumer is device-free. Its `ProofReport` is 21 deterministic
+  lines, the last of which plans a village from embedded prefab/village TOML
+  with no filesystem, clock, thread or GPU.
 - No crate depends on the `opencraft` package, directly or transitively. The
   boundary gate enforces this with `cargo tree`.
 
@@ -197,8 +206,15 @@ renderer into the crate, and the game consumes them through historical
 module-path re-exports. S05 moved deterministic allocation, patch precedence,
 placeholder allocation, the FNV-1a content digest and the changed-stack notice
 into `opencraft_content::catalog` over neutral raw `u16` ids, leaving the game's
-`ContentRegistry` as a thin adapter. Worldgen/prefab/village extraction remains
-a future M018 slice (S06-S07) with S08 closure; it is not implemented yet.
+`ContentRegistry` as a thin adapter. S06 moved the neutral worldgen surface into
+`opencraft-worldgen`: the biome/height/ruin/tree/spawn queries, the loot
+vocabulary, the prefab codec/catalog/serializer behind a two-method
+`BlockNameResolver`, and the village codec/catalog/fingerprint/plan/chunk-local
+emission over raw `u16` ids. The game keeps `Chunk` writing (`place_village_cells`),
+capture, `WorldGenContext`, season/clock policy and all UI, and consumes the
+crate through `src/world/{terrain,prefab,village,loot}.rs` re-export shims.
+S07 remains: terrain/tree/spawn generation, cave/ore painting and generation-side
+ruins are still game-side. S08 owns the final closure.
 
 The pack and worldgen formats stay frozen at their current versions. `.mcvx`
 now writes v10 through `opencraft-storage`; any future save-format change needs
