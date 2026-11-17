@@ -1679,6 +1679,7 @@ dependencies = [
  "crossbeam-channel",
  "glam",
  "glyphon",
+ "opencraft-content",
  "opencraft-core",
  "opencraft-gfx",
  "opencraft-pathfinding",
@@ -1698,6 +1699,12 @@ dependencies = [
 [[package]]
 name = "opencraft-content"
 version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+ "png",
+ "tempfile",
+ "toml",
+]
 
 [[package]]
 name = "opencraft-core"

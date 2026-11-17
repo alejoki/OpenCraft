@@ -2611,7 +2611,11 @@ icon = "huge.bin"
     fn oversized_ihdr_asset_is_diagnosed() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root);
-        fs::write(dir.join("huge.png"), decode::png_bomb_bytes(30000, 30000)).unwrap();
+        fs::write(
+            dir.join("huge.png"),
+            crate::pack::png_bomb_bytes(30000, 30000),
+        )
+        .unwrap();
 
         let text = r#"
 [[blocks]]

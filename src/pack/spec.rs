@@ -21,7 +21,6 @@ use crate::pack::asset;
 use crate::pack::decode;
 use crate::pack::manifest;
 use crate::pack::manifest::PackFormat;
-use crate::pack::resample;
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
 use crate::pack::v2;
@@ -30,11 +29,9 @@ use crate::render::texture::{
     generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
 };
 use crate::settings::SettingsWarning;
-
-/// Smallest accepted layer side length, in pixels.
-pub(crate) const MIN_LAYER_SIDE: u32 = 16;
-/// Largest accepted layer side length, in pixels.
-pub(crate) const MAX_LAYER_SIDE: u32 = 256;
+pub use opencraft_content::decode::{
+    decode_asset_file, decode_builtin_icon_file, decode_layer_file, MAX_LAYER_SIDE, MIN_LAYER_SIDE,
+};
 
 /// Largest accepted `pack.toml` file, in bytes.
 const MAX_MANIFEST_BYTES: u64 = asset::PACK_ASSET_BYTE_CAP;
@@ -174,79 +171,6 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
         diagnostics,
         warnings,
     }
-}
-
-/// Decode one optional layer file into resampled 16x16 RGBA bytes.
-///
-/// This is the single-file seam shared by startup loading and live texture
-/// reload. A missing file is `Ok(None)` (the stack keeps whatever is below);
-/// a present-but-invalid file is `Err(reason)` using the exact startup reason
-/// strings. It never warns or touches presentation state.
-pub fn decode_layer_file(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = dir.join(file);
-    if !path.exists() {
-        // Missing layer files are legal: the stack keeps whatever is below.
-        return Ok(None);
-    }
-
-    let decoded = decode::decode_png_rgba(&path, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "layers")?;
-    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
-}
-
-/// Decode one v2 pack asset into resampled 16x16 RGBA bytes.
-///
-/// Uses the same confinement, byte cap, and dimension rules as
-/// [`crate::pack::v2::load_content_assets`], but returns the failure reason to
-/// the caller instead of recording a diagnostic. This is the live-reload seam
-/// for pack block-face assets.
-pub fn decode_asset_file(dir: &Path, relative: &str) -> Result<Vec<u8>, String> {
-    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "assets")?;
-    Ok(resample::resample_to_16(&decoded.rgba, decoded.width))
-}
-
-/// Decode one optional `[builtin_icons]` PNG into resampled 16x16 RGBA bytes.
-///
-/// This is the live-reload seam for built-in sprite overrides. It applies the
-/// same confinement, byte cap, and square 16..=256 rules as
-/// [`decode_asset_file`], but a missing file is `Ok(None)` instead of an error:
-/// a deleted override must reveal the lower pack or procedural art. A path
-/// that escapes the pack folder, or a present-but-invalid/oversized image, is
-/// `Err(reason)`.
-pub fn decode_builtin_icon_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = asset::resolve_asset_path(dir, relative)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "assets")?;
-    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
-}
-
-/// Require a square image between [`MIN_LAYER_SIDE`] and [`MAX_LAYER_SIDE`].
-///
-/// `noun` selects the exact startup wording: `layers` for fixed-name layers
-/// and `assets` for v2 pack assets.
-fn validate_square_16_to_256(decoded: &decode::DecodedPng, noun: &str) -> Result<(), String> {
-    if decoded.width != decoded.height {
-        return Err(format!(
-            "image is {}x{}, {noun} must be square",
-            decoded.width, decoded.height
-        ));
-    }
-
-    if decoded.width < MIN_LAYER_SIDE || decoded.width > MAX_LAYER_SIDE {
-        return Err(format!(
-            "image is {}x{}, {noun} must be between {} and {} pixels per side",
-            decoded.width, decoded.height, MIN_LAYER_SIDE, MAX_LAYER_SIDE
-        ));
-    }
-
-    Ok(())
 }
 
 /// Decode one optional layer file into resampled 16x16 RGBA bytes.
@@ -411,6 +335,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::audio::default_buffers;
+    use crate::pack::resample;
     use crate::render::texture::NUM_TEX_LAYERS;
 
     const LAYER_BYTES: usize = 16 * 16 * 4;
