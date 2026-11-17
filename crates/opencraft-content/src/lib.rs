@@ -11,6 +11,7 @@
 //! worldgen.
 
 pub mod asset;
+pub mod catalog;
 pub mod decode;
 pub mod manifest;
 pub mod resample;
