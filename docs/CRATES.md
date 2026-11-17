@@ -123,8 +123,9 @@ crate. These stay game-side:
 
 Pathfinding A* is proven by crate tests and the external consumer but remains
 unwired in mob behavior. Wiring it in is a future gameplay decision, not an
-engine-crate detail. `SAVE_VERSION` stays 9 and the `.mcvx`, pack and worldgen
-formats are frozen through M017.
+engine-crate detail. In M017, `SAVE_VERSION` stayed 9 and the `.mcvx`, pack and
+worldgen formats were frozen through that milestone; M018/S02 has since moved
+`.mcvx` to v10 through `opencraft-storage` (see the M018 scope below).
 
 ## Gate commands
 
@@ -179,13 +180,18 @@ environmental.
 
 The three M018 members now exist in the workspace. `opencraft-storage`'s
 neutral archive container, canonical chunk-section codec and bounded file I/O
-surface landed in S01. Save v10, content/pack extraction and
-worldgen/prefab/village extraction remain future M018 slices (S02-S07) with S08
-closure; none of that work is implemented yet.
+surface landed in S01. Save v10 is now live through that crate: the S02
+sectioned writer/reader, sorted kind-tagged content table, per-chunk palette
+sections, crop section, eager content-table resolution and forward migration
+from v1-v9 are implemented, and the game's save I/O routes through the neutral
+bounded file helpers. Content/pack extraction and worldgen/prefab/village
+extraction remain future M018 slices (S04-S07) with S08 closure; neither is
+implemented yet.
 
-The `.mcvx`, pack and worldgen formats stay frozen at their current versions.
-Those extractions need a recorded decision and their own boundary/gate work,
-must not change save, pack or worldgen formats by accident, and must keep the
+The pack and worldgen formats stay frozen at their current versions. `.mcvx`
+now writes v10 through `opencraft-storage`; any future save-format change needs
+a recorded decision and its own boundary/gate work. The remaining extractions
+must not change pack or worldgen formats by accident, and must keep the
 neutral-API rules above intact.
 
 ## Failure and recovery
