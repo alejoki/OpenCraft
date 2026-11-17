@@ -13,14 +13,13 @@
 //! Everything here is GPU- and audio-device-free pure data plus filesystem
 //! reads, mirroring [`crate::pack::load_pack_from_dir`]'s never-fail contract.
 
-use std::io::Read;
 use std::path::Path;
 
 use crate::content::spec::{ContentDiagnostic, PackContentSpec};
 use crate::pack::asset;
 use crate::pack::decode;
 use crate::pack::manifest;
-use crate::pack::manifest::PackFormat;
+use crate::pack::manifest::{PackFormat, PackWarning};
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
 use crate::pack::v2;
@@ -32,42 +31,17 @@ use crate::settings::SettingsWarning;
 pub use opencraft_content::decode::{
     decode_asset_file, decode_builtin_icon_file, decode_layer_file, MAX_LAYER_SIDE, MIN_LAYER_SIDE,
 };
+pub use opencraft_content::manifest::read_manifest_text;
 
-/// Largest accepted `pack.toml` file, in bytes.
-const MAX_MANIFEST_BYTES: u64 = asset::PACK_ASSET_BYTE_CAP;
-
-/// Read one `pack.toml` with a metadata-first size and file-type guard.
-///
-/// Returns the manifest text without any path prefix: callers own the path
-/// wording so the watcher status line keeps its pinned `failed to read:`
-/// shape while the loader names the folder. A FIFO or other non-regular file
-/// is rejected from metadata alone, so a hostile manifest cannot block the
-/// open or allocate an attacker-sized buffer.
-pub fn read_manifest_text(path: &Path) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|err| err.to_string())?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+/// The neutral parser warning converts to the game's settings warning where
+/// `LoadedPack`, the validator and the menu expect that richer type.
+impl From<PackWarning> for SettingsWarning {
+    fn from(warning: PackWarning) -> Self {
+        Self {
+            field: warning.field,
+            reason: warning.reason,
+        }
     }
-    if metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
-            metadata.len()
-        ));
-    }
-
-    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
-    let mut text = String::new();
-    file.take(MAX_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|err| err.to_string())?;
-    if text.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
-            text.len()
-        ));
-    }
-
-    Ok(text)
 }
 
 /// What one pack authors, before any fallback is applied.
@@ -102,7 +76,7 @@ pub struct PackSpec {
     /// Rejected v2 entries and asset failures (empty for v1 packs).
     pub diagnostics: Vec<ContentDiagnostic>,
     /// Manifest/layer/logo fallbacks, in the v1 warning order.
-    pub warnings: Vec<SettingsWarning>,
+    pub warnings: Vec<PackWarning>,
 }
 
 /// Read one pack directory into authored presence only.
@@ -119,7 +93,7 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     let (manifest, root, mut manifest_warnings) = match read_manifest_text(&manifest_path) {
         Ok(text) => manifest::parse_pack_file(&text),
         Err(err) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: "pack.toml".to_string(),
                 reason: format!("failed to read {}: {err}", manifest_path.display()),
             });
@@ -131,11 +105,16 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     // The v2 gate owns the v1 "content arrays require format_version = 2"
     // warning and the future-version warning. A syntactically invalid manifest
     // has no root and produced its own warning above.
-    let (mut content, mut content_warnings, mut diagnostics) = match &root {
+    let (mut content, content_warnings, mut diagnostics) = match &root {
         Some(root) => v2::parse_content(root, manifest.format_version),
         None => (PackContentSpec::default(), Vec::new(), Vec::new()),
     };
-    warnings.append(&mut content_warnings);
+    // The v2 gate still speaks the game's settings warning type; fold it into
+    // the spec's neutral list so every authored fallback keeps one order.
+    warnings.extend(content_warnings.into_iter().map(|warning| PackWarning {
+        field: warning.field,
+        reason: warning.reason,
+    }));
     if manifest.format_version == PackFormat::V2 {
         v2::load_content_assets(dir, &mut content, &mut diagnostics);
     }
@@ -177,11 +156,11 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
 ///
 /// A missing file is silent `None`; a present-but-invalid file is `None` plus
 /// one warning named after the bare file, matching v1 `apply_layer_files`.
-fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> Option<Vec<u8>> {
+fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<PackWarning>) -> Option<Vec<u8>> {
     match decode_layer_file(dir, file) {
         Ok(layer) => layer,
         Err(reason) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: file.to_string(),
                 reason,
             });
@@ -191,16 +170,12 @@ fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> 
 }
 
 /// Decode the optional manifest logo at native size, warning on failure.
-fn load_logo(
-    dir: &Path,
-    logo: Option<&str>,
-    warnings: &mut Vec<SettingsWarning>,
-) -> Option<PackLogo> {
+fn load_logo(dir: &Path, logo: Option<&str>, warnings: &mut Vec<PackWarning>) -> Option<PackLogo> {
     let logo = logo?;
     let path = match asset::resolve_asset_path(dir, logo) {
         Ok(path) => path,
         Err(reason) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: logo.to_string(),
                 reason,
             });
@@ -214,7 +189,7 @@ fn load_logo(
             height: decoded.height,
         }),
         Err(err) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: logo.to_string(),
                 reason: err,
             });
@@ -268,7 +243,7 @@ pub fn resolve_presentation(specs: &[PackSpec]) -> LoadedPack {
         if let Some(name) = &spec.manifest.name {
             display_name = Some(name.clone());
         }
-        warnings.extend(spec.warnings.iter().cloned());
+        warnings.extend(spec.warnings.iter().cloned().map(SettingsWarning::from));
     }
 
     let display_name = display_name
@@ -312,7 +287,7 @@ pub fn load_stack(
         }
 
         let spec = load_spec_from_dir(&dir);
-        warnings.extend(spec.warnings.iter().cloned());
+        warnings.extend(spec.warnings.iter().cloned().map(SettingsWarning::from));
         specs.push(spec);
     }
 

@@ -12,6 +12,10 @@
 
 pub mod asset;
 pub mod decode;
+pub mod manifest;
 pub mod resample;
 pub mod spec;
 pub mod vocabulary;
+mod warning;
+
+pub use warning::PackWarning;
