@@ -93,6 +93,11 @@ impl fmt::Display for ProofReport {
         writeln!(f, "storage.chunk_edits={}", self.storage.chunk_edits)?;
 
         writeln!(f, "content.pack_entries={}", self.content.pack_entries)?;
+        writeln!(
+            f,
+            "content.catalog_digest=0x{:016x}",
+            self.content.catalog_digest
+        )?;
         Ok(())
     }
 }
@@ -101,7 +106,7 @@ impl fmt::Display for ProofReport {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 19] = [
+    const KEYS: [&str; 20] = [
         "physics.landing_y=",
         "physics.wall_x=",
         "physics.ray_block=",
@@ -121,6 +126,7 @@ mod tests {
         "storage.section_count=",
         "storage.chunk_edits=",
         "content.pack_entries=",
+        "content.catalog_digest=",
     ];
 
     #[test]

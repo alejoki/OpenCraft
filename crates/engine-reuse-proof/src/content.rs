@@ -3,13 +3,19 @@
 //! This is the outside-crate proof for `opencraft-content`: an authored
 //! `format_version = 2` manifest is parsed, its blocks and items arrays are
 //! validated entry by entry, and one embedded PNG travels the same decode and
-//! 16x16 resample path a real pack asset takes. Everything runs from memory:
+//! 16x16 resample path a real pack asset takes. The resampled sprite is then
+//! inserted into the neutral spec, a `catalog::Catalog` is built from the same
+//! pack stack and its FNV-1a digest is reported. Everything runs from memory:
 //! no path is opened, no clock is read, no thread is spawned and no GPU object
 //! is created, so the proof is byte-deterministic on a headless CI runner.
 
+use opencraft_content::catalog::{
+    build_catalog, BlockDef, Catalog, PackIdentity, EMPTY_DIGEST, PACK_ICON_BASE, PACK_LAYER_BASE,
+};
 use opencraft_content::decode::decode_png_rgba_bytes;
 use opencraft_content::manifest::parse_pack_file;
 use opencraft_content::resample::resample_to_16;
+use opencraft_content::spec::PackAsset;
 use opencraft_content::v2::parse_content;
 
 /// A minimal valid v2 manifest: one block and one item.
@@ -55,6 +61,8 @@ pub struct ContentProof {
     pub items: usize,
     /// Bytes in the resampled 16x16 sprite.
     pub sprite_bytes: usize,
+    /// FNV-1a digest of the neutral catalog built from the proof pack.
+    pub catalog_digest: u64,
 }
 
 /// Run the pack-parse and asset-pipeline proofs deterministically.
@@ -70,7 +78,7 @@ pub fn run() -> ContentProof {
     );
     let root = root.expect("the proof manifest is valid TOML");
 
-    let (spec, warnings, diagnostics) = parse_content(&root, manifest.format_version);
+    let (mut spec, warnings, diagnostics) = parse_content(&root, manifest.format_version);
     assert!(
         warnings.is_empty(),
         "the proof content must parse without warnings: {warnings:?}"
@@ -81,6 +89,9 @@ pub fn run() -> ContentProof {
     );
     assert_eq!(spec.blocks.len(), 1, "the proof pack authors one block");
     assert_eq!(spec.items.len(), 1, "the proof pack authors one item");
+    let pack_entries = spec.blocks.len() + spec.items.len();
+    let blocks = spec.blocks.len();
+    let items = spec.items.len();
 
     let decoded = decode_png_rgba_bytes(&PNG, "proof.png", Some(256))
         .expect("the embedded proof PNG is a valid 16x16 RGBA image");
@@ -93,10 +104,88 @@ pub fn run() -> ContentProof {
     let sprite = resample_to_16(&decoded.rgba, decoded.width);
     assert_eq!(sprite.len(), 16 * 16 * 4, "the sprite is 1024 RGBA bytes");
 
+    // Feed the decoded sprite back through the neutral spec exactly like a real
+    // pack loader would, then build the catalog over one base block.
+    spec.assets.insert(
+        "proof.png".to_string(),
+        PackAsset {
+            rgba: sprite.clone(),
+            source_side: 16,
+        },
+    );
+    let base = Catalog::from_base(
+        vec![BlockDef {
+            id: 0,
+            name: "stone".to_string(),
+            display_name: "Stone".to_string(),
+            faces: [3; 6],
+            hardness: Some(1.5),
+            drop: None,
+            tool_class: None,
+            stack_limit: 64,
+            placeholder: false,
+        }],
+        Vec::new(),
+        Vec::new(),
+    );
+    let packs = [(
+        PackIdentity {
+            folder: "proof".to_string(),
+            version: Some("1.0.0".to_string()),
+        },
+        spec,
+    )];
+    let (catalog, report) = build_catalog(&base, &packs);
+
+    assert_eq!(
+        report.entries, 2,
+        "the catalog build considers one block and one item"
+    );
+    assert_eq!(
+        report.errors(),
+        0,
+        "the proof pack must build without errors: {:?}",
+        report.diagnostics
+    );
+    assert_eq!(
+        report.warnings(),
+        0,
+        "the proof pack must build without warnings: {:?}",
+        report.diagnostics
+    );
+
+    assert_eq!(
+        catalog.blocks().len(),
+        2,
+        "one base block plus one pack block"
+    );
+    let block = &catalog.blocks()[1];
+    assert_eq!(block.id, 1, "the pack block allocates right after the base");
+    assert_eq!(
+        block.faces, [PACK_LAYER_BASE; 6],
+        "the pack block's six faces share the first pack layer"
+    );
+    assert_eq!(catalog.items().len(), 1, "one pack item");
+    assert_eq!(catalog.items()[0].index, 0, "the neutral item index is 0");
+    assert_eq!(
+        catalog.items()[0].icon_layer,
+        PACK_ICON_BASE,
+        "the pack item icon takes the first pack icon layer"
+    );
+    assert_eq!(catalog.pack_layers().len(), 1, "one pack block layer");
+    assert_eq!(catalog.pack_icons().len(), 1, "one pack icon layer");
+    assert_eq!(catalog.packs().len(), 1, "one pack identity in the stack");
+    assert_ne!(
+        catalog.digest(),
+        EMPTY_DIGEST,
+        "a non-empty pack stack must move the content digest"
+    );
+
     ContentProof {
-        pack_entries: spec.blocks.len() + spec.items.len(),
-        blocks: spec.blocks.len(),
-        items: spec.items.len(),
+        pack_entries,
+        blocks,
+        items,
         sprite_bytes: sprite.len(),
+        catalog_digest: catalog.digest(),
     }
 }

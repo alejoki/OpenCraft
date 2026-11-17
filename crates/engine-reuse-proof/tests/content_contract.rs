@@ -39,6 +39,11 @@ fn content_proof_reports_the_parse_and_sprite_values() {
     assert_eq!(proof.items, 1, "one accepted item entry");
     assert_eq!(proof.pack_entries, 2, "one block plus one item");
     assert_eq!(proof.sprite_bytes, 1024, "16x16 RGBA is 1024 bytes");
+    assert_ne!(
+        proof.catalog_digest,
+        opencraft_content::catalog::EMPTY_DIGEST,
+        "the proof pack must move the neutral catalog digest"
+    );
 
     let repeated = content::run();
     assert_eq!(
@@ -46,13 +51,15 @@ fn content_proof_reports_the_parse_and_sprite_values() {
             proof.blocks,
             proof.items,
             proof.pack_entries,
-            proof.sprite_bytes
+            proof.sprite_bytes,
+            proof.catalog_digest
         ),
         (
             repeated.blocks,
             repeated.items,
             repeated.pack_entries,
-            repeated.sprite_bytes
+            repeated.sprite_bytes,
+            repeated.catalog_digest
         ),
         "the content proof must be stable across runs"
     );
@@ -62,12 +69,16 @@ fn content_proof_reports_the_parse_and_sprite_values() {
 fn proof_report_renders_the_content_line() {
     let rendered = ProofReport::to_string(&engine_reuse_proof::run());
 
-    assert_eq!(rendered.lines().count(), 19, "five proof groups of lines");
-    let expected = "content.pack_entries=2";
-    assert!(
-        rendered.lines().any(|actual| actual == expected),
-        "report must render {expected:?}:\n{rendered}"
-    );
+    assert_eq!(rendered.lines().count(), 20, "five proof groups of lines");
+    for expected in [
+        "content.pack_entries=2",
+        "content.catalog_digest=0xdd3648c397a414c0",
+    ] {
+        assert!(
+            rendered.lines().any(|actual| actual == expected),
+            "report must render {expected:?}:\n{rendered}"
+        );
+    }
 }
 
 #[test]

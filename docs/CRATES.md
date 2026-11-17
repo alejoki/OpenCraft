@@ -27,7 +27,7 @@ The repository has two layers:
 | `crates/opencraft-physics` | `opencraft-physics` | `0.1.0` | AABB collision, raycast/sweep and the movement solver over `BlockQuery`. |
 | `crates/opencraft-pathfinding` | `opencraft-pathfinding` | `0.1.0` | Steering primitives plus deterministic nav-grid A* over `BlockQuery`. |
 | `crates/opencraft-storage` | `opencraft-storage` | `0.1.0` | Neutral sectioned save archive, canonical chunk-section codec and bounded file I/O; depends on `opencraft-core` only. |
-| `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Neutral pack format and validation: `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement/caps, PNG decode, 16x16 resample and the deterministic `--validate-pack` renderer. Depends on `opencraft-core`, `toml` and `png`. |
+| `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Neutral pack format and validation: `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement/caps, PNG decode, 16x16 resample, deterministic allocation, patch precedence, placeholders, the FNV digest over raw u16 ids and the deterministic `--validate-pack` renderer. The game's `ContentRegistry` is a thin adapter. Depends on `opencraft-core`, `toml` and `png`. |
 | `crates/opencraft-worldgen` | `opencraft-worldgen` | `0.1.0` | Skeleton; M018/S06-S07 will add worldgen. |
 | `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the engine crates; proves reuse without the game. |
 
@@ -194,8 +194,11 @@ bounded file helpers. `opencraft-content` now owns the pack format: the S04
 slice moved the manifest/v2 parsers, per-entry diagnostics, asset confinement
 and caps, PNG decode, 16x16 resample and the deterministic `--validate-pack`
 renderer into the crate, and the game consumes them through historical
-module-path re-exports. Worldgen/prefab/village extraction remains a future
-M018 slice (S06-S07) with S08 closure; it is not implemented yet.
+module-path re-exports. S05 moved deterministic allocation, patch precedence,
+placeholder allocation, the FNV-1a content digest and the changed-stack notice
+into `opencraft_content::catalog` over neutral raw `u16` ids, leaving the game's
+`ContentRegistry` as a thin adapter. Worldgen/prefab/village extraction remains
+a future M018 slice (S06-S07) with S08 closure; it is not implemented yet.
 
 The pack and worldgen formats stay frozen at their current versions. `.mcvx`
 now writes v10 through `opencraft-storage`; any future save-format change needs

@@ -265,8 +265,8 @@ The workspace also contains the engine crates and their external reuse proof und
 *   `opencraft-physics`: AABB collision, raycasting, and movement solvers over the `BlockQuery` trait.
 *   `opencraft-pathfinding`: Steering plus nav-grid A*. Not yet wired into mobs.
 *   `opencraft-storage`: The neutral sectioned save archive, canonical chunk-section codec, and bounded file I/O. Depends on `opencraft-core` only.
-*   `opencraft-content`: The neutral pack format and validation layer — `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement and caps, PNG decode, 16x16 resample, and the deterministic `--validate-pack` renderer. Depends on `opencraft-core`, `toml` and `png`.
+*   `opencraft-content`: The neutral pack format and validation layer — `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement and caps, PNG decode, 16x16 resample, deterministic allocation, patch precedence, placeholders and the FNV digest over raw u16 ids, and the deterministic `--validate-pack` renderer. The game's `ContentRegistry` is a thin adapter over this crate. Depends on `opencraft-core`, `toml` and `png`.
 *   `opencraft-worldgen`: Skeleton for world generation; M018/S06-S07 will add worldgen.
-*   `engine-reuse-proof`: An external, device-free consumer of the engine crates. It runs headless, prints a deterministic 19-line report, has no `opencraft` dependency, and never creates a GPU adapter.
+*   `engine-reuse-proof`: An external, device-free consumer of the engine crates. It runs headless, prints a deterministic 20-line report, has no `opencraft` dependency, and never creates a GPU adapter.
 
 See [the engine crate guide](docs/CRATES.md) for the workspace layout, neutral-API rules, gate commands and M018 scope.
