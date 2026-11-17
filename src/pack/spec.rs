@@ -109,12 +109,9 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
         Some(root) => v2::parse_content(root, manifest.format_version),
         None => (PackContentSpec::default(), Vec::new(), Vec::new()),
     };
-    // The v2 gate still speaks the game's settings warning type; fold it into
-    // the spec's neutral list so every authored fallback keeps one order.
-    warnings.extend(content_warnings.into_iter().map(|warning| PackWarning {
-        field: warning.field,
-        reason: warning.reason,
-    }));
+    // The parser already speaks the neutral warning type, so the v2 gate's
+    // warnings append unchanged and every authored fallback keeps one order.
+    warnings.extend(content_warnings);
     if manifest.format_version == PackFormat::V2 {
         v2::load_content_assets(dir, &mut content, &mut diagnostics);
     }
