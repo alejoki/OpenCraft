@@ -42,6 +42,7 @@ use crate::biome::{
     biome_at_seeded, biome_label, Biome, BiomeTag, BEACH_BAND, MOUNTAIN_HEIGHT_THRESHOLD, SEA_LEVEL,
 };
 use crate::block::{BLOCK_AIR, BLOCK_COBBLESTONE, BLOCK_DIRT};
+use crate::buffer::ChunkBuffer;
 use crate::height::terrain_height_at_seeded;
 use crate::prefab::{Direction, Prefab, PrefabCatalog, MAX_PREFAB_FILE_BYTES, WORLDGEN_DIR};
 use crate::ruin::ruin_covers;
@@ -862,9 +863,8 @@ impl VillageCatalog {
 /// `anchor`.
 ///
 /// Shared by [`VillageCatalog::chunk_may_hold_village`] (the affordable pre-
-/// plan gate) and the game-side `place_village_cells` writer (the emission-time
-/// early return), so the two cannot disagree about which chunks are worth a
-/// plan.
+/// plan gate) and [`place_village_cells`] (the emission-time early return), so
+/// the two cannot disagree about which chunks are worth a plan.
 pub fn chunk_intersects_anchor_radius(pos: ChunkPos, anchor: [i32; 2]) -> bool {
     let chunk_min_x = pos.x * CHUNK_SIZE as i32;
     let chunk_max_x = chunk_min_x + CHUNK_SIZE as i32 - 1;
@@ -1833,6 +1833,67 @@ pub fn village_plan<'a>(
     catalog: &'a VillageCatalog,
 ) -> Option<VillagePlan<'a>> {
     village_plan_with_spawn(cell, seed, catalog, find_spawn_column(seed))
+}
+
+/// Write this chunk's share of the village plan into `buffer`.
+///
+/// Called by [`crate::terrain::generate_chunk_with_context`] as the final
+/// generation pass. Pure in `(pos, seed, catalog, spawn_column)`: it never
+/// reads a neighbour chunk, keeps no state and ignores the season. All
+/// geometry comes from [`village_plan_with_spawn`] and
+/// [`VillagePlan::cells_for_chunk`]; this writer never re-derives a single
+/// cell.
+///
+/// The early returns are deliberately conservative and cheap, in this order:
+/// 1. the chunk's own cell has no site;
+/// 2. the chunk does not intersect the anchor radius box;
+/// 3. the whole cell has no plan (gated out, unfit root, or too close to
+///    spawn);
+/// 4. the plan's exact bounds miss this chunk.
+///
+/// Only then is the plan materialized for this chunk. Every emitted cell is
+/// asserted to belong to `pos` in debug builds.
+pub fn place_village_cells(
+    buffer: &mut ChunkBuffer,
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn_column: Option<(i32, i32)>,
+) {
+    let cell = village_cell_at(pos.x * CHUNK_SIZE as i32, pos.z * CHUNK_SIZE as i32);
+    let Some(site) = catalog.site(cell, seed) else {
+        return;
+    };
+    if !chunk_intersects_anchor_radius(pos, site.anchor) {
+        return;
+    }
+    let spawn = spawn_column.unwrap_or_else(|| find_spawn_column(seed));
+    let Some(plan) = village_plan_with_spawn(site.cell, seed, catalog, spawn) else {
+        return;
+    };
+    if !plan.bounds.intersects_chunk(pos) {
+        return;
+    }
+
+    let chunk_size = CHUNK_SIZE as i32;
+    for block in plan.cells_for_chunk(pos) {
+        let [wx, wy, wz] = block.world;
+        debug_assert_eq!(
+            ChunkPos::new(
+                wx.div_euclid(chunk_size),
+                wy.div_euclid(chunk_size),
+                wz.div_euclid(chunk_size),
+            ),
+            pos,
+            "village plan emitted a cell outside the chunk being generated"
+        );
+        buffer.set(
+            wx.rem_euclid(chunk_size) as usize,
+            wy.rem_euclid(chunk_size) as usize,
+            wz.rem_euclid(chunk_size) as usize,
+            block.block,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3795,5 +3856,50 @@ junction = ["test_hub"]
         let (second, diagnostics) = VillageCatalog::load_sorted(&checked_in_worldgen());
         assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
         assert_eq!(catalog.fingerprint(), second.fingerprint());
+    }
+
+    /// The crate-side writer must insert every planned cell at its chunk-local
+    /// position as the plan's raw block id. Mirrors the game adapter test that
+    /// pins the same plan through the game `Chunk`.
+    #[test]
+    fn place_village_cells_round_trips_raw_ids_into_the_chunk_buffer() {
+        let (catalog, diagnostics) = VillageCatalog::load_sorted(&checked_in_worldgen());
+        assert!(diagnostics.is_empty(), "diagnostics: {diagnostics:?}");
+        let seed = 424_242;
+        let cell = VillageCell { x: 6, z: -6 };
+        let spawn = find_spawn_column(seed);
+        let plan =
+            village_plan_with_spawn(cell, seed, &catalog, spawn).expect("pinned cell must plan");
+
+        let cs = CHUNK_SIZE as i32;
+        let mut target = None;
+        'search: for cy in plan.bounds.min_y.div_euclid(cs)..=plan.bounds.max_y.div_euclid(cs) {
+            for cz in plan.bounds.min_z.div_euclid(cs)..=plan.bounds.max_z.div_euclid(cs) {
+                for cx in plan.bounds.min_x.div_euclid(cs)..=plan.bounds.max_x.div_euclid(cs) {
+                    let pos = ChunkPos::new(cx, cy, cz);
+                    if !plan.cells_for_chunk(pos).is_empty() {
+                        target = Some(pos);
+                        break 'search;
+                    }
+                }
+            }
+        }
+        let pos = target.expect("the pinned plan must own at least one non-empty chunk");
+        let cells = plan.cells_for_chunk(pos);
+        let mut buffer = ChunkBuffer::uniform(BLOCK_AIR);
+        place_village_cells(&mut buffer, pos, seed, &catalog, Some(spawn));
+        for cell in &cells {
+            let [wx, wy, wz] = cell.world;
+            assert_eq!(
+                buffer.get(
+                    wx.rem_euclid(cs) as usize,
+                    wy.rem_euclid(cs) as usize,
+                    wz.rem_euclid(cs) as usize,
+                ),
+                cell.block,
+                "cell {:?} did not round-trip through the crate writer",
+                cell.world
+            );
+        }
     }
 }

@@ -1,8 +1,9 @@
 //! Neutral world generation for OpenCraft.
 //!
 //! This crate owns biome/tag data, height and ruin queries, prefab and village
-//! codecs/plans/placement, loot vocabulary and terrain generation over raw
-//! `u16` block ids.
+//! codecs/plans/placement, loot vocabulary, and the complete terrain generation
+//! body — caves, ores, ruins, trees, seasonal surfaces, pack patches, villages —
+//! over a neutral raw-`u16` [`buffer::ChunkBuffer`].
 //!
 //! Neutrality: no module may import the `opencraft` game crate, a game
 //! `BlockId`/`ItemId`/`ContentRegistry`/`Chunk`/`WorldSession`, or a GPU,
@@ -11,11 +12,14 @@
 
 pub mod biome;
 pub mod block;
+pub mod buffer;
 pub mod height;
 pub mod loot;
 mod noise;
 pub mod prefab;
 pub mod ruin;
+pub mod season;
 pub mod spawn;
+pub mod terrain;
 pub mod tree;
 pub mod village;
