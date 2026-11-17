@@ -14,7 +14,10 @@
 //! layer/icon constants here are the single authoritative values both the
 //! crate and the game report.
 
+mod build;
 mod digest;
+
+pub use build::build_catalog;
 
 use std::collections::BTreeMap;
 

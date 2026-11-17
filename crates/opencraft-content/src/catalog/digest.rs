@@ -11,13 +11,8 @@
 //! provenance sources, `[builtin_icons]` and diagnostics are all excluded, so
 //! a live texture edit never moves the digest.
 //
-// The pack-stack builder in `catalog::build` is the in-crate consumer of this
-// module; it lands in the next task of this slice. Until it wires
-// `compute_digest`, the digest surface is exercised only by this module's
-// tests, so keep a dead-code allow scoped to this module rather than letting
-// the staged extraction fail `-D warnings`. Drop it when the builder calls in.
-#![allow(dead_code)]
-
+// The pack-stack builder in `catalog::build` is the consumer of this
+// module, so nothing here is staged dead code.
 use std::collections::BTreeMap;
 
 use crate::spec::{
