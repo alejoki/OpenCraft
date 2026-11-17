@@ -196,7 +196,8 @@ fn mined_village_block_survives_reload_and_unedited_cells_match() {
         .map(|cell| {
             let block = session_block(&session, cell.world);
             assert_eq!(
-                block, cell.block,
+                block,
+                BlockId::from_raw(cell.block),
                 "the pre-save stream must reproduce the plan at {:?}",
                 cell.world
             );
@@ -208,7 +209,7 @@ fn mined_village_block_survives_reload_and_unedited_cells_match() {
     // is the only world state a save carries.
     let mined = cells
         .iter()
-        .find(|cell| cell.block != BlockId::Air)
+        .find(|cell| BlockId::from_raw(cell.block) != BlockId::Air)
         .expect("the pinned plan must place at least one non-Air block")
         .world;
     session
@@ -301,7 +302,8 @@ fn pre_m015_world_gains_villages_and_keeps_its_edit() {
         .find_map(|&pos| {
             let cells = plan.cells_for_chunk(pos);
             let other = cells.iter().find(|cell| {
-                cell.block != BlockId::Air && session_block(&legacy, cell.world) != cell.block
+                BlockId::from_raw(cell.block) != BlockId::Air
+                    && session_block(&legacy, cell.world) != BlockId::from_raw(cell.block)
             })?;
             let edit = cells.iter().find(|cell| cell.world != other.world)?;
             Some((*edit, *other))
@@ -345,7 +347,7 @@ fn pre_m015_world_gains_villages_and_keeps_its_edit() {
     // The rest of the same chunk gains the village it never had.
     assert_eq!(
         session_block(&reloaded, other.world),
-        other.block,
+        BlockId::from_raw(other.block),
         "the village must be applied around the edit at {:?}",
         other.world
     );
@@ -371,7 +373,7 @@ fn save_is_v10_and_carries_no_prefab_name() {
         chunks
             .iter()
             .flat_map(|&pos| plan.cells_for_chunk(pos))
-            .find(|cell| cell.block != BlockId::Air)
+            .find(|cell| BlockId::from_raw(cell.block) != BlockId::Air)
             .map(|cell| cell.world)
             .expect("the pinned plan must place at least one non-Air block")
     };

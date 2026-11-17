@@ -4698,8 +4698,8 @@ mod tests {
 
     use crate::world::prefab::{Prefab, PrefabBlock, WORLDGEN_DIR};
     use crate::world::village::{
-        catalog_for_tests, village_cell_at, village_plan_with_spawn, VillageCatalog, VillageCell,
-        VillageDefinition, VillagePlan,
+        village_cell_at, village_plan_with_spawn, VillageCatalog, VillageCell, VillageDefinition,
+        VillagePlan,
     };
     use std::collections::HashSet;
     use std::path::Path;
@@ -4786,7 +4786,7 @@ mod tests {
             well: Vec::new(),
             junction: Vec::new(),
         };
-        catalog_for_tests(vec![prefab], vec![definition])
+        VillageCatalog::from_content(vec![prefab], vec![definition])
     }
 
     /// The empty-catalog contract: `villages: None` and an empty catalog must
@@ -4909,7 +4909,7 @@ mod tests {
                         let local = local_cell(cell.world);
                         assert_eq!(
                             generated.get(local.0, local.1, local.2),
-                            cell.block,
+                            BlockId::from_raw(cell.block),
                             "village cell {:?} was not materialized in {pos:?}",
                             cell.world
                         );
@@ -4977,7 +4977,7 @@ mod tests {
                         // Only a non-Cobblestone surface cell can prove the
                         // ordering: a Cobblestone village cell is
                         // indistinguishable from the patch block.
-                        if cell.block == BlockId::Cobblestone {
+                        if BlockId::from_raw(cell.block) == BlockId::Cobblestone {
                             continue;
                         }
                         let [wx, wy, wz] = cell.world;
@@ -5000,7 +5000,7 @@ mod tests {
                         );
                         assert_eq!(
                             assembled.get(local.0, local.1, local.2),
-                            cell.block,
+                            BlockId::from_raw(cell.block),
                             "pack patch beat the village pass at {:?}",
                             cell.world
                         );
@@ -5050,7 +5050,7 @@ mod tests {
                             let local = local_cell(cell.world);
                             assert_eq!(
                                 chunk.get(local.0, local.1, local.2),
-                                cell.block,
+                                BlockId::from_raw(cell.block),
                                 "village cell {:?} changed in {season:?}",
                                 cell.world
                             );
@@ -5142,7 +5142,7 @@ mod tests {
                                 let local = local_cell(cell.world);
                                 assert_eq!(
                                     generated.get(local.0, local.1, local.2),
-                                    cell.block,
+                                    BlockId::from_raw(cell.block),
                                     "fast path clipped village cell {:?} in {pos:?}",
                                     cell.world
                                 );

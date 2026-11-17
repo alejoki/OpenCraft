@@ -4092,7 +4092,9 @@ mod tests {
         let mut village_cells = 0usize;
         for &pos in &plan_chunks {
             for cell in plan.cells_for_chunk(pos) {
-                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2]) == cell.block {
+                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2])
+                    == BlockId::from_raw(cell.block)
+                {
                     village_cells += 1;
                 }
             }
@@ -4392,7 +4394,7 @@ mod tests {
                         let (lx, ly, lz) = local_cell(cell.world);
                         assert_eq!(
                             chunk.get(lx, ly, lz),
-                            cell.block,
+                            BlockId::from_raw(cell.block),
                             "village cell {:?} missing from generated chunk {pos:?}",
                             cell.world
                         );
@@ -4469,7 +4471,7 @@ mod tests {
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
         for cell in &plan_cells {
             let (lx, ly, lz) = local_cell(cell.world);
-            assert_eq!(summer_chunk.get(lx, ly, lz), cell.block);
+            assert_eq!(summer_chunk.get(lx, ly, lz), BlockId::from_raw(cell.block));
         }
 
         let mut mgr =
@@ -4507,7 +4509,7 @@ mod tests {
             let (lx, ly, lz) = local_cell(cell.world);
             assert_eq!(
                 swapped.get(lx, ly, lz),
-                cell.block,
+                BlockId::from_raw(cell.block),
                 "season rollover erased village cell {:?}",
                 cell.world
             );

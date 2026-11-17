@@ -2061,7 +2061,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                         session
                             .world
                             .get_block(cell.world[0], cell.world[1], cell.world[2])
-                            == cell.block
+                            == BlockId::from_raw(cell.block)
                     })
             })
         }

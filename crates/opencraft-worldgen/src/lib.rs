@@ -18,3 +18,4 @@ pub mod prefab;
 pub mod ruin;
 pub mod spawn;
 pub mod tree;
+pub mod village;
