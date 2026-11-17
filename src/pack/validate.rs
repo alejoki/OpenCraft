@@ -6,13 +6,14 @@
 //! was rejected, so validation is the loud counterpart to the game's
 //! never-fail loader.
 //!
-//! Output is deterministic across runs: entries are emitted in sorted order and
-//! identical diagnostic lines are printed once.
+//! The deterministic renderer lives in `opencraft_content::validate`; this
+//! module keeps the folder guards, pack load and registry build (the only
+//! game-side seam).
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::content::spec::{ContentDiagnostic, PackContentSpec, Severity, WorldgenKind};
+use opencraft_content::validate::{render_lines, summary};
+
 use crate::content::{build_registry, ContentRegistry, PackIdentity};
 use crate::pack::spec::load_spec_from_dir;
 
@@ -58,123 +59,12 @@ pub fn validate_pack_lines(packs_root: &Path, name: &str) -> (Vec<String>, bool)
         &[(identity, spec.content.clone())],
     );
 
-    // One line per distinct diagnostic. BTreeSet gives both deduplication and
-    // deterministic ordering; entry-scoped lines group under their
-    // `<kind> <id>` prefix because every severity shares that prefix.
-    let mut rendered: BTreeSet<String> = BTreeSet::new();
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
+    // Parser diagnostics live beside the accepted content, so merge them with
+    // the registry report before handing the whole set to the renderer.
+    let mut diagnostics = spec.diagnostics.clone();
+    diagnostics.extend(report.diagnostics.iter().cloned());
 
-    for diagnostic in spec.diagnostics.iter().chain(report.diagnostics.iter()) {
-        let level = match diagnostic.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-        };
-        let line = diagnostic_line(level, name, diagnostic);
-        if rendered.insert(line) {
-            match diagnostic.severity {
-                Severity::Error => errors += 1,
-                Severity::Warning => warnings += 1,
-            }
-        }
-    }
-
-    // Manifest and presentation warnings (v1 content-array gating, corrupt
-    // texture/sound fallbacks) are warning-level and never change the exit
-    // code. `field` is the authored file or setting that failed.
-    for warning in &spec.warnings {
-        let line = format!("warning: {}: {}", warning.field, warning.reason);
-        if rendered.insert(line) {
-            warnings += 1;
-        }
-    }
-
-    // An accepted entry still prints `ok:` unless a diagnostic rejected it.
-    // Rejected entries never reach `spec.content`, so their error lines stand
-    // alone; accepted entries with warning lines keep both.
-    let failed_entries: BTreeSet<&str> = spec
-        .diagnostics
-        .iter()
-        .chain(report.diagnostics.iter())
-        .filter(|diagnostic| diagnostic.severity == Severity::Error)
-        .map(|diagnostic| diagnostic.entry.as_str())
-        .collect();
-
-    for entry in content_entries(&spec.content) {
-        if failed_entries.contains(entry.as_str()) {
-            continue;
-        }
-        rendered.insert(format!("ok: {entry}"));
-    }
-
-    let mut lines: Vec<String> = rendered.into_iter().collect();
-    lines.push(summary(
-        name,
-        report.entries + spec.content.builtin_icons.len(),
-        errors,
-        warnings,
-    ));
-    (lines, errors == 0)
-}
-
-/// Render one diagnostic line, special-casing pack-level diagnostics.
-fn diagnostic_line(level: &str, name: &str, diagnostic: &ContentDiagnostic) -> String {
-    if diagnostic.entry == "pack" {
-        format!("{level}: pack {name}: {}", diagnostic.reason)
-    } else {
-        format!("{level}: {}: {}", diagnostic.entry, diagnostic.reason)
-    }
-}
-
-/// Stable `<kind> <id>` labels for every accepted authored entry.
-///
-/// Worldgen rules have no id of their own, so they use the same
-/// `worldgen <kind> <block>` shape the parser puts in diagnostics.
-fn content_entries(spec: &PackContentSpec) -> Vec<String> {
-    let mut entries = Vec::new();
-    entries.extend(
-        spec.blocks
-            .iter()
-            .map(|entry| format!("block {}", entry.id)),
-    );
-    entries.extend(spec.items.iter().map(|entry| format!("item {}", entry.id)));
-    entries.extend(spec.tiers.iter().map(|entry| format!("tier {}", entry.id)));
-    entries.extend(spec.tools.iter().map(|entry| format!("tool {}", entry.id)));
-    entries.extend(
-        spec.recipes
-            .iter()
-            .map(|entry| format!("recipe {}", entry.id)),
-    );
-    entries.extend(spec.worldgen.iter().map(worldgen_label));
-    entries.extend(
-        spec.block_patches
-            .iter()
-            .map(|entry| format!("block_patch {}", entry.id)),
-    );
-    entries.extend(
-        spec.recipe_patches
-            .iter()
-            .map(|entry| format!("recipe_patch {}", entry.id)),
-    );
-    entries.extend(
-        spec.builtin_icons
-            .keys()
-            .map(|name| format!("builtin_icon {name}")),
-    );
-    entries
-}
-
-/// `<kind> <block>` label matching the v2 parser's worldgen diagnostics.
-fn worldgen_label(entry: &crate::content::spec::WorldgenEntry) -> String {
-    match &entry.kind {
-        WorldgenKind::Ore { block, .. } => format!("worldgen ore {block}"),
-        WorldgenKind::Patch { block, .. } => format!("worldgen patch {block}"),
-    }
-}
-
-/// One summary line shared by success, failure and missing-pack paths.
-fn summary(name: &str, entries: usize, errors: usize, warnings: usize) -> String {
-    format!("validate-pack: {name}: {entries} entries, {errors} errors, {warnings} warnings")
+    render_lines(name, &spec.content, &diagnostics, &spec.warnings)
 }
 
 #[cfg(test)]

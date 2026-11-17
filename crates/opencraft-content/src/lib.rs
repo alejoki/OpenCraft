@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod resample;
 pub mod spec;
 pub mod v2;
+pub mod validate;
 pub mod vocabulary;
 mod warning;
 
