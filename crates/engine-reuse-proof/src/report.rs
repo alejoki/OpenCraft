@@ -1,4 +1,4 @@
-//! Aggregated, deterministic [`ProofReport`] over the four proof areas.
+//! Aggregated, deterministic [`ProofReport`] over the five proof areas.
 //!
 //! The report is the runnable surface of the consumer: the `engine-reuse-proof`
 //! bin prints it and exits 0. Every line is a `key=value` pair, floats use a
@@ -8,6 +8,7 @@
 
 use std::fmt;
 
+use crate::content::ContentProof;
 use crate::gfx::GfxProof;
 use crate::motion::MotionProof;
 use crate::physics::PhysicsProof;
@@ -24,6 +25,8 @@ pub struct ProofReport {
     pub motion: MotionProof,
     /// Archive container and chunk-section codec proof.
     pub storage: StorageProof,
+    /// Pack-parse and asset-pipeline proof.
+    pub content: ContentProof,
 }
 
 /// Format a proof float with fixed precision, normalizing negative zero.
@@ -88,6 +91,8 @@ impl fmt::Display for ProofReport {
         writeln!(f, "storage.archive_bytes={}", self.storage.archive_bytes)?;
         writeln!(f, "storage.section_count={}", self.storage.section_count)?;
         writeln!(f, "storage.chunk_edits={}", self.storage.chunk_edits)?;
+
+        writeln!(f, "content.pack_entries={}", self.content.pack_entries)?;
         Ok(())
     }
 }
@@ -96,7 +101,7 @@ impl fmt::Display for ProofReport {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 18] = [
+    const KEYS: [&str; 19] = [
         "physics.landing_y=",
         "physics.wall_x=",
         "physics.ray_block=",
@@ -115,6 +120,7 @@ mod tests {
         "storage.archive_bytes=",
         "storage.section_count=",
         "storage.chunk_edits=",
+        "content.pack_entries=",
     ];
 
     #[test]
@@ -124,6 +130,7 @@ mod tests {
             gfx: crate::gfx::run(),
             motion: crate::motion::run(),
             storage: crate::storage::run(),
+            content: crate::content::run(),
         };
         let rendered = report.to_string();
 

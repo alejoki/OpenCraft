@@ -9,11 +9,13 @@ game-side and may be considered for a later move.
 The repository has two layers:
 
 - The **game package** `opencraft` at the repository root owns the window,
-  gameplay, world and content policy, save/pack/worldgen formats, and every
-  player-facing rule.
+  gameplay, world and content policy, the worldgen format and every
+  player-facing rule. It consumes the crate-owned save archive
+  (`opencraft-storage`) and pack format (`opencraft-content`).
 - The **neutral engine crates** under `crates/` own reusable math, geometry,
-  collision, movement, pathfinding and GPU mechanisms. They never depend on the
-  game package and never see a game type.
+  collision, movement, pathfinding, GPU mechanisms, save archives and pack
+  parsing/validation. They never depend on the game package and never see a
+  game type.
 
 ## Workspace layout
 
@@ -25,7 +27,7 @@ The repository has two layers:
 | `crates/opencraft-physics` | `opencraft-physics` | `0.1.0` | AABB collision, raycast/sweep and the movement solver over `BlockQuery`. |
 | `crates/opencraft-pathfinding` | `opencraft-pathfinding` | `0.1.0` | Steering primitives plus deterministic nav-grid A* over `BlockQuery`. |
 | `crates/opencraft-storage` | `opencraft-storage` | `0.1.0` | Neutral sectioned save archive, canonical chunk-section codec and bounded file I/O; depends on `opencraft-core` only. |
-| `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Skeleton; M018/S04-S05 will add pack/content. |
+| `crates/opencraft-content` | `opencraft-content` | `0.1.0` | Neutral pack format and validation: `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement/caps, PNG decode, 16x16 resample and the deterministic `--validate-pack` renderer. Depends on `opencraft-core`, `toml` and `png`. |
 | `crates/opencraft-worldgen` | `opencraft-worldgen` | `0.1.0` | Skeleton; M018/S06-S07 will add worldgen. |
 | `crates/engine-reuse-proof` | `engine-reuse-proof` | `0.1.0` | External, device-free consumer of the engine crates; proves reuse without the game. |
 
@@ -53,10 +55,11 @@ opencraft (game)
 ├── opencraft-pathfinding ──> opencraft-core
 └── opencraft-storage ───> opencraft-core
 
-opencraft-content    (skeleton: no crate dependencies yet)
+opencraft-content ────> opencraft-core + toml + png
 opencraft-worldgen   (skeleton: no crate dependencies yet)
 
 engine-reuse-proof
+├── opencraft-content
 ├── opencraft-core
 ├── opencraft-gfx
 ├── opencraft-physics
@@ -76,11 +79,14 @@ engine-reuse-proof
 - `opencraft-storage` depends on `opencraft-core` only. It has no game, GPU or
   windowing dependency and no `opencraft-content`, `opencraft-worldgen`, `toml`
   or `png` edge.
-- `opencraft-content` and `opencraft-worldgen` are dependency-free skeletons for
-  now. `opencraft-content` must not depend on `opencraft-storage` or
-  `opencraft-worldgen`; `opencraft-worldgen` must not depend on
-  `opencraft-storage` (it may depend on `opencraft-content` once S06 lands).
-- `engine-reuse-proof` depends only on the five engine crates plus `glam 0.27`.
+- `opencraft-content` depends on `opencraft-core`, `toml` and `png`, with
+  `tempfile` as a dev-dependency only. It has no game, GPU, windowing, audio,
+  storage or worldgen edge. Its file I/O is the bounded pack reader
+  (`read_manifest_text`, `read_asset_bytes`, `decode_png_rgba`), which caps
+  every read and rejects non-regular files. `opencraft-worldgen` is still a
+  dependency-free skeleton; it must not depend on `opencraft-storage` (it may
+  depend on `opencraft-content` once S06 lands).
+- `engine-reuse-proof` depends only on the six engine crates plus `glam 0.27`.
   Its manifest has no direct GPU, windowing, serialization or temp-file
   dependency. Its `wgpu` edge is transitive through `opencraft-gfx` and is never
   called: the consumer is device-free.
@@ -119,7 +125,7 @@ crate. These stay game-side:
 - `daycycle` celestial math;
 - hotbar layout and the NDC rectangle computation;
 - mob and arrow scene assembly, including model placement and animation;
-- save, pack and worldgen formats.
+- save-session policy, content-registry policy and worldgen formats.
 
 Pathfinding A* is proven by crate tests and the external consumer but remains
 unwired in mob behavior. Wiring it in is a future gameplay decision, not an
@@ -184,9 +190,12 @@ surface landed in S01. Save v10 is now live through that crate: the S02
 sectioned writer/reader, sorted kind-tagged content table, per-chunk palette
 sections, crop section, eager content-table resolution and forward migration
 from v1-v9 are implemented, and the game's save I/O routes through the neutral
-bounded file helpers. Content/pack extraction and worldgen/prefab/village
-extraction remain future M018 slices (S04-S07) with S08 closure; neither is
-implemented yet.
+bounded file helpers. `opencraft-content` now owns the pack format: the S04
+slice moved the manifest/v2 parsers, per-entry diagnostics, asset confinement
+and caps, PNG decode, 16x16 resample and the deterministic `--validate-pack`
+renderer into the crate, and the game consumes them through historical
+module-path re-exports. Worldgen/prefab/village extraction remains a future
+M018 slice (S06-S07) with S08 closure; it is not implemented yet.
 
 The pack and worldgen formats stay frozen at their current versions. `.mcvx`
 now writes v10 through `opencraft-storage`; any future save-format change needs

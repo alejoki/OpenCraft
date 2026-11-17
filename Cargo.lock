@@ -596,6 +596,7 @@ name = "engine-reuse-proof"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "opencraft-content",
  "opencraft-core",
  "opencraft-gfx",
  "opencraft-pathfinding",

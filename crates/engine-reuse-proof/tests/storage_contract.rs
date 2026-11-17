@@ -185,7 +185,7 @@ fn consumer_proof_reports_the_archive_and_codec_values() {
 fn proof_report_renders_the_three_storage_lines() {
     let rendered = ProofReport::to_string(&engine_reuse_proof::run());
 
-    assert_eq!(rendered.lines().count(), 18, "four proof groups of lines");
+    assert_eq!(rendered.lines().count(), 19, "five proof groups of lines");
     for line in [
         "storage.archive_bytes=84",
         "storage.section_count=2",

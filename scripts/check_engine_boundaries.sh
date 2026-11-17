@@ -168,6 +168,16 @@ self_test() {
         fail "self-test accepted a content -> worldgen edge"
     fi
 
+    local neutral_content_tree=$'opencraft-content v0.1.0\n├── opencraft-core v0.1.0\n├── png v0.17.16\n└── toml v1.1.8+spec-1.1.0'
+    if violation=$(tree_violation opencraft-content "$neutral_content_tree"); then
+        fail "self-test rejected a neutral opencraft-content tree: $violation"
+    fi
+
+    local content_wgpu_tree=$'opencraft-content v0.1.0\n└── wgpu v0.19.0'
+    if ! violation=$(tree_violation opencraft-content "$content_wgpu_tree"); then
+        fail "self-test accepted wgpu in opencraft-content"
+    fi
+
     echo "PASS: boundary self-test"
 }
 
