@@ -9091,6 +9091,66 @@ mod tests {
         );
     }
 
+    /// D326: the O(1) autosave snapshot must be isolated from edits made
+    /// after the projection is handed to the writer. `ChunkEditMap::clone`
+    /// is an `Arc` bump, so this pins copy-on-write at both the outer map and
+    /// the per-chunk section instead of only comparing map counts.
+    #[test]
+    fn autosave_snapshot_isolated_from_later_edits() {
+        let registry = ContentRegistry::builtin().clone();
+        let mut data = v10_rich_data();
+        let existing = ChunkPos::new(0, 0, 0);
+        let existing_local = linear_index(0, 0, 0) as u16;
+        let new_chunk = ChunkPos::new(6, -3, 2);
+        let new_local = linear_index(7, 1, 5) as u16;
+
+        // The autosave snapshot path: `WorldSaveData::clone` shares the edit
+        // map Arcs, then the archive is encoded from the living `data`.
+        let snapshot = data.clone();
+        let before = v10_archive(&data, &registry);
+
+        data.chunk_edits
+            .insert_block(existing, existing_local, BlockId::Stone);
+        data.chunk_edits
+            .insert_block(new_chunk, new_local, BlockId::Brick);
+
+        assert_eq!(
+            v10_archive(&snapshot, &registry),
+            before,
+            "an in-flight autosave snapshot must not observe later edits"
+        );
+        assert_eq!(
+            snapshot.chunk_edits[&existing].get(&existing_local),
+            Some(&BlockId::Dirt),
+            "the snapshot keeps the pre-edit block value"
+        );
+        assert!(!snapshot.chunk_edits.contains_key(&new_chunk));
+
+        let loaded_before = load_v10_bytes(before.clone(), &registry).expect("snapshot bytes load");
+        assert_eq!(
+            loaded_before.data.chunk_edits[&existing].get(&existing_local),
+            Some(&BlockId::Dirt),
+            "the written archive still decodes to the old block value"
+        );
+
+        let after = v10_archive(&data, &registry);
+        assert_ne!(
+            after, before,
+            "edits after the snapshot must change the re-encoded bytes"
+        );
+        let loaded_after = load_v10_bytes(after, &registry).expect("mutated bytes load");
+        assert_eq!(
+            loaded_after.data.chunk_edits[&existing].get(&existing_local),
+            Some(&BlockId::Stone),
+            "the mutated save carries the overwritten block"
+        );
+        assert_eq!(
+            loaded_after.data.chunk_edits[&new_chunk].get(&new_local),
+            Some(&BlockId::Brick),
+            "the mutated save carries the newly added chunk"
+        );
+    }
+
     #[test]
     fn v10_bytes_are_independent_of_chunk_insertion_order() {
         let entries = [
