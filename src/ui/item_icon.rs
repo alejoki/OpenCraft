@@ -28,7 +28,7 @@ use super::inventory::{InventoryMode, InventoryPanel, Rect};
 use super::palette::{self, PaletteLayout, PaletteScreen};
 use crate::content::{ContentRegistry, PACK_ICON_BASE, PACK_ICON_CAP};
 use crate::player::inventory::{
-    Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolTier,
+    Inventory, Item, ItemId, Material, RecipePreview, ToolKind, ToolKindTiers, ToolTier,
 };
 use crate::world::block::BlockId;
 use opencraft_gfx::context::RenderContext;

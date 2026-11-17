@@ -220,35 +220,26 @@ impl Material {
 }
 
 /// Tool shape. Tools are always non-stackable and carry durability.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ToolKind {
-    Pickaxe,
-    Axe,
-    Shovel,
-    Hoe,
-    // Appended after Hoe; these are the trades the melee/bow slices need.
-    Sword,
-    Bow,
-}
+///
+/// The enum is authored content and lives in `opencraft-content`; it is
+/// re-exported here so every game-side `inventory::ToolKind` path stays intact.
+pub use opencraft_content::spec::ToolKind;
 
-impl ToolKind {
-    pub const fn name(self) -> &'static str {
-        match self {
-            ToolKind::Pickaxe => "Pickaxe",
-            ToolKind::Axe => "Axe",
-            ToolKind::Shovel => "Shovel",
-            ToolKind::Hoe => "Hoe",
-            ToolKind::Sword => "Sword",
-            ToolKind::Bow => "Bow",
-        }
-    }
-
+/// Tier policy for a neutral [`ToolKind`].
+///
+/// Kept game-side because it pairs the authored kind with the game's
+/// [`ToolTier`] durability ladder; the crate must not know about tiers.
+pub trait ToolKindTiers {
     /// Tiers this kind is constructible in.
     ///
     /// The bow is deliberately wood-only (D133/MEM396): there is no stone or
     /// iron bow, so `(Bow, Stone)` and `(Bow, Iron)` must never become a valid
     /// [`Item`]. Swords exist in all three tiers.
-    pub const fn allowed_tiers(self) -> &'static [ToolTier] {
+    fn allowed_tiers(self) -> &'static [ToolTier];
+}
+
+impl ToolKindTiers for ToolKind {
+    fn allowed_tiers(self) -> &'static [ToolTier] {
         match self {
             ToolKind::Bow => &[ToolTier::Wood],
             ToolKind::Pickaxe

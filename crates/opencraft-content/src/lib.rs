@@ -1,9 +1,9 @@
 //! Neutral content-pack format, validation and asset vocabulary for OpenCraft.
 //!
-//! This crate owns the pack format/validation surface and the neutral name
-//! vocabulary, allocation, patches, placeholders and FNV digest. It carries no
-//! game block id, session state, GPU, windowing, audio, storage or worldgen
-//! dependency.
+//! This crate owns the pack format/validation surface, the neutral authored
+//! content model and name vocabulary, allocation, patches, placeholders and
+//! FNV digest. It carries no game block id, session state, GPU, windowing,
+//! audio, storage or worldgen dependency.
 //!
 //! Neutrality rules: the only allowed dependencies are `opencraft-core`, `toml`
 //! and `png`, with `tempfile` as a dev-dependency. No module here may import
@@ -13,3 +13,5 @@
 pub mod asset;
 pub mod decode;
 pub mod resample;
+pub mod spec;
+pub mod vocabulary;

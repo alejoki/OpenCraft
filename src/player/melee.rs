@@ -350,7 +350,7 @@ impl MeleeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::Material;
+    use crate::player::inventory::{Material, ToolKindTiers};
     use crate::world::mob::MobKind;
 
     fn item(id: ItemId) -> Item {

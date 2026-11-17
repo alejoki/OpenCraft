@@ -923,7 +923,7 @@ pub fn screen_labels_with(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::{Material, HOTBAR_SLOTS, MAIN_SLOTS};
+    use crate::player::inventory::{Material, ToolKindTiers, HOTBAR_SLOTS, MAIN_SLOTS};
 
     fn item(id: ItemId, count: u16) -> Item {
         Item::new(id, count).expect("test items are valid")

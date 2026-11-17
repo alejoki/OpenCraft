@@ -238,7 +238,7 @@ pub fn break_duration_for_pack_tier_with_rules(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::player::inventory::{ItemId, Material};
+    use crate::player::inventory::{ItemId, Material, ToolKindTiers};
 
     #[test]
     fn tool_rules_default_matches_constants() {
