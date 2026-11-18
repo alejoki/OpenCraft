@@ -98,6 +98,20 @@ The palette entries point at content-table indices of block entries. A chunk pal
 - Malformed, truncated, wrong-magic, unknown-codec, non-canonical directory, unknown-kind, and over-cap input fails closed with a typed error. The 256 MiB file cap and the temp-file-plus-rename atomic write are unchanged.
 - The config comparison is unchanged: section 7 holds the same `u16` schema plus `u64` effective-value digest, a changed config or schema shows one non-blocking notice, and a version 1-8 save carries no config record and therefore no notice.
 
+### Measured cold load
+
+The release harness measures the same deterministic fixture twice in one run: 10,000,000 Stone edits across 20,000 chunks (500 edits per chunk, seed 4242), written by the frozen v9 witness encoder and by the v10 writer. On the assembled M018 tree (release profile, rustc 1.99.1, AMD Ryzen AI 7 350), storage plus session setup p50 was 350.182 ms for v9 and 51.520 ms for v10, a 6.797x speedup. The frozen target is an exact 159.815 ms p50 (half the recorded 319.630 ms v9 baseline), and v10 uses 32.2% of it.
+
+The same-run correctness guardrails passed: first-area 95.638 ms against a 164.987 ms limit, full verify 52.287 ms against a 164.813 ms limit, the same 10,000,000 edits and 20,000 chunks in both directions, and checksum `0xd3ef88bdc7ae0ebc`. The v9-to-v10 migration leg also reports `byte_identical=true` with `unresolved=0`.
+
+The compact palette sections are what make this possible: each edited chunk body stores one sorted `u16` palette and its sorted `(local_index, palette_index)` pairs instead of a flat per-edit payload, so load decodes each section once and resolves it to block ids. The archive is not compressed — codec `0` is the only codec in v10 — and the measured v10 file is slightly larger than v9 because of the section directory and fixed bodies. The win is the sectioned layout and chunk-local palettes, not a smaller file.
+
+Rerun on an idle desktop:
+
+```bash
+cargo test --locked --release --lib -- --ignored cold_load_release_baseline --nocapture
+```
+
 ## Loading a save from an older version
 
 This build reads every version 1-9 save through the same load path. A version 1-8 file has no config record, so it loads with no config notice and remains playable; a version 9 file carries that record and compares it. If the effective config differs from the one the file was saved with, or the config schema differs, the game shows one non-blocking notice after the world is open. Malformed input fails closed with a named error instead of being guessed at.

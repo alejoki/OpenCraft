@@ -86,7 +86,7 @@ final pre-tag commit, before tagging.
 ```bash
 WORKFLOW=release.yml bash scripts/ci_gate.sh
 gh run download <run-id> --dir dist/rehearsal
-bash scripts/verify_release_artifacts.sh dist/rehearsal 0.2.2
+bash scripts/verify_release_artifacts.sh dist/rehearsal 0.3.0
 ```
 
 `verify_release_artifacts.sh` unpacks the archives and asserts that
@@ -116,21 +116,25 @@ WORKFLOW=ci.yml bash scripts/ci_gate.sh
 Then run the release-profile smoke subset locally:
 
 ```bash
-SMOKE_PROFILE=release bash scripts/presentation_smoke.sh
-SMOKE_PROFILE=release bash scripts/crafting_smoke.sh
-SMOKE_PROFILE=release bash scripts/worldgen_smoke.sh
-SMOKE_PROFILE=release bash scripts/modding_smoke.sh
 SMOKE_PROFILE=release bash scripts/combat_smoke.sh
+SMOKE_PROFILE=release bash scripts/content_smoke.sh
+SMOKE_PROFILE=release bash scripts/crafting_smoke.sh
+SMOKE_PROFILE=release bash scripts/creator_smoke.sh
+SMOKE_PROFILE=release bash scripts/modding_smoke.sh
+SMOKE_PROFILE=release bash scripts/presentation_smoke.sh
+SMOKE_PROFILE=release bash scripts/ui_smoke.sh
+SMOKE_PROFILE=release bash scripts/village_smoke.sh
+SMOKE_PROFILE=release bash scripts/worldgen_smoke.sh
 ```
 
-All five must exit 0. This is the last chance to notice a release-only
+All nine must exit 0. This is the last chance to notice a release-only
 regression (the release build drops the creator watcher, overlay, and trace).
 
 ## 6. Tag
 
 ```bash
-git tag -a v0.2.2 -m "OpenCraft 0.2.2"
-git push origin v0.2.2
+git tag -a v0.3.0 -m "OpenCraft 0.3.0"
+git push origin v0.3.0
 ```
 
 Always use an annotated tag. The tag name must match `v` + the `Cargo.toml`
@@ -140,10 +144,10 @@ tag triggers the package jobs and the publish job for that commit.
 ## 7. Verify the published release
 
 ```bash
-gh release view v0.2.2
-gh release download v0.2.2 --dir dist/published
-bash scripts/verify_release_artifacts.sh dist/published 0.2.2
-bash scripts/verify_release_page.sh v0.2.2 0.2.2
+gh release view v0.3.0
+gh release download v0.3.0 --dir dist/published
+bash scripts/verify_release_artifacts.sh dist/published 0.3.0
+bash scripts/verify_release_page.sh v0.3.0 0.3.0
 ```
 
 Check by eye and by script:
@@ -153,9 +157,9 @@ Check by eye and by script:
   `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` (releases published
   before D290, including v0.2.2, carry only the two portable archives; verify
   those with the verifier from that tag);
-- the release body is the contents of `docs/RELEASE-NOTES-0.2.2.md`;
+- the release body is the contents of `docs/RELEASE-NOTES-0.3.0.md`;
 - `verify_release_page.sh` finds the three asset names, `SmartScreen`, and
-  `version 9` in the published body;
+  `version 10` in the published body;
 - on Linux, extract the tarball and run `./opencraft --demo-ui` headlessly: it
   must print the `ui_demo:` digest lines and exit before opening a window.
 
@@ -170,7 +174,7 @@ To repeat the fresh-clone build locally on Linux:
 
 ```bash
 tmp=$(mktemp -d)
-git clone --depth 1 --branch v0.2.2 https://github.com/alejoki/OpenCraft.git "$tmp/opencraft"
+git clone --depth 1 --branch v0.3.0 https://github.com/alejoki/OpenCraft.git "$tmp/opencraft"
 cd "$tmp/opencraft"
 PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo test --workspace --locked
 PKG_CONFIG_PATH=/home/aleksi/minecraft-clone/.toolchain/alsa/usr/lib64/pkgconfig cargo build --release --locked
@@ -191,13 +195,13 @@ job repairs a partial release without hand-editing assets.
 If the tag is wrong, delete the release and the tag, fix, and re-tag:
 
 ```bash
-gh release delete v0.2.2 --cleanup-tag -y
+gh release delete v0.3.0 --cleanup-tag -y
 # or, if the release never existed:
-git push origin :refs/tags/v0.2.2
+git push origin :refs/tags/v0.3.0
 ```
 
 Never move a published tag without deleting the release first: downstream
-clones and cached tarballs would otherwise disagree about what `v0.2.2` means.
+clones and cached tarballs would otherwise disagree about what `v0.3.0` means.
 After re-tagging, repeat section 7.
 
 ## Failure modes of this checklist

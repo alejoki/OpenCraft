@@ -8,7 +8,7 @@
 #   - the asset name set is exactly the three release assets (two portable
 #     archives plus the Windows installer, D290)
 #   - all asset sizes are greater than zero
-#   - the release body contains `SmartScreen` and `version 9`
+#   - the release body contains `SmartScreen` and `version 10`
 #
 # Prints one machine-readable latch line on success and one readable FAIL line
 # on any mismatch. Dependencies: bash, gh, python3.
@@ -79,7 +79,7 @@ for asset in assets:
         sys.exit(1)
 
 body = payload.get("body") or ""
-missing = [needle for needle in ("SmartScreen", "version 9") if needle not in body]
+missing = [needle for needle in ("SmartScreen", "version 10") if needle not in body]
 if missing:
     print(
         "verify_release_page: FAIL release body is missing: " + ", ".join(missing),

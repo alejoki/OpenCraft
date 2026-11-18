@@ -22,7 +22,7 @@ The repository has two layers:
 
 | Path | Package | Version | Role |
 | --- | --- | --- | --- |
-| `Cargo.toml` (root) | `opencraft` | `0.2.2` at capture time | Game binary and library; stays at the repository root. |
+| `Cargo.toml` (root) | `opencraft` | `0.3.0` at capture time | Game binary and library; stays at the repository root. |
 | `crates/opencraft-core` | `opencraft-core` | `0.1.0` | Neutral primitives: block query, chunk-coordinate math, AABB/ray geometry, camera math and RGBA downsampling. |
 | `crates/opencraft-gfx` | `opencraft-gfx` | `0.1.0` | GPU frame layer over a game-created surface: buffers, meshes, texture arrays, models, sky, weather and frame passes. |
 | `crates/opencraft-physics` | `opencraft-physics` | `0.1.0` | AABB collision, raycast/sweep and the movement solver over `BlockQuery`. |
@@ -229,13 +229,31 @@ ownership follows that boundary: the crate holds the 53-test generation oracle
 (all moved terrain tests plus the pinned baseline), while the game keeps the
 mesh integration test and the adapter tests in `src/world/terrain.rs` (dense
 buffer move, season mirror, default wrapper, authored rule/context order and
-the pinned FNV triple run through the adapter). S08 owns the final closure.
+the pinned FNV triple run through the adapter). S08 closes the milestone with
+the 0.3.0 version bump and notes, the R093-R098 registry lockstep and the
+assembled-tree evidence below.
 
 The pack and worldgen formats stay frozen at their current versions. `.mcvx`
 now writes v10 through `opencraft-storage`; any future save-format change needs
 a recorded decision and its own boundary/gate work. The remaining extractions
 must not change pack or worldgen formats by accident, and must keep the
 neutral-API rules above intact.
+
+## M018 evidence at closeout
+
+These are assembled-tree figures captured in M018/S08, not permanent promises.
+Re-run the commands to refresh them. The consumer report is byte-identical
+across runs; the cold-load and budget numbers come from the release-profile
+harnesses on the assembled tree.
+
+| Signal | Assembled-tree result |
+| --- | --- |
+| `engine-reuse-proof` | Exactly 22 deterministic lines. The terrain line is `worldgen.terrain=chunks=4,uniform=1,non_air=53951,digest=0xa13b53f3403b98bf` and the final line is `worldgen.village_plan=cell=-6,-7,prefabs=2,links=1,roads=4`. |
+| Cold load, 10M edits / 20,000 chunks | Recorded v9 storage+session p50 319.630 ms, frozen target 159.815 ms; same-run v9 350.182 ms vs v10 51.520 ms p50 (6.797x, 32.2% of target). Both directions report checksum `0xd3ef88bdc7ae0ebc`; migration is byte-identical with zero unresolved names. |
+| Cold-load guardrails | First-area 95.638 ms against a 164.987 ms limit; full verify 52.287 ms against a 164.813 ms limit. |
+| Autosave budget | 1M frame p95 0.095 ms against the 16.6 ms gate; 10M stress frame p95 0.259 ms (report-only). |
+| Streaming budgets | Base p95 1.015 ms / max 4.902 ms; villages p95 2.488 ms / max 3.651 ms (`village_cells=2962`, `plan_chunks=6`); targets p95 <= 8 ms and max <= 16 ms. |
+| Village frame budget | Frame p95 7.289 ms against the 16.6 ms gate. |
 
 ## Failure and recovery
 
@@ -251,7 +269,12 @@ neutral-API rules above intact.
 
 ## Requirement and decision references
 
-R089-R092 in `REQUIREMENTS-REGISTRY.md` define the workspace/boundary contract,
-the external reuse proof, the no-regression closure surface and the scope
-guardrails. D292-D309 in `.gsd/DECISIONS.md` record the layout, dependency DAG,
-carve strategy, neutral seams, test-migration oracle and consumer proof shape.
+R089-R098 in `REQUIREMENTS-REGISTRY.md` define the workspace/boundary contract,
+the external reuse proof, the M018 storage/content/worldgen boundaries, the v10
+save and cold-load target, and the M018 scope guardrail. R091 and R092 remain in
+the registry as historical M017 closure rows; M018/S08 superseded them with
+R094/R095 and R098. D292-D309 in `.gsd/DECISIONS.md` record the M017 layout,
+dependency DAG, carve strategy, neutral seams, test-migration oracle and
+consumer proof shape; D313-D338 record the M018 slice decomposition, crate
+mapping, v10 wire contract, lazy chunk store, cold-load target, requirement
+supersession, release target and consumer proof lines.

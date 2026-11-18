@@ -4,8 +4,8 @@
 ; has staged dist/opencraft-<version>-x86_64-pc-windows-msvc/. ISCC must be
 ; given three defines (all values are Windows paths):
 ;
-;   ISCC.exe /DMyAppVersion=0.2.2 \
-;            /DStageDir=D:\...\dist\opencraft-0.2.2-x86_64-pc-windows-msvc \
+;   ISCC.exe /DMyAppVersion=0.3.0 \
+;            /DStageDir=D:\...\dist\opencraft-0.3.0-x86_64-pc-windows-msvc \
 ;            /DOutDir=D:\...\dist \
 ;            installer\opencraft.iss
 ;

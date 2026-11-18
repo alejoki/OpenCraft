@@ -225,7 +225,7 @@ bash scripts/modding_smoke.sh
 
 ## Content packs and saves
 
-Content definitions are not baked into a world file. A version 9 save stores every block, item and tool reference by name in a sorted, save-local table; built-in names are unqualified and pack content uses its namespaced id. Loading reads those names against the currently selected stack. The v9 config schema and effective-value digest tail is separate from this content identity: it describes the gameplay tuning that wrote the file, not the pack stack.
+Content definitions are not baked into a world file. A version 10 save stores every block, item and tool reference by name in a sorted, kind-tagged, save-local table; built-in names are unqualified and pack content uses its namespaced id. Loading reads those names against the currently selected stack. The v10 config section is separate from this content identity: it describes the gameplay tuning that wrote the file, not the pack stack. The neutral `opencraft-content` crate owns pack parsing, deterministic allocation and the content digest; the game's `ContentRegistry` is the thin adapter that exposes them to the world session.
 
 When a saved name is well-formed but absent from the selected stack, the load succeeds and keeps the reference as a placeholder:
 
