@@ -28,7 +28,7 @@ pub struct ProofReport {
     pub storage: StorageProof,
     /// Pack-parse and asset-pipeline proof.
     pub content: ContentProof,
-    /// In-memory prefab/village planning proof.
+    /// In-memory terrain-generation and prefab/village planning proof.
     pub worldgen: WorldgenProof,
 }
 
@@ -104,6 +104,14 @@ impl fmt::Display for ProofReport {
 
         writeln!(
             f,
+            "worldgen.terrain=chunks={},uniform={},non_air={},digest=0x{:016x}",
+            self.worldgen.terrain_chunks,
+            self.worldgen.terrain_uniform,
+            self.worldgen.terrain_non_air,
+            self.worldgen.terrain_digest
+        )?;
+        writeln!(
+            f,
             "worldgen.village_plan=cell={},{},prefabs={},links={},roads={}",
             self.worldgen.village_cell.0,
             self.worldgen.village_cell.1,
@@ -119,7 +127,7 @@ impl fmt::Display for ProofReport {
 mod tests {
     use super::*;
 
-    const KEYS: [&str; 21] = [
+    const KEYS: [&str; 22] = [
         "physics.landing_y=",
         "physics.wall_x=",
         "physics.ray_block=",
@@ -140,6 +148,7 @@ mod tests {
         "storage.chunk_edits=",
         "content.pack_entries=",
         "content.catalog_digest=",
+        "worldgen.terrain=",
         "worldgen.village_plan=",
     ];
 

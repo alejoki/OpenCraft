@@ -69,7 +69,7 @@ fn content_proof_reports_the_parse_and_sprite_values() {
 fn proof_report_renders_the_content_line() {
     let rendered = ProofReport::to_string(&engine_reuse_proof::run());
 
-    assert_eq!(rendered.lines().count(), 21, "six proof groups of lines");
+    assert_eq!(rendered.lines().count(), 22, "six proof groups of lines");
     for expected in [
         "content.pack_entries=2",
         "content.catalog_digest=0xdd3648c397a414c0",
