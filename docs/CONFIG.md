@@ -126,7 +126,7 @@ startup work:
 
 A rejected release launch reads no settings file, pack stack, save, or config
 tree. The creator tools are not available in release. The headless demo and
-validation seams (`--demo-save-v9`, `--demo-restart`, `--validate-pack`) are
+validation seams (`--demo-save-v10`, `--demo-restart`, `--validate-pack`) are
 separate from the creator tools and remain available.
 
 ### F6 overlay
@@ -228,8 +228,9 @@ schema version and every effective value in lexicographic key order. It hashes
 values, not file bytes. Comments, whitespace, table order, and formatting
 changes do not move it; editing a value does. A value that fails validation is
 folded in as its default, so the digest describes what the game will actually
-use, not what the file intended. Save format v9 records this digest alongside
-the schema version so a save can notice that gameplay tuning changed.
+use, not what the file intended. Save format v10 records this digest in its
+config section alongside the schema version so a save can notice that gameplay
+tuning changed.
 
 ## Development and release
 
@@ -245,7 +246,7 @@ startup work:
 
 No release build is required to edit `config/`; validate a tree before
 launching with `--check-config` in a debug build. Normal config and pack
-loading, and the headless `--demo-save-v9`, `--demo-restart`, and
+loading, and the headless `--demo-save-v10`, `--demo-restart`, and
 `--validate-pack` seams, remain available in release.
 
 ## Not in the curated registry

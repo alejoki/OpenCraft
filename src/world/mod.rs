@@ -6,8 +6,11 @@ pub mod capture;
 pub mod catalog;
 pub mod catalog_fs;
 pub mod chunk;
+#[cfg(test)]
+mod cold_load_budget;
 pub mod collision;
 pub mod daycycle;
+pub mod edit_store;
 pub mod farming;
 pub mod light;
 pub mod loot;

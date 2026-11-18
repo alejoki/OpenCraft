@@ -104,10 +104,7 @@ pub fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16
     let mut chunk_edits = ChunkEditMap::default();
     for (pos, id) in [(ore_pos, ore), (block_pos, block)] {
         let (chunk_pos, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
-        chunk_edits
-            .entry(chunk_pos)
-            .or_default()
-            .insert(linear_index(lx, ly, lz) as u16, id);
+        chunk_edits.insert_block(chunk_pos, linear_index(lx, ly, lz) as u16, id);
     }
     let mut inventory = Inventory::empty();
     inventory
@@ -2064,7 +2061,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                         session
                             .world
                             .get_block(cell.world[0], cell.world[1], cell.world[2])
-                            == cell.block
+                            == BlockId::from_raw(cell.block)
                     })
             })
         }
@@ -2271,7 +2268,7 @@ pub fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
             parsed
                 .blocks
                 .iter()
-                .filter(|block| block.block == BlockId::SocketMarker)
+                .filter(|block| BlockId::from_raw(block.block) == BlockId::SocketMarker)
                 .count()
         })
         .unwrap_or(0);
@@ -2286,7 +2283,7 @@ pub fn capture_demo_lines(root: &Path) -> (Vec<String>, bool) {
                 .blocks
                 .iter()
                 .find(|block| block.position == [cell[0] as u32, cell[1] as u32, cell[2] as u32])
-                .map(|block| block.block)
+                .map(|block| BlockId::from_raw(block.block))
         }
         _ => None,
     };
@@ -2789,41 +2786,42 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
 }
 
 // ---------------------------------------------------------------------------
-// Headless v8-to-v9 save proof (`--demo-save-v9`, M014/S04-T05)
+// Headless v1-v9-to-v10 save proof (`--demo-save-v10`, M018/S02)
 // ---------------------------------------------------------------------------
 
-/// Build the deterministic `--demo-save-v9` proof.
+/// Build the deterministic `--demo-save-v10` proof.
 ///
 /// Reads `input` as bytes (never writing it), decodes it through the production
-/// v8/v9 loader with the built-in registry, reports the load leg, then writes a
-/// v9 file next to the input through the one production save site and reloads
-/// that output under the same effective config. A missing input is reported as
-/// `missing-input`; every other read/decode failure is `load`. No settings
-/// file, pack stack, window, GPU, audio engine, or event loop is touched.
-pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>, bool) {
+/// v1-v9 loader with the built-in registry, reports the load leg, then writes a
+/// v10 sectioned file next to the input through the one production save site
+/// and reloads that output under the same effective config. A missing input is
+/// reported as `missing-input`; every other read/decode failure is `load`. No
+/// settings file, pack stack, window, GPU, audio engine, or event loop is
+/// touched.
+pub fn demo_save_v10_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>, bool) {
     let mut lines: Vec<String> = Vec::new();
-    let output = input.with_extension("v9.mcvx");
+    let output = input.with_extension("v10.mcvx");
 
     let bytes = match std::fs::read(input) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            lines.push("save_v9: failed reason=missing-input".to_string());
+            lines.push("save_v10: failed reason=missing-input".to_string());
             return (lines, false);
         }
         Err(_) => {
-            lines.push("save_v9: failed reason=load".to_string());
+            lines.push("save_v10: failed reason=load".to_string());
             return (lines, false);
         }
     };
     let Some(version_bytes) = bytes.get(4..8) else {
-        lines.push("save_v9: failed reason=load".to_string());
+        lines.push("save_v10: failed reason=load".to_string());
         return (lines, false);
     };
     let version = u32::from_le_bytes(version_bytes.try_into().expect("4-byte version slice"));
     let loaded = match load_world_from_bytes_with(&bytes, ContentRegistry::builtin()) {
         Ok(loaded) => loaded,
         Err(_) => {
-            lines.push("save_v9: failed reason=load".to_string());
+            lines.push("save_v10: failed reason=load".to_string());
             return (lines, false);
         }
     };
@@ -2839,7 +2837,7 @@ pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>,
     let notice = session.take_config_notice(current);
     let playable = !session.is_dead();
     lines.push(format!(
-        "save_v9: leg=load version={version} packs={packs} saved_config={} notice={} playable={playable}",
+        "save_v10: leg=load version={version} packs={packs} saved_config={} notice={} playable={playable}",
         if saved_config { "some" } else { "none" },
         notice.as_deref().unwrap_or("none"),
     ));
@@ -2848,13 +2846,13 @@ pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>,
     // production save site: the session's `save_path` is the derived output.
     session.apply_config(&config.rules(), current);
     if save_current_world(&mut session).is_err() {
-        lines.push("save_v9: failed reason=save".to_string());
+        lines.push("save_v10: failed reason=save".to_string());
         return (lines, false);
     }
     let saved_bytes = match std::fs::read(&output) {
         Ok(bytes) => bytes,
         Err(_) => {
-            lines.push("save_v9: failed reason=resave".to_string());
+            lines.push("save_v10: failed reason=resave".to_string());
             return (lines, false);
         }
     };
@@ -2862,8 +2860,12 @@ pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>,
         .get(4..8)
         .map(|raw| u32::from_le_bytes(raw.try_into().expect("4-byte version slice")))
         .unwrap_or(0);
+    let section_count = saved_bytes
+        .get(12..16)
+        .map(|raw| u32::from_le_bytes(raw.try_into().expect("4-byte section count slice")))
+        .unwrap_or(0);
     lines.push(format!(
-        "save_v9: leg=resave version={resave_version} config_schema={} config_digest=0x{:016x} bytes={}",
+        "save_v10: leg=resave version={resave_version} config_schema={} config_digest=0x{:016x} bytes={} sections={section_count}",
         current.schema,
         current.digest,
         saved_bytes.len(),
@@ -2872,7 +2874,7 @@ pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>,
     let reloaded = match load_world_from_path_with(&output, ContentRegistry::builtin()) {
         Ok(loaded) => loaded,
         Err(_) => {
-            lines.push("save_v9: failed reason=reload".to_string());
+            lines.push("save_v10: failed reason=reload".to_string());
             return (lines, false);
         }
     };
@@ -2880,15 +2882,15 @@ pub fn demo_save_v9_lines(input: &Path, config: &ConfigRuntime) -> (Vec<String>,
     let match_notice = reload_session.take_config_notice(current);
     let match_playable = !reload_session.is_dead();
     lines.push(format!(
-        "save_v9: leg=match notice={} playable={match_playable}",
+        "save_v10: leg=match notice={} playable={match_playable}",
         match_notice.as_deref().unwrap_or("none"),
     ));
 
-    if resave_version != 9 || match_notice.is_some() || !playable || !match_playable {
-        lines.push("save_v9: failed reason=mismatch".to_string());
+    if resave_version != 10 || match_notice.is_some() || !playable || !match_playable {
+        lines.push("save_v10: failed reason=mismatch".to_string());
         return (lines, false);
     }
-    lines.push("save_v9: ok".to_string());
+    lines.push("save_v10: ok".to_string());
     (lines, true)
 }
 

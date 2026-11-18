@@ -2,15 +2,19 @@
 # Fail the build if an engine crate reaches back into the game or picks up
 # dependencies it must not own (M017/S01).
 #
-# Rules for every engine member under crates/ (the four opencraft-* crates
+# Rules for every engine member under crates/ (all seven opencraft-* members
 # and the engine-reuse-proof consumer):
 #   - no dependency on the root `opencraft` game package (direct or transitive)
 #   - publish = false and no version.workspace (the release guard reads the
 #     root package version; members version independently)
-#   - opencraft-core, opencraft-physics, opencraft-pathfinding: no wgpu,
+#   - opencraft-core, opencraft-physics, opencraft-pathfinding,
+#     opencraft-storage, opencraft-content, opencraft-worldgen: no wgpu,
 #     wgpu-core, wgpu-types, winit or raw-window-handle
 #   - opencraft-gfx: no winit (wgpu is allowed), and no direct winit or
 #     raw-window-handle manifest entry
+#   - opencraft-storage: no opencraft-content, opencraft-worldgen, toml or png
+#   - opencraft-content: no opencraft-storage or opencraft-worldgen
+#   - opencraft-worldgen: no opencraft-storage (worldgen -> content is allowed)
 #   - engine-reuse-proof: no direct wgpu, winit, raw-window-handle, pollster,
 #     bytemuck, serde or tempfile manifest entry; it consumes the engine crates
 #     only and the no-game-package rule above still applies
@@ -44,9 +48,29 @@ tree_violation() {
                 return 0
             fi
             ;;
-        opencraft-core|opencraft-physics|opencraft-pathfinding)
+        opencraft-core|opencraft-physics|opencraft-pathfinding|opencraft-storage|opencraft-content|opencraft-worldgen)
             if grep -Eq '(^|[[:space:]])(wgpu|wgpu-core|wgpu-types|winit|raw-window-handle) v[0-9]' <<<"$tree"; then
                 echo "depends on a GPU/windowing crate"
+                return 0
+            fi
+            ;;
+    esac
+    case "$name" in
+        opencraft-storage)
+            if grep -Eq '(^|[[:space:]])(opencraft-content|opencraft-worldgen) v[0-9]' <<<"$tree"; then
+                echo "depends on opencraft-content or opencraft-worldgen"
+                return 0
+            fi
+            ;;
+        opencraft-content)
+            if grep -Eq '(^|[[:space:]])(opencraft-storage|opencraft-worldgen) v[0-9]' <<<"$tree"; then
+                echo "depends on opencraft-storage or opencraft-worldgen"
+                return 0
+            fi
+            ;;
+        opencraft-worldgen)
+            if grep -Eq '(^|[[:space:]])opencraft-storage v[0-9]' <<<"$tree"; then
+                echo "depends on opencraft-storage"
                 return 0
             fi
             ;;
@@ -71,6 +95,15 @@ manifest_violation() {
             ;;
         opencraft-core|opencraft-physics|opencraft-pathfinding)
             forbidden='wgpu|wgpu-core|wgpu-types|winit|raw-window-handle'
+            ;;
+        opencraft-storage)
+            forbidden='wgpu|wgpu-core|wgpu-types|winit|raw-window-handle|opencraft-content|opencraft-worldgen|toml|png'
+            ;;
+        opencraft-content)
+            forbidden='wgpu|wgpu-core|wgpu-types|winit|raw-window-handle|opencraft-storage|opencraft-worldgen'
+            ;;
+        opencraft-worldgen)
+            forbidden='wgpu|wgpu-core|wgpu-types|winit|raw-window-handle|opencraft-storage'
             ;;
         engine-reuse-proof)
             forbidden='wgpu|winit|raw-window-handle|pollster|bytemuck|serde|tempfile'
@@ -115,6 +148,46 @@ self_test() {
         fail "self-test accepted winit in opencraft-gfx"
     fi
 
+    local neutral_storage_tree=$'opencraft-storage v0.1.0\n├── opencraft-core v0.1.0\n└── tempfile v3.8.0'
+    if violation=$(tree_violation opencraft-storage "$neutral_storage_tree"); then
+        fail "self-test rejected a neutral opencraft-storage tree: $violation"
+    fi
+
+    local storage_content_tree=$'opencraft-storage v0.1.0\n└── opencraft-content v0.1.0'
+    if ! violation=$(tree_violation opencraft-storage "$storage_content_tree"); then
+        fail "self-test accepted a storage -> content edge"
+    fi
+
+    local storage_wgpu_tree=$'opencraft-storage v0.1.0\n└── wgpu v0.19.0'
+    if ! violation=$(tree_violation opencraft-storage "$storage_wgpu_tree"); then
+        fail "self-test accepted wgpu in opencraft-storage"
+    fi
+
+    local content_worldgen_tree=$'opencraft-content v0.1.0\n└── opencraft-worldgen v0.1.0'
+    if ! violation=$(tree_violation opencraft-content "$content_worldgen_tree"); then
+        fail "self-test accepted a content -> worldgen edge"
+    fi
+
+    local neutral_content_tree=$'opencraft-content v0.1.0\n├── opencraft-core v0.1.0\n├── png v0.17.16\n└── toml v1.1.8+spec-1.1.0'
+    if violation=$(tree_violation opencraft-content "$neutral_content_tree"); then
+        fail "self-test rejected a neutral opencraft-content tree: $violation"
+    fi
+
+    local content_wgpu_tree=$'opencraft-content v0.1.0\n└── wgpu v0.19.0'
+    if ! violation=$(tree_violation opencraft-content "$content_wgpu_tree"); then
+        fail "self-test accepted wgpu in opencraft-content"
+    fi
+
+    local neutral_worldgen_tree=$'opencraft-worldgen v0.1.0\n├── opencraft-core v0.1.0\n├── opencraft-content v0.1.0\n├── glam v0.27.0\n└── toml v1.1.8+spec-1.1.0'
+    if violation=$(tree_violation opencraft-worldgen "$neutral_worldgen_tree"); then
+        fail "self-test rejected a neutral opencraft-worldgen tree: $violation"
+    fi
+
+    local worldgen_storage_tree=$'opencraft-worldgen v0.1.0\n└── opencraft-storage v0.1.0'
+    if ! violation=$(tree_violation opencraft-worldgen "$worldgen_storage_tree"); then
+        fail "self-test accepted a worldgen -> storage edge"
+    fi
+
     echo "PASS: boundary self-test"
 }
 
@@ -124,7 +197,7 @@ if ! cargo metadata --locked --no-deps --format-version 1 >/dev/null; then
     fail "cargo metadata --locked failed (stale Cargo.lock or malformed manifest)"
 fi
 
-for crate in opencraft-core opencraft-gfx opencraft-physics opencraft-pathfinding engine-reuse-proof; do
+for crate in opencraft-core opencraft-gfx opencraft-physics opencraft-pathfinding opencraft-storage opencraft-content opencraft-worldgen engine-reuse-proof; do
     [[ -f "crates/$crate/Cargo.toml" ]] || fail "missing crates/$crate/Cargo.toml"
 done
 

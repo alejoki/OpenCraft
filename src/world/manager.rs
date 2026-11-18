@@ -1154,9 +1154,7 @@ impl WorldManager {
         self.light_epoch = self.light_epoch.wrapping_add(1);
 
         self.chunk_edits
-            .entry(cpos)
-            .or_default()
-            .insert(linear_index(lx, ly, lz) as u16, block);
+            .insert_block(cpos, linear_index(lx, ly, lz) as u16, block);
         self.unsaved_changes = true;
 
         // A block edit changes sky light. Recompute the edit's chunk-column
@@ -1846,10 +1844,11 @@ mod tests {
         let origin = ChunkPos::new(0, 0, 0);
         let (lx, ly, lz) = (5usize, 10usize, 5usize);
         let mut edits = ChunkEditMap::default();
-        edits
-            .entry(origin)
-            .or_default()
-            .insert(linear_index(lx, ly, lz) as u16, BlockId::WheatStage1);
+        edits.insert_block(
+            origin,
+            linear_index(lx, ly, lz) as u16,
+            BlockId::WheatStage1,
+        );
         let (wx, wy, wz) = (lx as i32, ly as i32, lz as i32);
 
         let mut mgr = WorldManager::with_seed_and_edits(4, seed, edits.clone());
@@ -4093,7 +4092,9 @@ mod tests {
         let mut village_cells = 0usize;
         for &pos in &plan_chunks {
             for cell in plan.cells_for_chunk(pos) {
-                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2]) == cell.block {
+                if mgr.get_block(cell.world[0], cell.world[1], cell.world[2])
+                    == BlockId::from_raw(cell.block)
+                {
                     village_cells += 1;
                 }
             }
@@ -4393,7 +4394,7 @@ mod tests {
                         let (lx, ly, lz) = local_cell(cell.world);
                         assert_eq!(
                             chunk.get(lx, ly, lz),
-                            cell.block,
+                            BlockId::from_raw(cell.block),
                             "village cell {:?} missing from generated chunk {pos:?}",
                             cell.world
                         );
@@ -4470,7 +4471,7 @@ mod tests {
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
         for cell in &plan_cells {
             let (lx, ly, lz) = local_cell(cell.world);
-            assert_eq!(summer_chunk.get(lx, ly, lz), cell.block);
+            assert_eq!(summer_chunk.get(lx, ly, lz), BlockId::from_raw(cell.block));
         }
 
         let mut mgr =
@@ -4508,7 +4509,7 @@ mod tests {
             let (lx, ly, lz) = local_cell(cell.world);
             assert_eq!(
                 swapped.get(lx, ly, lz),
-                cell.block,
+                BlockId::from_raw(cell.block),
                 "season rollover erased village cell {:?}",
                 cell.world
             );

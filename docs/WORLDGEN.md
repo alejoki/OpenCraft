@@ -23,9 +23,10 @@ content that is read from the process working directory.
 A prefab is built from built-in blocks only. Palette values must be names of
 built-in blocks; the prefab format deliberately has no mod namespace. Villages
 are generated content: they are written into chunks while those chunks are
-generated. They are not a new save schema, so the save version does not change,
-no prefab or village name is written into a save, and neither enters the pack
-content fingerprint or the save content table.
+generated. The village system adds no save field, no prefab or village name is
+written into a save, and neither enters the pack content fingerprint or the
+save content table. M018 separately moved the save to version 10 for the
+storage work; that is independent of worldgen, whose format stays byte-identical.
 
 Because villages are generated content, a saved chunk is never retroactively
 re-stamped. Existing worlds gain villages only in chunks they have not edited,
@@ -36,6 +37,17 @@ generates the same terrain as before M015. Broken content is fail-soft at load
 time: it produces readable warnings and fewer or no villages, never a world
 load failure. The validator described in section 5 is the fail-closed check you
 run on purpose.
+
+### Implementation boundary
+
+The neutral `opencraft-worldgen` crate owns the biome/height/ruin/tree/spawn
+queries, the loot vocabulary, the prefab and village codecs/catalogs/fingerprint
+/plan/chunk-local emission, and the whole terrain-generation pass over a
+neutral raw-`u16` `ChunkBuffer`. The game keeps `Chunk`, the move-only
+`chunk_from_buffer` adapter, the `WorldGenContext` wrapper, `Season`/clock
+policy, capture and all UI. The external `engine-reuse-proof` consumer proves
+the prefab and village planners and a four-chunk terrain pass device-free — no
+GPU, window, filesystem, clock or thread — on that same raw-id boundary.
 
 ## 2. Authoring loop in game
 
@@ -418,6 +430,13 @@ resident_plan_chunks=6) each printed p50/p95/max in milliseconds:
 The frame-budget harness p95 in the same measurement round was 6.668 ms. The
 accepted controls stay p95<=8 ms and max<=16 ms; the smoke gate above never
 relaxes them.
+
+On the assembled M018 tree, S08 reran the same release harnesses: the base
+streaming budget printed p50 0.272 ms / p95 1.015 ms / max 4.902 ms, the
+village-enabled budget printed p50 0.328 ms / p95 2.488 ms / max 3.651 ms
+(village_cells=2962, plan_chunks=6), and the windowed village frame budget
+printed p50 1.245 ms / p95 7.289 ms / max 126.442 ms against the 16.6 ms p95
+target. No budget moved.
 
 The reference content is:
 

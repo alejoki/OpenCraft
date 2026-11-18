@@ -290,7 +290,7 @@ pub fn extract_prefab(
                             (y - region.min.y) as u32,
                             (z - region.min.z) as u32,
                         ],
-                        block: BlockId::Air,
+                        block: BlockId::Air.to_raw(),
                     });
                     continue;
                 }
@@ -303,7 +303,7 @@ pub fn extract_prefab(
                         (y - region.min.y) as u32,
                         (z - region.min.z) as u32,
                     ],
-                    block: normalize_block(block),
+                    block: normalize_block(block).to_raw(),
                 });
             }
         }
@@ -525,7 +525,7 @@ mod tests {
         assert_eq!(prefab.origin, [0, 0, 0]);
         assert_eq!(prefab.blocks.len(), 1);
         assert_eq!(prefab.blocks[0].position, [0, 0, 0]);
-        assert_eq!(prefab.blocks[0].block, BlockId::Stone);
+        assert_eq!(BlockId::from_raw(prefab.blocks[0].block), BlockId::Stone);
         assert_eq!(parse_prefab(&prefab.to_toml_string()), Ok(prefab));
     }
 
@@ -559,12 +559,14 @@ mod tests {
         let world = stone_house_world();
         let prefab = extract_prefab("house", &world, house_region()).expect("house captures");
         let find = |position: [u32; 3]| {
-            prefab
-                .blocks
-                .iter()
-                .find(|block| block.position == position)
-                .expect("cell exists")
-                .block
+            BlockId::from_raw(
+                prefab
+                    .blocks
+                    .iter()
+                    .find(|block| block.position == position)
+                    .expect("cell exists")
+                    .block,
+            )
         };
 
         assert_eq!(find([1, 1, 1]), BlockId::Air);
@@ -579,7 +581,7 @@ mod tests {
         assert!(!prefab
             .blocks
             .iter()
-            .any(|block| block.block == BlockId::LootChest));
+            .any(|block| BlockId::from_raw(block.block) == BlockId::LootChest));
     }
 
     #[test]
@@ -868,14 +870,14 @@ mod tests {
         assert!(!prefab
             .blocks
             .iter()
-            .any(|block| block.block == BlockId::SocketMarker));
+            .any(|block| BlockId::from_raw(block.block) == BlockId::SocketMarker));
 
         let marker_cell = prefab
             .blocks
             .iter()
             .find(|block| block.position == [2, 1, 0])
             .expect("the marker grid cell is preserved");
-        assert_eq!(marker_cell.block, BlockId::Air);
+        assert_eq!(BlockId::from_raw(marker_cell.block), BlockId::Air);
 
         let text = prefab.to_toml_string();
         assert!(!text.contains("socket_marker"));
@@ -1013,7 +1015,7 @@ mod tests {
             size: [1, 1, 1],
             blocks: vec![PrefabBlock {
                 position: [0, 0, 0],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
         };
@@ -1052,7 +1054,7 @@ mod tests {
             size: [1, 1, 1],
             blocks: vec![PrefabBlock {
                 position: [0, 0, 0],
-                block: BlockId::Stone,
+                block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
         };

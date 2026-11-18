@@ -478,6 +478,9 @@ impl WorldSession {
             ContentRegistry::builtin_arc(),
             None,
             None,
+            // v1-v9 loads carry no validated crop section: rebuild the
+            // candidates from the edit map exactly as before.
+            None,
         )
     }
 
@@ -490,12 +493,14 @@ impl WorldSession {
     pub fn from_loaded_world(loaded: LoadedWorld, save_path: PathBuf) -> WorldSession {
         let content_notice = loaded.content_notice();
         let saved_config = loaded.saved_config;
+        let crops = loaded.crops;
         Self::session_from_save_with_registry(
             loaded.data,
             save_path,
             Arc::new(loaded.registry),
             content_notice,
             saved_config,
+            crops,
         )
     }
 
@@ -513,6 +518,7 @@ impl WorldSession {
         registry: Arc<ContentRegistry>,
         content_notice: Option<String>,
         saved_config: Option<SaveConfigMeta>,
+        crops: Option<Vec<IVec3>>,
     ) -> WorldSession {
         let WorldSaveData {
             seed,
@@ -546,8 +552,13 @@ impl WorldSession {
         player.restore_selected_slot(saved.selected_slot as usize);
         // Rebuild growth candidates from the persisted stage edits *before*
         // the edit map is moved into the world manager. Progress restarts at
-        // zero: only the visible stage survives a save.
-        let crops = CropRuntime::from_edits(&chunk_edits);
+        // zero: only the visible stage survives a save. A v10 load carries
+        // the already-validated crop section, so its 10M-edit load skips the
+        // edit-map scan entirely; v1-v9 and hand-built loads scan as before.
+        let crops = match crops {
+            Some(positions) => CropRuntime::from_positions(&positions),
+            None => CropRuntime::from_edits(&chunk_edits),
+        };
         // Restore the live mob records from the v7 tail. Each record re-anchors
         // `home` at the saved feet position and keeps the saved health, so
         // damage survives a reload; every ephemeral runtime field (velocity,
@@ -1784,7 +1795,7 @@ impl WorldSession {
         }
     }
 
-    /// The single synchronous v9 writer: projection + atomic write, clearing
+    /// The single synchronous v10 writer: projection + atomic write, clearing
     /// the unsaved flag only after the write succeeds.
     ///
     /// An in-flight autosave is joined and any coalesced request dropped
@@ -2579,6 +2590,7 @@ mod tests {
                 registry: ContentRegistry::builtin().clone(),
                 saved_content: None,
                 saved_config: Some(saved),
+                crops: None,
                 unresolved: 0,
             },
             PathBuf::from("/tmp/v9-config.mcvx"),
@@ -5362,7 +5374,6 @@ mod tests {
 
         let mut edits = ChunkEditMap::default();
         let chunk = ChunkPos::new(0, 0, 0);
-        let inner = edits.entry(chunk).or_default();
         for (index, block) in [
             (linear_index(1, 2, 3), BlockId::WheatStage0),
             (linear_index(2, 2, 3), BlockId::WheatStage1),
@@ -5370,7 +5381,7 @@ mod tests {
             (linear_index(4, 2, 3), BlockId::WheatStage3),
             (linear_index(5, 2, 3), BlockId::Farmland),
         ] {
-            inner.insert(index as u16, block);
+            edits.insert_block(chunk, index as u16, block);
         }
         let mut data = make_save(1);
         data.chunk_edits = edits;
@@ -5382,6 +5393,61 @@ mod tests {
         assert_eq!(restored.crops.progress(IVec3::new(3, 2, 3)), Some(0.0));
         assert_eq!(restored.crops.progress(IVec3::new(4, 2, 3)), None);
         assert_eq!(restored.crops.progress(IVec3::new(5, 2, 3)), None);
+    }
+
+    #[test]
+    fn from_loaded_world_installs_crop_candidates_from_the_v10_crop_section() {
+        use crate::world::chunk::linear_index;
+        use crate::world::persistence::{load_world_from_path_with, save_world_to_path};
+
+        let mut edits = ChunkEditMap::default();
+        let chunk = ChunkPos::new(0, 0, 0);
+        for (index, block) in [
+            (linear_index(1, 2, 3), BlockId::WheatStage0),
+            (linear_index(2, 2, 3), BlockId::WheatStage1),
+            (linear_index(3, 2, 3), BlockId::WheatStage2),
+            (linear_index(4, 2, 3), BlockId::WheatStage3),
+            (linear_index(5, 2, 3), BlockId::Farmland),
+        ] {
+            edits.insert_block(chunk, index as u16, block);
+        }
+        let mut data = make_save(1);
+        data.chunk_edits = edits;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("crops-from-section.mcvx");
+        save_world_to_path(&path, &data).expect("the save writes");
+
+        let loaded =
+            load_world_from_path_with(&path, ContentRegistry::builtin()).expect("the save loads");
+        assert_eq!(
+            loaded.crops,
+            Some(vec![
+                IVec3::new(1, 2, 3),
+                IVec3::new(2, 2, 3),
+                IVec3::new(3, 2, 3),
+            ]),
+            "the crop section carries exactly the immature wheat positions"
+        );
+        assert!(
+            loaded
+                .data
+                .chunk_edits
+                .values()
+                .all(|section| section.is_palette()),
+            "every v10-loaded section is palette"
+        );
+
+        let restored = WorldSession::from_loaded_world(loaded, path);
+        assert_eq!(restored.crops.len(), 3);
+        for pos in [
+            IVec3::new(1, 2, 3),
+            IVec3::new(2, 2, 3),
+            IVec3::new(3, 2, 3),
+        ] {
+            assert_eq!(restored.crops.progress(pos), Some(0.0));
+        }
+        assert_eq!(restored.crops.progress(IVec3::new(4, 2, 3)), None);
     }
 
     #[test]
@@ -6682,7 +6748,7 @@ mod tests {
     }
 
     #[test]
-    fn session_save_writes_the_unchanged_v9_bytes() {
+    fn session_save_writes_the_unchanged_v10_bytes() {
         use crate::world::persistence::save_world_to_bytes_with_config;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6709,9 +6775,9 @@ mod tests {
 
         assert_eq!(
             bytes, expected,
-            "session save writes the v9 bytes unchanged"
+            "session save writes the v10 bytes unchanged"
         );
-        assert_eq!(&bytes[4..8], &9u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &10u32.to_le_bytes());
     }
 
     #[test]
@@ -6751,7 +6817,7 @@ mod tests {
             async_bytes, sync_bytes,
             "R064: the worker writes exactly the session save's bytes"
         );
-        assert_eq!(&async_bytes[4..8], &9u32.to_le_bytes());
+        assert_eq!(&async_bytes[4..8], &10u32.to_le_bytes());
     }
 
     #[test]
@@ -7013,7 +7079,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_mob_save_keeps_the_179_byte_edit_free_length() {
+    fn empty_mob_save_keeps_the_353_byte_edit_free_length() {
+        use opencraft_storage::archive::{SaveImage, SectionId};
+
         use crate::world::persistence::{load_world_from_bytes, save_world_to_bytes};
 
         let data = make_save(9183u32);
@@ -7021,14 +7089,16 @@ mod tests {
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("empty mob save encodes");
 
-        // Measured v9 shape: the empty content table adds four bytes before
-        // the hotbar, so the mob count moves from 149 to 153, and the v8 pack
-        // + digest tail plus the 10-byte config tail complete the payload.
-        assert_eq!(bytes.len(), 179);
+        // Measured v10 shape: a 16-byte header plus nine 21-byte directory
+        // entries and the fixed section bodies. Section 5 is the mob count.
+        assert_eq!(bytes.len(), 353);
+        let image = SaveImage::parse(bytes.clone()).expect("v10 archive parses");
+        assert_eq!(image.version(), 10);
+        assert_eq!(image.section_count(), 9);
         assert_eq!(
-            &bytes[153..157],
-            &0u32.to_le_bytes(),
-            "the v9 mob count sits at offset 153"
+            image.section(SectionId(5)),
+            Some(&0u32.to_le_bytes()[..]),
+            "the v10 mobs section holds only a zero count"
         );
         let loaded = load_world_from_bytes(&bytes).expect("empty mob save decodes");
         assert!(loaded.mobs.is_empty());
@@ -8193,12 +8263,12 @@ mod tests {
             "respawn forgets the projectile cause too"
         );
 
-        // Arrows have no wire representation: the v9 save stays the same
-        // 179-byte edit-free layout and a reload starts in flight-free air.
+        // Arrows have no wire representation: the v10 save stays the same
+        // 353-byte edit-free layout and a reload starts in flight-free air.
         let data = make_save(62);
         let mut bytes = Vec::new();
         save_world_to_bytes(&mut bytes, &data).expect("save encodes");
-        assert_eq!(bytes.len(), 179, "arrows add no save bytes");
+        assert_eq!(bytes.len(), 353, "arrows add no save bytes");
         let restored = WorldSession::session_from_save(
             load_world_from_bytes(&bytes).expect("save decodes"),
             PathBuf::from("/tmp/arrow-reload.mcvx"),
@@ -8472,6 +8542,7 @@ mod tests {
                 digest: 0x1234,
             }),
             saved_config: None,
+            crops: None,
             unresolved: 1,
         };
 
@@ -8669,6 +8740,7 @@ mod tests {
             Arc::clone(&registry),
             None,
             None,
+            None,
         );
         assert_eq!(
             (*restored.world.worldgen_rules()).as_ref(),
@@ -8682,6 +8754,7 @@ mod tests {
                 registry: (*registry).clone(),
                 saved_content: None,
                 saved_config: None,
+                crops: None,
                 unresolved: 0,
             },
             PathBuf::from("/tmp/loaded-rules.mcvx"),
@@ -8720,6 +8793,7 @@ mod tests {
             registry,
             saved_content: None,
             saved_config: None,
+            crops: None,
             unresolved: 0,
         };
         let session =

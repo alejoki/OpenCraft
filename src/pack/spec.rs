@@ -13,15 +13,13 @@
 //! Everything here is GPU- and audio-device-free pure data plus filesystem
 //! reads, mirroring [`crate::pack::load_pack_from_dir`]'s never-fail contract.
 
-use std::io::Read;
 use std::path::Path;
 
 use crate::content::spec::{ContentDiagnostic, PackContentSpec};
 use crate::pack::asset;
 use crate::pack::decode;
 use crate::pack::manifest;
-use crate::pack::manifest::PackFormat;
-use crate::pack::resample;
+use crate::pack::manifest::{PackFormat, PackWarning};
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
 use crate::pack::v2;
@@ -30,47 +28,20 @@ use crate::render::texture::{
     generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
 };
 use crate::settings::SettingsWarning;
+pub use opencraft_content::decode::{
+    decode_asset_file, decode_builtin_icon_file, decode_layer_file, MAX_LAYER_SIDE, MIN_LAYER_SIDE,
+};
+pub use opencraft_content::manifest::read_manifest_text;
 
-/// Smallest accepted layer side length, in pixels.
-pub(crate) const MIN_LAYER_SIDE: u32 = 16;
-/// Largest accepted layer side length, in pixels.
-pub(crate) const MAX_LAYER_SIDE: u32 = 256;
-
-/// Largest accepted `pack.toml` file, in bytes.
-const MAX_MANIFEST_BYTES: u64 = asset::PACK_ASSET_BYTE_CAP;
-
-/// Read one `pack.toml` with a metadata-first size and file-type guard.
-///
-/// Returns the manifest text without any path prefix: callers own the path
-/// wording so the watcher status line keeps its pinned `failed to read:`
-/// shape while the loader names the folder. A FIFO or other non-regular file
-/// is rejected from metadata alone, so a hostile manifest cannot block the
-/// open or allocate an attacker-sized buffer.
-pub fn read_manifest_text(path: &Path) -> Result<String, String> {
-    let metadata = std::fs::metadata(path).map_err(|err| err.to_string())?;
-    if !metadata.is_file() {
-        return Err(format!("{} is not a regular file", path.display()));
+/// The neutral parser warning converts to the game's settings warning where
+/// `LoadedPack`, the validator and the menu expect that richer type.
+impl From<PackWarning> for SettingsWarning {
+    fn from(warning: PackWarning) -> Self {
+        Self {
+            field: warning.field,
+            reason: warning.reason,
+        }
     }
-    if metadata.len() > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
-            metadata.len()
-        ));
-    }
-
-    let file = std::fs::File::open(path).map_err(|err| err.to_string())?;
-    let mut text = String::new();
-    file.take(MAX_MANIFEST_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|err| err.to_string())?;
-    if text.len() as u64 > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "manifest is {} bytes, larger than the {MAX_MANIFEST_BYTES} byte limit",
-            text.len()
-        ));
-    }
-
-    Ok(text)
 }
 
 /// What one pack authors, before any fallback is applied.
@@ -105,7 +76,7 @@ pub struct PackSpec {
     /// Rejected v2 entries and asset failures (empty for v1 packs).
     pub diagnostics: Vec<ContentDiagnostic>,
     /// Manifest/layer/logo fallbacks, in the v1 warning order.
-    pub warnings: Vec<SettingsWarning>,
+    pub warnings: Vec<PackWarning>,
 }
 
 /// Read one pack directory into authored presence only.
@@ -122,7 +93,7 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     let (manifest, root, mut manifest_warnings) = match read_manifest_text(&manifest_path) {
         Ok(text) => manifest::parse_pack_file(&text),
         Err(err) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: "pack.toml".to_string(),
                 reason: format!("failed to read {}: {err}", manifest_path.display()),
             });
@@ -134,11 +105,13 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     // The v2 gate owns the v1 "content arrays require format_version = 2"
     // warning and the future-version warning. A syntactically invalid manifest
     // has no root and produced its own warning above.
-    let (mut content, mut content_warnings, mut diagnostics) = match &root {
+    let (mut content, content_warnings, mut diagnostics) = match &root {
         Some(root) => v2::parse_content(root, manifest.format_version),
         None => (PackContentSpec::default(), Vec::new(), Vec::new()),
     };
-    warnings.append(&mut content_warnings);
+    // The parser already speaks the neutral warning type, so the v2 gate's
+    // warnings append unchanged and every authored fallback keeps one order.
+    warnings.extend(content_warnings);
     if manifest.format_version == PackFormat::V2 {
         v2::load_content_assets(dir, &mut content, &mut diagnostics);
     }
@@ -178,86 +151,13 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
 
 /// Decode one optional layer file into resampled 16x16 RGBA bytes.
 ///
-/// This is the single-file seam shared by startup loading and live texture
-/// reload. A missing file is `Ok(None)` (the stack keeps whatever is below);
-/// a present-but-invalid file is `Err(reason)` using the exact startup reason
-/// strings. It never warns or touches presentation state.
-pub fn decode_layer_file(dir: &Path, file: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = dir.join(file);
-    if !path.exists() {
-        // Missing layer files are legal: the stack keeps whatever is below.
-        return Ok(None);
-    }
-
-    let decoded = decode::decode_png_rgba(&path, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "layers")?;
-    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
-}
-
-/// Decode one v2 pack asset into resampled 16x16 RGBA bytes.
-///
-/// Uses the same confinement, byte cap, and dimension rules as
-/// [`crate::pack::v2::load_content_assets`], but returns the failure reason to
-/// the caller instead of recording a diagnostic. This is the live-reload seam
-/// for pack block-face assets.
-pub fn decode_asset_file(dir: &Path, relative: &str) -> Result<Vec<u8>, String> {
-    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "assets")?;
-    Ok(resample::resample_to_16(&decoded.rgba, decoded.width))
-}
-
-/// Decode one optional `[builtin_icons]` PNG into resampled 16x16 RGBA bytes.
-///
-/// This is the live-reload seam for built-in sprite overrides. It applies the
-/// same confinement, byte cap, and square 16..=256 rules as
-/// [`decode_asset_file`], but a missing file is `Ok(None)` instead of an error:
-/// a deleted override must reveal the lower pack or procedural art. A path
-/// that escapes the pack folder, or a present-but-invalid/oversized image, is
-/// `Err(reason)`.
-pub fn decode_builtin_icon_file(dir: &Path, relative: &str) -> Result<Option<Vec<u8>>, String> {
-    let path = asset::resolve_asset_path(dir, relative)?;
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let (_path, bytes) = asset::read_asset_bytes(dir, relative)?;
-    let decoded = decode::decode_png_rgba_bytes(&bytes, relative, Some(MAX_LAYER_SIDE))?;
-    validate_square_16_to_256(&decoded, "assets")?;
-    Ok(Some(resample::resample_to_16(&decoded.rgba, decoded.width)))
-}
-
-/// Require a square image between [`MIN_LAYER_SIDE`] and [`MAX_LAYER_SIDE`].
-///
-/// `noun` selects the exact startup wording: `layers` for fixed-name layers
-/// and `assets` for v2 pack assets.
-fn validate_square_16_to_256(decoded: &decode::DecodedPng, noun: &str) -> Result<(), String> {
-    if decoded.width != decoded.height {
-        return Err(format!(
-            "image is {}x{}, {noun} must be square",
-            decoded.width, decoded.height
-        ));
-    }
-
-    if decoded.width < MIN_LAYER_SIDE || decoded.width > MAX_LAYER_SIDE {
-        return Err(format!(
-            "image is {}x{}, {noun} must be between {} and {} pixels per side",
-            decoded.width, decoded.height, MIN_LAYER_SIDE, MAX_LAYER_SIDE
-        ));
-    }
-
-    Ok(())
-}
-
-/// Decode one optional layer file into resampled 16x16 RGBA bytes.
-///
 /// A missing file is silent `None`; a present-but-invalid file is `None` plus
 /// one warning named after the bare file, matching v1 `apply_layer_files`.
-fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> Option<Vec<u8>> {
+fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<PackWarning>) -> Option<Vec<u8>> {
     match decode_layer_file(dir, file) {
         Ok(layer) => layer,
         Err(reason) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: file.to_string(),
                 reason,
             });
@@ -267,16 +167,12 @@ fn decode_layer(dir: &Path, file: &str, warnings: &mut Vec<SettingsWarning>) -> 
 }
 
 /// Decode the optional manifest logo at native size, warning on failure.
-fn load_logo(
-    dir: &Path,
-    logo: Option<&str>,
-    warnings: &mut Vec<SettingsWarning>,
-) -> Option<PackLogo> {
+fn load_logo(dir: &Path, logo: Option<&str>, warnings: &mut Vec<PackWarning>) -> Option<PackLogo> {
     let logo = logo?;
     let path = match asset::resolve_asset_path(dir, logo) {
         Ok(path) => path,
         Err(reason) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: logo.to_string(),
                 reason,
             });
@@ -290,7 +186,7 @@ fn load_logo(
             height: decoded.height,
         }),
         Err(err) => {
-            warnings.push(SettingsWarning {
+            warnings.push(PackWarning {
                 field: logo.to_string(),
                 reason: err,
             });
@@ -344,7 +240,7 @@ pub fn resolve_presentation(specs: &[PackSpec]) -> LoadedPack {
         if let Some(name) = &spec.manifest.name {
             display_name = Some(name.clone());
         }
-        warnings.extend(spec.warnings.iter().cloned());
+        warnings.extend(spec.warnings.iter().cloned().map(SettingsWarning::from));
     }
 
     let display_name = display_name
@@ -388,7 +284,7 @@ pub fn load_stack(
         }
 
         let spec = load_spec_from_dir(&dir);
-        warnings.extend(spec.warnings.iter().cloned());
+        warnings.extend(spec.warnings.iter().cloned().map(SettingsWarning::from));
         specs.push(spec);
     }
 
@@ -411,6 +307,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::audio::default_buffers;
+    use crate::pack::resample;
     use crate::render::texture::NUM_TEX_LAYERS;
 
     const LAYER_BYTES: usize = 16 * 16 * 4;

@@ -4,7 +4,7 @@
 # Runs `scripts/combat_smoke.sh` strictly serially N times (default 40) and
 # asserts that every run exits 0, so the Skeleton-stage spot scan never aborts
 # with `stage=skeleton observed=...spot`. The per-run script already pins the
-# six exact digests, the frame budget, the 317-byte v9 save layout and the
+# six exact digests, the frame budget, the sectioned v10 save witness and the
 # reload line; this script adds the repetition + aggregation contract.
 #
 # Inputs:

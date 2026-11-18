@@ -637,7 +637,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M010 / S02 pack format and validation
 - Primary owning slice: M010/S02
 - Supporting slices: None
-- Validation: cargo test --locked --lib -- pack::v2; cargo test --locked --lib -- pack::spec; cargo test --locked --lib -- pack::validate; bash scripts/validate_pack_smoke.sh; bash scripts/pack_smoke.sh
+- Validation: cargo test -p opencraft-content --locked -- v2::; cargo test --locked --lib -- pack::spec; cargo test --locked --lib -- pack::validate; bash scripts/validate_pack_smoke.sh; bash scripts/pack_smoke.sh
 
 ### R064 — Save v8 content table, v1-v7 migration, placeholders and changed-stack notice
 - Class: continuity
@@ -777,7 +777,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M014 / S07 built-in item overrides
 - Primary owning slice: M014/S07
 - Supporting slices: M014/S03, M014/S09
-- Validation: cargo test --locked --lib -- pack::v2; cargo test --locked --bin opencraft pack_builtin_icon; bash scripts/pack_smoke.sh; bash scripts/ui_smoke.sh
+- Validation: cargo test -p opencraft-content --locked -- v2::; cargo test --locked --bin opencraft pack_builtin_icon; bash scripts/pack_smoke.sh; bash scripts/ui_smoke.sh
 
 ### R078 — Durable restart-required recipe/pack content boundary with same-save restart
 - Class: primary-user-loop
@@ -797,12 +797,12 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M014 / S04 save v9
 - Primary owning slice: M014/S04
 - Supporting slices: None
-- Validation: cargo test --locked --test save_v9_cli; cargo test --locked --lib -- world::persistence; bash scripts/creator_smoke.sh
+- Validation: cargo test --locked --test save_v10_cli; cargo test --locked --lib -- world::persistence; bash scripts/creator_smoke.sh
 
 ### R080 — Release gating for creator tooling
 - Class: constraint
 - Status: active
-- Description: Release builds load `config/` and packs at startup but expose no watcher, F6 overlay, or creator trace; `--check-config` and `--creator-trace` print stable `...: dev build only` lines and exit nonzero without launching; no test pack ships under `packs/`; the headless `--demo-save-v9` and `--demo-restart` proof seams remain usable in release; a bounded release launch from an empty temp cwd survives without creator output or writes.
+- Description: Release builds load `config/` and packs at startup but expose no watcher, F6 overlay, or creator trace; `--check-config` and `--creator-trace` print stable `...: dev build only` lines and exit nonzero without launching; no test pack ships under `packs/`; the headless `--demo-save-v10` and `--demo-restart` proof seams remain usable in release; a bounded release launch from an empty temp cwd survives without creator output or writes.
 - Why it matters: Release hygiene is the milestone guardrail: players get stable defaults and pack loading, never creator tooling or test fixtures.
 - Source: M014 / S09 release gating
 - Primary owning slice: M014/S09
@@ -842,7 +842,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 ### R084 — Village lifecycle continuity and dispatch budget
 - Class: continuity
 - Status: active
-- Description: Production village state lives behind an `Arc<VillageCatalog>` with a cached spawn column, dispatches from both worldgen call sites, carries across a season rollover, installs only at new-world or session boundaries, and surfaces diagnostics as warnings. Player edits win so existing cells never re-place, `SAVE_VERSION` stays 9, and no prefab name appears in save bytes or the content table. With villages enabled the measured release dispatch budget is p95 <= 8 ms and max <= 16 ms, with frame p95 <= 16.6 ms.
+- Description: Production village state lives behind an `Arc<VillageCatalog>` with a cached spawn column, dispatches from both worldgen call sites, carries across a season rollover, installs only at new-world or session boundaries, and surfaces diagnostics as warnings. Player edits win so existing cells never re-place, the village system adds no save field; prefab names never appear in save bytes or the content table (the current writer is v10). With villages enabled the measured release dispatch budget is p95 <= 8 ms and max <= 16 ms, with frame p95 <= 16.6 ms.
 - Why it matters: Adding content to worldgen must not disturb saves or the frame budget, and refilling must never overwrite what the player built.
 - Source: M015 / S03 lifecycle and S08 budget proof
 - Primary owning slice: M015/S03
@@ -857,7 +857,7 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Source: M015 / S04 socket marker block
 - Primary owning slice: M015/S04
 - Supporting slices: M015/S05, M015/S06
-- Validation: cargo test --locked --lib -- world::block; cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v9_cli; bash scripts/presentation_smoke.sh; bash scripts/palette_smoke.sh
+- Validation: cargo test --locked --lib -- world::block; cargo test --locked --bin opencraft -- socket_marker; cargo test --locked --test save_v10_cli; bash scripts/presentation_smoke.sh; bash scripts/palette_smoke.sh
 
 ### R086 — Creative two-corner prefab capture
 - Class: primary-user-loop
@@ -892,17 +892,17 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 ### R089 — Neutral engine crate workspace and boundary contract
 - Class: integration
 - Status: active
-- Description: The root `opencraft` game package stays at the repository root; the workspace members `opencraft-core`, `opencraft-gfx`, `opencraft-physics`, `opencraft-pathfinding` and `engine-reuse-proof` live under `crates/`, each `publish = false` with an independent 0.1.0 version. No engine crate depends on `opencraft`; `opencraft-core` has no GPU or windowing dependency; `opencraft-gfx` has no `winit` and takes a game-created surface; physics and pathfinding query blocks only through `BlockQuery -> BlockKind`; and no `BlockId`, `ContentRegistry`, `Player`, `WorldSession` or `Mob` crosses into a crate. The game consumes gfx through a game-created `Instance` and `Surface<'static>`, physics through `BlockIdQuery`, and pathfinding steering through the same query, and the duplicate solver, geometry, raycast and mover bodies and the temporary `src/render` re-export facade are deleted.
+- Description: The root `opencraft` game package stays at the repository root; the workspace members `opencraft-core`, `opencraft-gfx`, `opencraft-physics`, `opencraft-pathfinding` and `engine-reuse-proof` live under `crates/`, each `publish = false` with an independent 0.1.0 version. No engine crate depends on `opencraft`; `opencraft-core` has no GPU or windowing dependency; `opencraft-gfx` has no `winit` and takes a game-created surface; physics and pathfinding query blocks only through `BlockQuery -> BlockKind`; and no `BlockId`, `ContentRegistry`, `Player`, `WorldSession` or `Mob` crosses into a crate. The game consumes gfx through a game-created `Instance` and `Surface<'static>`, physics through `BlockIdQuery`, and pathfinding steering through the same query, and the duplicate solver, geometry, raycast and mover bodies and the temporary `src/render` re-export facade are deleted. The workspace now also has the three M018 members `opencraft-storage`, `opencraft-content` and `opencraft-worldgen` (independent 0.1.0, `publish = false`; storage depends only on core, content on core+toml+png, worldgen on core+content+toml+glam; the game adapts at raw-`u16`/neutral-tag boundaries through the save archive, `ContentRegistry`, `BlockIdQuery` and `WorldGenContext`).
 - Why it matters: Compiler-enforced reuse is the point of the split; one neutral boundary keeps the engine crates reusable outside the game package.
 - Source: M017 / S01-S09 engine partition and game migration
 - Primary owning slice: M017/S09
 - Supporting slices: M017/S01, M017/S02, M017/S03, M017/S04, M017/S05, M017/S06, M017/S07
-- Validation: cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo metadata --locked --no-deps --format-version 1; cargo tree --locked -p opencraft-core; cargo tree --locked -p opencraft-gfx; cargo tree --locked -p opencraft-physics; cargo tree --locked -p opencraft-pathfinding
+- Validation: cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo metadata --locked --no-deps --format-version 1; cargo tree --locked -p opencraft-core; cargo tree --locked -p opencraft-gfx; cargo tree --locked -p opencraft-physics; cargo tree --locked -p opencraft-pathfinding; cargo test -p opencraft-storage --locked; cargo test -p opencraft-content --locked; cargo test -p opencraft-worldgen --locked; cargo tree --locked -p opencraft-storage; cargo tree --locked -p opencraft-content; cargo tree --locked -p opencraft-worldgen
 
 ### R090 — Device-free external reuse proof
 - Class: differentiator
 - Status: active
-- Description: `crates/engine-reuse-proof` depends only on the four engine crates plus `glam 0.27`, compiles and runs headless, exercises a physics body, raycast and sweep, steering, deterministic A* and gfx CPU-side mesh, texture and model data, prints the deterministic 15-line `ProofReport`, never imports `opencraft`, never creates a GPU adapter or surface, and CI runs its tests explicitly.
+- Description: `crates/engine-reuse-proof` depends only on the seven engine crates plus `glam 0.27`, compiles and runs headless, exercises a physics body, raycast and sweep, steering, deterministic A* and gfx CPU-side mesh, texture and model data, the storage archive/codec, the pack parse and neutral catalog digest, and the four-chunk terrain and village plan proofs, prints the deterministic 22-line `ProofReport`, never imports `opencraft`, never creates a GPU adapter or surface, and CI runs its tests explicitly.
 - Why it matters: A real external consumer is the only proof the crates are reusable without the game package or a GPU.
 - Source: M017 / S08 external reuse proof
 - Primary owning slice: M017/S09
@@ -911,23 +911,87 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R091 — Game migration without save or gameplay regression and the M017 closure surface
 - Class: launchability
-- Status: active
+- Status: superseded
 - Description: v1-v9 saves load, v9 writes and reads byte-stably, `SAVE_VERSION` stays 9, and `.mcvx`, pack and worldgen formats are unchanged. The full workspace suite, all 23 smoke scripts and the demo digests are green, the 317-byte v9 witness is unchanged, frame p95 stays at or below 16.6 ms, and streaming and autosave distributions are re-reported rather than re-pinned. CI is green on Linux and Windows, clippy, fmt, release build, package and installer scripts are green, `docs/CRATES.md` records the layout, boundaries, neutral-API rules and M018 scope, and the registry carries R089-R092 plus the 10-row M017 trace with checker and selftest lockstep.
 - Why it matters: M017 must close without changing saves or gameplay, and the closure proof must be reproducible on the final tree.
 - Source: M017 / S09 closure and final operational verification
 - Primary owning slice: M017/S09
 - Supporting slices: M017/S01, M017/S02, M017/S03, M017/S04, M017/S05, M017/S06, M017/S07, M017/S08
 - Validation: bash scripts/ci_gate.sh; cargo test --workspace --locked; cargo test -p opencraft --locked --lib -- world::persistence; cargo test -p opencraft --locked --test save_v9_cli; cargo test --locked --release --test autosave_budget -- --ignored --nocapture; cargo test --locked --release --lib -- --ignored streaming_budget --nocapture; cargo test --locked --release --test village_frame_budget -- --ignored --nocapture; cargo build --release --locked; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+- Superseded by: M018/S08
+- Note: Superseded for M018 by R094 and R095.
 
 ### R092 — Constraint: no format, gameplay or threshold scope creep
 - Class: constraint
-- Status: active
+- Status: superseded
 - Description: `SAVE_VERSION` stays 9 and `.mcvx`, pack and worldgen formats are unchanged; A* stays unwired in mob behavior; `daycycle` celestial math, texture layer identity, hotbar layout, procedural art and mob scene assembly stay game-side; only provably dead or duplicated code is deleted; no new external dependency is added without a decision; and no digest, witness or performance threshold is re-pinned without a decision and evidence.
 - Why it matters: The partition refactor must not smuggle in format, gameplay or threshold changes.
 - Source: M017 / S09 scope guardrails
 - Primary owning slice: M017/S09
 - Supporting slices: M017/S09
 - Validation: cargo test -p opencraft --locked --test save_v9_cli; cargo test -p opencraft --locked --lib -- world::persistence; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; git diff --exit-code -- tests/fixtures packs worldgen; ! rg -q find_path src; ! rg -q NavGrid src
+- Superseded by: M018/S08
+- Note: Superseded for M018 by R098.
+
+### R093 — Neutral storage/chunk-streaming crate and boundary contract
+- Class: integration
+- Status: active
+- Description: `opencraft-storage` owns the neutral sectioned `.mcvx` archive (MCVX header, 21-byte section directory, opaque bounded sections), the canonical chunk-section palette codec over raw `u16` content indices, lazy section reading, typed fail-closed `StorageError`, the 256 MiB cap and atomic temp+rename file helpers; it depends only on `opencraft-core` (dev `tempfile`), has no game/GPU/window/content/worldgen edge, is 0.1.0 `publish = false`, and appears in both boundary-gate lists; game save I/O routes through it and the device-free consumer proves the archive/codec.
+- Why it matters: a reusable storage layer is the M018 boundary payoff and the base for v10.
+- Source: M018 / S01 storage crate
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S01, M018/S02, M018/S03
+- Validation: `cargo test -p opencraft-storage --locked; cargo test -p engine-reuse-proof --locked; bash scripts/check_engine_boundaries.sh; cargo tree --locked -p opencraft-storage --edges normal,build,dev; cargo test --workspace --locked`
+
+### R094 — Save v10 sectioned format, forward migration and lazy chunk-edit store
+- Class: continuity
+- Status: active
+- Description: v10 is the only `.mcvx` writer with fixed sections 1-9 (sorted kind-tagged content table, world/player, inventory, chests, mobs, content meta, config, crops, sorted chunk index), per-chunk palette sections keyed by content-table name index, codec 0 only, eager content-table resolution with placeholders and typed fail-closed errors; v1-v9 read forward, frozen v8/v9 fixtures migrate, v10 resaves byte-stably, and the game loads through the Arc-COW `ChunkEditMap`/`EditSection` Palette store with per-arriving-chunk edits and crop-section load; old builds cannot read v10 and the copy-first warning stays.
+- Why it matters: the sectioned/lazy format is the deliberate format change and the measured cold-load win.
+- Source: M018 / S02-S03 save v10 and lazy store
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S01, M018/S02, M018/S03
+- Validation: `cargo test -p opencraft --locked --test save_v10_cli; cargo test -p opencraft --locked --lib -- world::persistence; cargo test -p opencraft --locked --lib -- world::edit_store; cargo test -p opencraft --locked --lib -- world::session; cargo test --locked --release --lib -- --ignored cold_load_release_baseline --nocapture`
+
+### R095 — Measured cold-load target and no-regression budgets
+- Class: quality-attribute
+- Status: active
+- Description: the release-only 10M-edit/20,000-chunk harness measures v9 and v10 in the same run on the same host/profile; the v9 storage+session p50 baseline is frozen at 319.630 ms and the exact v10 target at 159.815 ms (ratio 0.50); v10 must meet the target with identical edits/checksum `0xd3ef88bdc7ae0ebc`, first-area and full-verify guardrails and byte-identical v9-to-session-to-v10 migration; the 1M pair is report-only; the four existing budgets stay no-regression guardrails (autosave frame p95 <= 16.6 ms, streaming p95 <= 8/max <= 16 ms, streaming-with-villages, village frame p95 <= 16.6 ms).
+- Why it matters: the runtime payoff must be measured against a recorded baseline, not claimed.
+- Source: M018 / S01 baseline and S03 win
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S01, M018/S03
+- Validation: the five cold-load/budget commands listed in the research, one line each: cold_load_release_baseline, autosave_budget, streaming_budget, streaming_budget_villages, village_frame_budget, all with `cargo test --locked --release` and `--ignored --nocapture`
+
+### R096 — Neutral pack/content crate and registry adapter
+- Class: integration
+- Status: active
+- Description: `opencraft-content` owns `pack.toml`/v2 parsing, per-entry diagnostics, asset confinement/caps, PNG decode/16x16 resample, frozen name vocabulary, deterministic allocation, patch precedence, placeholder allocation, the FNV-1a content digest over raw `u16` ids and the deterministic `--validate-pack` renderer; `ContentRegistry` is a thin game adapter; pinned digests are reference `0xbacbc160bdf76d08`, reference+overlay `0xabb6212ad7506661`, builtin `0xcbf29ce484222325`; the consumer prints `content.pack_entries=2` and `content.catalog_digest=0xdd3648c397a414c0`.
+- Why it matters: pack/content policy must be reusable without the game while every pack byte and demo line stays unchanged.
+- Source: M018 / S04-S05 content crate
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S01, M018/S04, M018/S05
+- Validation: `cargo test -p opencraft-content --locked; cargo test -p opencraft --locked --lib -- content::; cargo test -p opencraft --locked --bin opencraft -- content_digest; cargo test -p engine-reuse-proof --locked; bash scripts/pack_smoke.sh`
+
+### R097 — Neutral worldgen/prefab/village crate and terrain pass
+- Class: integration
+- Status: active
+- Description: `opencraft-worldgen` owns neutral Biome/tags, height/ruin/tree/spawn queries, loot vocabulary, the prefab codec/catalog/serializer behind `BlockNameResolver`, the village codec/catalog/fingerprint/plan/chunk-local emission, and the complete terrain pass over a raw-`u16` `ChunkBuffer` (caves, ores, ruins, trees, patches, seasons, villages); the game keeps `Chunk`, the move-only `chunk_from_buffer` adapter, `WorldGenContext`, season/clock policy, capture and UI; pinned fingerprint `0x5c2b550240d34cfb`, plan 13/12/48/22 at `[1654,-1383]`, layout digest `0x79663be18a213bab`, capture 423/425; the consumer prints the terrain and village lines.
+- Why it matters: the whole worldgen subsystem must be reusable without the game while output stays byte-identical.
+- Source: M018 / S06-S07 worldgen crate
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S01, M018/S04, M018/S05, M018/S06, M018/S07
+- Validation: `cargo test -p opencraft-worldgen --locked; cargo test -p opencraft --locked --lib -- world::terrain; cargo test -p opencraft --locked --lib -- world::village; cargo test -p opencraft --locked --test worldgen_refs --test worldgen_cli --test village_determinism --test village_session --test village_continuity --test capture_cli; bash scripts/worldgen_smoke.sh; bash scripts/village_smoke.sh`
+
+### R098 — M018 scope guardrail and closure surface
+- Class: constraint
+- Status: active
+- Description: M018 changes exactly one format (`.mcvx` v10); pack and worldgen formats stay byte-identical; A* stays unwired; `daycycle` math, texture layer identity, hotbar layout, procedural art, mob scene assembly and all save/game policy stay game-side; no new external dependency without a decision; no digest, witness or performance threshold is re-pinned without a decision and evidence; closure requires the 23 debug smokes, nine documented release legs, the four unchanged budgets, the cold-load gate, fmt/clippy/workspace tests, the boundary gate, release build/package of 0.3.0 and Linux+Windows CI green on the final pushed SHA.
+- Why it matters: the deliberate v10 change must not smuggle in any other format, gameplay or threshold change.
+- Source: M018 / S08 scope guardrail
+- Primary owning slice: M018/S08
+- Supporting slices: M018/S08
+- Validation: `bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu; WORKFLOW=ci.yml bash scripts/ci_gate.sh; git diff --exit-code -- tests/fixtures/packs worldgen tests/fixtures/saves`
 
 ## M003 Criterion Trace
 
@@ -1078,3 +1142,18 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 8 | R091 | S09 | bash scripts/ci_gate.sh && cargo build --release --locked |
 | 9 | R091 | S09 | cargo test --locked --release --test autosave_budget -- --ignored --nocapture && cargo test --locked --release --lib -- --ignored streaming_budget --nocapture && cargo test --locked --release --test village_frame_budget -- --ignored --nocapture |
 | 10 | R091 | S09 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && cargo test --workspace --locked |
+
+## M018 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R093, R096, R097 | S01, S04, S06, S07 | cargo test --workspace --locked && cargo test -p engine-reuse-proof --locked |
+| 2 | R093 | S01 | bash scripts/check_engine_boundaries.sh && cargo metadata --locked --no-deps --format-version 1 |
+| 3 | R090, R093, R096, R097 | S08 | cargo run -p engine-reuse-proof --locked |
+| 4 | R094 | S01, S02, S03 | cargo test -p opencraft --locked --test save_v10_cli && cargo test -p opencraft --locked --lib -- world::persistence |
+| 5 | R096, R097 | S04, S05, S06, S07 | bash scripts/pack_smoke.sh && bash scripts/worldgen_smoke.sh && bash scripts/village_smoke.sh && git diff --exit-code -- tests/fixtures/packs worldgen |
+| 6 | R095 | S01, S03 | cargo test --locked --release --lib -- --ignored cold_load_release_baseline --nocapture |
+| 7 | R095, R098 | S08 | cargo test --locked --release --test autosave_budget -- --ignored --nocapture && cargo test --locked --release --lib -- --ignored streaming_budget --nocapture && cargo test --locked --release --test village_frame_budget -- --ignored --nocapture |
+| 8 | R098 | S08 | 23 debug smoke scripts and nine release-profile legs recorded in docs/RELEASE.md |
+| 9 | R098 | S08 | cargo fmt --all -- --check && cargo clippy --workspace --locked --all-targets -- -D warnings && cargo build --release --locked && bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu |
+| 10 | R089, R090, R093, R094, R095, R096, R097, R098 | S08 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && WORKFLOW=ci.yml bash scripts/ci_gate.sh |

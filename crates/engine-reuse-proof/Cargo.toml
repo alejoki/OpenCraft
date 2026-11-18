@@ -7,7 +7,10 @@ publish = false
 
 [dependencies]
 glam = "0.27"
+opencraft-content = { path = "../opencraft-content" }
 opencraft-core = { path = "../opencraft-core" }
 opencraft-gfx = { path = "../opencraft-gfx" }
 opencraft-physics = { path = "../opencraft-physics" }
 opencraft-pathfinding = { path = "../opencraft-pathfinding" }
+opencraft-storage = { path = "../opencraft-storage" }
+opencraft-worldgen = { path = "../opencraft-worldgen" }

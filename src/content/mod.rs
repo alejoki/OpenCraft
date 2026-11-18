@@ -1,9 +1,11 @@
 //! Immutable content registry and built-in content definitions.
 //!
-//! [`ContentRegistry::builtin`] is the single authoritative built-in content
-//! table. [`registry::build_registry`] folds an ordered pack stack over it into
-//! one deterministic, immutable [`ContentRegistry`]. Later slices freeze the
-//! result behind `Arc<ContentRegistry>` once modded content is live.
+//! [`ContentRegistry`] is the game adapter over the neutral
+//! `opencraft-content` catalog: [`ContentRegistry::builtin`] is the single
+//! authoritative built-in table and [`registry::build_registry`] converts it to
+//! a neutral base, folds an ordered pack stack and converts every row back into
+//! game types. Later slices freeze the result behind `Arc<ContentRegistry>`
+//! once modded content is live.
 //!
 //! This module deliberately has no render, audio, settings, filesystem or pack
 //! dependency: content identity must stay decoupled from presentation and
@@ -16,6 +18,10 @@ pub mod names;
 pub mod registry;
 pub mod spec;
 
+pub use opencraft_content::catalog::{
+    LayerSource, EMPTY_DIGEST, PACK_ICON_BASE, PACK_ICON_CAP, PACK_LAYER_BASE, PACK_LAYER_CAP,
+    PLACEHOLDER_BLOCK_LAYER, PLACEHOLDER_ICON_LAYER,
+};
 pub use registry::{build_registry, ContentLoadReport, PackIdentity};
 pub use spec::{ContentDiagnostic, PackContentSpec, Severity};
 
@@ -28,37 +34,6 @@ use crate::player::inventory::{
 use crate::player::tools::{self, ToolRules};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 use crate::world::terrain::Biome;
-
-/// First texture-array layer reserved for pack-authored block faces.
-///
-/// Mirrors [`crate::render::texture::NUM_TEX_LAYERS`] as a literal so `content`
-/// stays render-free; S04 grows the array to [`PACK_LAYER_CAP`].
-pub const PACK_LAYER_BASE: u8 = 48;
-
-/// Exclusive upper bound for pack-authored block face layers (160 pack layers).
-pub const PACK_LAYER_CAP: u8 = 208;
-
-/// First reserved block face layer used when a pack asset is missing or the
-/// layer space overflows: the built-in checker placeholder.
-///
-/// Starts at 26 so a fallback never aliases layer 25, the built-in
-/// socket-marker art that packs cannot override.
-pub const PLACEHOLDER_BLOCK_LAYER: u8 = 26;
-
-/// First icon layer reserved for pack-authored item/tool icons.
-pub const PACK_ICON_BASE: u8 = 32;
-
-/// Exclusive upper bound for pack-authored icon layers (192 pack icons).
-pub const PACK_ICON_CAP: u8 = 224;
-
-/// Reserved icon layer used when a pack icon is missing or icon space overflows.
-pub const PLACEHOLDER_ICON_LAYER: u8 = 27;
-
-/// Digest of a registry with no packs: the FNV-1a 64 offset basis.
-///
-/// The digest excludes built-in definitions, asset bytes and diagnostics, so
-/// the built-in registry is exactly the empty-stack digest.
-pub const EMPTY_DIGEST: u64 = 0xcbf2_9ce4_8422_2325;
 
 /// A reference to an item identity before `ItemId`/`RecipeId` widening.
 ///
@@ -297,21 +272,6 @@ impl BlockDef {
     }
 }
 
-/// Provenance of one frozen pack-authored block layer or icon.
-///
-/// `path` is the pack-relative authored path exactly as the pack names it
-/// (the bare file name for fixed-name layers). A source is metadata only: it
-/// identifies which `(pack, path)` produced a GPU layer, so a live edit can
-/// rewrite that layer without re-deriving allocation. Sources never enter the
-/// content digest.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LayerSource {
-    /// Pack folder name (stable identity inside `packs/`).
-    pub folder: String,
-    /// Pack-relative authored path.
-    pub path: String,
-}
-
 /// Immutable, session-scoped registry of content definitions.
 ///
 /// The built-in registry is created once and shared through a `OnceLock`; a
@@ -372,19 +332,10 @@ impl ContentRegistry {
     pub fn append_placeholder_block(&mut self, name: &str) -> BlockId {
         let raw = u16::try_from(self.blocks.len())
             .expect("content registry block count exceeds the u16 id space");
-        let id = BlockId::Modded(raw);
-        self.blocks.push(BlockDef {
-            id,
-            name: name.to_string(),
-            display_name: name.to_string(),
-            faces: [PLACEHOLDER_BLOCK_LAYER; 6],
-            hardness: None,
-            drop: None,
-            tool_class: None,
-            stack_limit: MAX_STACK_COUNT,
-            placeholder: true,
-        });
-        id
+        self.blocks.push(registry::block_from_catalog(
+            opencraft_content::catalog::placeholder_block(raw, name, MAX_STACK_COUNT),
+        ));
+        BlockId::Modded(raw)
     }
 
     /// Appends a deterministic placeholder item for a save-local name.
@@ -395,16 +346,9 @@ impl ContentRegistry {
     pub fn append_placeholder_item(&mut self, name: &str) -> u16 {
         let index = u16::try_from(self.items.len())
             .expect("content registry item count exceeds the u16 item space");
-        self.items.push(ItemDef {
-            index,
-            name: name.to_string(),
-            display_name: name.to_string(),
-            icon_layer: PLACEHOLDER_ICON_LAYER,
-            stack_limit: MAX_STACK_COUNT,
-            food: None,
-            placeholder: true,
-            placeholder_tool: false,
-        });
+        self.items.push(registry::item_from_catalog(
+            opencraft_content::catalog::placeholder_item(index, name, MAX_STACK_COUNT),
+        ));
         index
     }
 
@@ -418,13 +362,11 @@ impl ContentRegistry {
     /// Persistence policy: wear is not carried through the placeholder — the
     /// restored tool comes back at its authored maximum durability.
     pub fn append_placeholder_tool_item(&mut self, name: &str) -> u16 {
-        let index = self.append_placeholder_item(name);
-        let def = self
-            .items
-            .get_mut(usize::from(index))
-            .expect("the placeholder was just appended");
-        def.placeholder_tool = true;
-        def.stack_limit = 1;
+        let index = u16::try_from(self.items.len())
+            .expect("content registry item count exceeds the u16 item space");
+        self.items.push(registry::item_from_catalog(
+            opencraft_content::catalog::placeholder_tool_item(index, name),
+        ));
         index
     }
 
@@ -761,59 +703,13 @@ pub fn content_mismatch_note(
     current: &ContentRegistry,
     unresolved: usize,
 ) -> Option<String> {
-    let saved: BTreeMap<&str, Option<&str>> = saved_packs
-        .iter()
-        .map(|pack| (pack.folder.as_str(), pack.version.as_deref()))
-        .collect();
-    let loaded: BTreeMap<&str, Option<&str>> = current
-        .packs()
-        .iter()
-        .map(|pack| (pack.folder.as_str(), pack.version.as_deref()))
-        .collect();
-
-    let mut notes = Vec::new();
-    for folder in saved.keys() {
-        if !loaded.contains_key(folder) {
-            notes.push(format!("missing pack `{folder}`"));
-        }
-    }
-    for folder in loaded.keys() {
-        if !saved.contains_key(folder) {
-            notes.push(format!("added pack `{folder}`"));
-        }
-    }
-    for (folder, saved_version) in &saved {
-        let Some(loaded_version) = loaded.get(folder) else {
-            continue;
-        };
-        if saved_version != loaded_version {
-            notes.push(format!(
-                "pack `{folder}` version changed from {} to {}",
-                saved_version.unwrap_or("unspecified"),
-                loaded_version.unwrap_or("unspecified"),
-            ));
-        }
-    }
-
-    // A digest difference with identical pack identities means a definition
-    // (or an authored asset key) changed underneath the same stack.
-    if saved_digest != current.digest() && notes.is_empty() {
-        notes.push("content definitions changed".to_string());
-    }
-
-    if unresolved > 0 {
-        notes.push(format!(
-            "{unresolved} saved content name{} {} unavailable and render as placeholders",
-            if unresolved == 1 { "" } else { "s" },
-            if unresolved == 1 { "is" } else { "are" },
-        ));
-    }
-
-    if notes.is_empty() {
-        None
-    } else {
-        Some(notes.join("; "))
-    }
+    opencraft_content::catalog::content_mismatch_note(
+        saved_packs,
+        saved_digest,
+        current.packs(),
+        current.digest(),
+        unresolved,
+    )
 }
 
 fn builtin_blocks() -> Vec<BlockDef> {
@@ -1088,6 +984,35 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_tool_item_matches_the_crate_row() {
+        let mut registry = ContentRegistry::builtin().clone();
+        let generic = registry.append_placeholder_item("mymod:gem");
+        assert_eq!(generic, 0);
+
+        let start = registry.items().len();
+        let index = registry.append_placeholder_tool_item("mymod:gone_pickaxe");
+        assert_eq!(usize::from(index), start, "index is the pre-append length");
+
+        let def = registry.item(index).expect("tool placeholder row");
+        assert!(def.placeholder);
+        assert!(
+            def.placeholder_tool,
+            "a re-save must keep the pack-tool tag"
+        );
+        assert_eq!(def.name, "mymod:gone_pickaxe");
+        assert_eq!(def.display_name, "mymod:gone_pickaxe");
+        assert_eq!(def.icon_layer, PLACEHOLDER_ICON_LAYER);
+        assert_eq!(def.stack_limit, 1, "tools never stack");
+        assert_eq!(def.food, None);
+
+        // Placeholder appends are not pack definitions: the digest and pack
+        // stack stay exactly as they were.
+        assert_eq!(registry.digest(), ContentRegistry::builtin().digest());
+        assert!(registry.packs().is_empty());
+        assert!(ContentRegistry::builtin().items().is_empty());
+    }
+
+    #[test]
     fn builtin_arc_is_shared_and_matches_builtin() {
         let first = ContentRegistry::builtin_arc();
         let second = ContentRegistry::builtin_arc();
@@ -1147,6 +1072,29 @@ mod tests {
         assert_eq!(
             content_mismatch_note(registry.packs(), registry.digest(), &registry, 0),
             None
+        );
+    }
+
+    #[test]
+    fn content_mismatch_note_delegates_to_the_neutral_catalog() {
+        assert_eq!(
+            content_mismatch_note(&[], EMPTY_DIGEST, ContentRegistry::builtin(), 0),
+            None
+        );
+
+        let saved = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("1.0"), stone_display("Stone"))],
+        )
+        .0;
+        let changed = build_registry(
+            ContentRegistry::builtin(),
+            &[pack("alpha", Some("2.0"), stone_display("Stone"))],
+        )
+        .0;
+        assert_eq!(
+            content_mismatch_note(saved.packs(), saved.digest(), &changed, 0),
+            Some("pack `alpha` version changed from 1.0 to 2.0".to_string())
         );
     }
 

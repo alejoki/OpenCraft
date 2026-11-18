@@ -1,1206 +1,378 @@
-//! Deterministic pack-stack → registry builder.
+//! Game adapter over the neutral `opencraft-content` catalog.
 //!
-//! [`build_registry`] folds the ordered pack stack over the built-in content
-//! table into one immutable [`ContentRegistry`]. Allocation is pure data:
-//!
-//! * every id is allocated in sorted order at a dense index (blocks from
-//!   [`BUILTIN_BLOCK_COUNT`], items from 0, tiers from 3, recipes from 22),
-//! * pack block faces and item/tool icons are appended to append-only layer
-//!   tables, deduplicated by `(pack folder, authored path)`,
-//! * worldgen rules keep authored stack order under an eight-rule cap, and
-//! * a hand-rolled FNV-1a 64 digest covers the resulting definitions (never
-//!   asset bytes), so `--validate-pack` and a game load agree.
+//! [`build_registry`] converts the game's built-in tables into a neutral
+//! [`Catalog`] base, lets `opencraft_content::catalog::build_catalog` fold the
+//! ordered pack stack, and converts every resulting row back into game types.
+//! Allocation order, patch precedence, placeholder allocation, the FNV-1a
+//! content digest, the layer/icon caps and the changed-stack notice all live in
+//! `opencraft-content`; this module owns only the field-for-field identity
+//! mapping, so no game type (`BlockId`, `ItemRef`, `ContentRegistry`) crosses
+//! the boundary.
 //!
 //! Nothing here touches the filesystem, renderer, audio, settings or the pack
 //! loader: input is a list of [`PackIdentity`] + [`PackContentSpec`] pairs.
 
-use std::collections::{BTreeMap, BTreeSet};
+pub use opencraft_content::catalog::{ContentLoadReport, PackIdentity, WORLDGEN_RULE_CAP};
+
+use std::collections::BTreeMap;
+
+use opencraft_content::catalog::{
+    self as neutral, BlockDef as NeutralBlockDef, Catalog, ItemDef as NeutralItemDef,
+    ItemRef as NeutralItemRef, RecipeDef as NeutralRecipeDef, TierDef as NeutralTierDef,
+    ToolDef as NeutralToolDef, WorldgenRule as NeutralWorldgenRule,
+};
 
 use crate::content::names;
-use crate::content::spec::{
-    BlockEntry, BlockPatch, BlockTextures, ContentDiagnostic, ItemEntry, PackAsset,
-    PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry, ToolEntry, WorldgenEntry,
-    WorldgenKind,
-};
+use crate::content::spec::{FoodSpec, PackContentSpec};
 use crate::content::{
-    BlockDef, ContentRegistry, FoodDef, ItemDef, ItemRef, LayerSource, RecipeDef, TierDef, ToolDef,
-    WorldgenRule, EMPTY_DIGEST, PACK_ICON_BASE, PACK_ICON_CAP, PACK_LAYER_BASE, PACK_LAYER_CAP,
-    PLACEHOLDER_BLOCK_LAYER, PLACEHOLDER_ICON_LAYER,
+    BlockDef, ContentRegistry, FoodDef, ItemDef, ItemRef, RecipeDef, TierDef, ToolDef, WorldgenRule,
 };
-use crate::player::inventory::{ItemId, ToolKind, ToolTier};
-use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
+use crate::player::inventory::ItemId;
+use crate::world::block::BlockId;
 use crate::world::terrain::Biome;
-
-/// Maximum number of worldgen rules the stack may contribute.
-pub const WORLDGEN_RULE_CAP: usize = 8;
-
-/// Number of built-in tool tiers: wood, stone, iron.
-pub const BUILTIN_TIER_COUNT: u16 = 3;
-
-/// Identity of one pack in the stack, hashed into the registry digest.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackIdentity {
-    /// Pack folder name (stable identity inside `packs/`).
-    pub folder: String,
-    /// Optional authored pack version.
-    pub version: Option<String>,
-}
-
-/// Outcome of one [`build_registry`] call.
-///
-/// `entries` is the number of authored content entries considered across the
-/// stack (blocks, items, tiers, tools, recipes, worldgen rules and patches);
-/// it is the summary line the `--validate-pack` CLI prints.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ContentLoadReport {
-    /// Authored content entries considered.
-    pub entries: usize,
-    /// Per-entry problems collected while building the registry.
-    pub diagnostics: Vec<ContentDiagnostic>,
-}
-
-impl ContentLoadReport {
-    /// Number of error-severity diagnostics.
-    pub fn errors(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Error)
-            .count()
-    }
-
-    /// Number of warning-severity diagnostics.
-    pub fn warnings(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == Severity::Warning)
-            .count()
-    }
-}
-
-/// Resolved string → identity lookups shared by every reference field.
-struct Resolver<'a> {
-    block_ids: &'a BTreeMap<&'a str, BlockId>,
-    item_indices: &'a BTreeMap<&'a str, u16>,
-    tool_indices: &'a BTreeMap<&'a str, u16>,
-}
-
-impl Resolver<'_> {
-    /// Resolve a block reference: pack block first, then a built-in name.
-    fn block(&self, name: &str) -> Option<BlockId> {
-        self.block_ids
-            .get(name)
-            .copied()
-            .or_else(|| names::builtin_block_id_by_name(name))
-    }
-
-    /// Resolve a generic item reference.
-    ///
-    /// Pack blocks/items/tools shadow nothing (their ids are namespaced), so
-    /// the pack tables are consulted first and the frozen built-in vocabulary
-    /// is the fallback.
-    fn item_ref(&self, name: &str) -> Option<ItemRef> {
-        if let Some(block) = self.block_ids.get(name) {
-            return Some(ItemRef::Block(*block));
-        }
-        if let Some(index) = self.item_indices.get(name) {
-            return Some(ItemRef::Item(*index));
-        }
-        if let Some(index) = self.tool_indices.get(name) {
-            return Some(ItemRef::Tool(*index));
-        }
-        names::builtin_item_id_by_name(name).map(ItemRef::from_item_id)
-    }
-}
 
 /// Fold an ordered pack stack over `base` into a fresh registry.
 ///
 /// The returned registry is immutable; the caller owns any `Arc` freezing.
-/// A malformed reference records a [`Severity::Error`] diagnostic and falls
-/// back to the safe value instead of panicking (the pack parser normally
-/// rejects those entries before they reach a spec).
+/// A malformed reference records a [`crate::content::Severity::Error`]
+/// diagnostic and falls back to the safe value instead of panicking (the pack
+/// parser normally rejects those entries before they reach a spec).
 pub fn build_registry(
     base: &ContentRegistry,
     packs: &[(PackIdentity, PackContentSpec)],
 ) -> (ContentRegistry, ContentLoadReport) {
-    let mut diagnostics = Vec::new();
-    let mut entries = 0usize;
+    let base = base_catalog(base);
+    let (catalog, report) = neutral::build_catalog(&base, packs);
+    (from_catalog(catalog), report)
+}
 
-    // Winning authored entry per id, sorted by id (BTreeMap) while later packs
-    // replace earlier ones in stack order.
-    let mut block_entries: BTreeMap<&str, (&str, &BlockEntry)> = BTreeMap::new();
-    let mut item_entries: BTreeMap<&str, (&str, &ItemEntry)> = BTreeMap::new();
-    let mut tier_entries: BTreeMap<&str, (&str, &TierEntry)> = BTreeMap::new();
-    let mut tool_entries: BTreeMap<&str, (&str, &ToolEntry)> = BTreeMap::new();
-    let mut recipe_entries: BTreeMap<&str, (&str, &RecipeEntry)> = BTreeMap::new();
-    let mut assets: BTreeMap<(String, String), &PackAsset> = BTreeMap::new();
-    let mut block_patches: Vec<(&str, &BlockPatch)> = Vec::new();
-    let mut recipe_patches: Vec<(&str, &RecipePatch)> = Vec::new();
-    let mut worldgen: Vec<(&str, &WorldgenEntry)> = Vec::new();
-
-    for (identity, spec) in packs {
-        entries += spec.blocks.len()
-            + spec.items.len()
-            + spec.tiers.len()
-            + spec.tools.len()
-            + spec.recipes.len()
-            + spec.worldgen.len()
-            + spec.block_patches.len()
-            + spec.recipe_patches.len();
-
-        let folder = identity.folder.as_str();
-        for (path, asset) in &spec.assets {
-            assets.insert((folder.to_string(), path.clone()), asset);
-        }
-        // `[builtin_icons]` is presentation-only: it never allocates a pack
-        // icon slot or enters the digest. A path that failed to load is still
-        // worth explaining, because the built-in sprite silently stays.
-        for (name, path) in &spec.builtin_icons {
-            if !spec.assets.contains_key(path) {
-                warning(
-                    &mut diagnostics,
-                    format!("builtin_icon {name}"),
-                    format!(
-                        "icon `{path}` is not a loaded asset; the built-in sprite stays visible"
-                    ),
-                );
-            }
-        }
-        for block in &spec.blocks {
-            if let Some((previous, _)) = block_entries.insert(block.id.as_str(), (folder, block)) {
-                warning(
-                    &mut diagnostics,
-                    format!("block {}", block.id),
-                    format!("pack `{folder}` replaces the definition from pack `{previous}`"),
-                );
-            }
-        }
-        for item in &spec.items {
-            if let Some((previous, _)) = item_entries.insert(item.id.as_str(), (folder, item)) {
-                warning(
-                    &mut diagnostics,
-                    format!("item {}", item.id),
-                    format!("pack `{folder}` replaces the definition from pack `{previous}`"),
-                );
-            }
-        }
-        for tier in &spec.tiers {
-            if let Some((previous, _)) = tier_entries.insert(tier.id.as_str(), (folder, tier)) {
-                warning(
-                    &mut diagnostics,
-                    format!("tier {}", tier.id),
-                    format!("pack `{folder}` replaces the definition from pack `{previous}`"),
-                );
-            }
-        }
-        for tool in &spec.tools {
-            if let Some((previous, _)) = tool_entries.insert(tool.id.as_str(), (folder, tool)) {
-                warning(
-                    &mut diagnostics,
-                    format!("tool {}", tool.id),
-                    format!("pack `{folder}` replaces the definition from pack `{previous}`"),
-                );
-            }
-        }
-        for recipe in &spec.recipes {
-            if let Some((previous, _)) = recipe_entries.insert(recipe.id.as_str(), (folder, recipe))
-            {
-                warning(
-                    &mut diagnostics,
-                    format!("recipe {}", recipe.id),
-                    format!("pack `{folder}` replaces the definition from pack `{previous}`"),
-                );
-            }
-        }
-        for patch in &spec.block_patches {
-            block_patches.push((folder, patch));
-        }
-        for patch in &spec.recipe_patches {
-            recipe_patches.push((folder, patch));
-        }
-        for rule in &spec.worldgen {
-            worldgen.push((folder, rule));
-        }
-    }
-
-    // Dense block ids start at the frozen built-in count, in sorted id order.
-    let block_ids: BTreeMap<&str, BlockId> = block_entries
-        .keys()
-        .enumerate()
-        .map(|(index, id)| (*id, BlockId::Modded(BUILTIN_BLOCK_COUNT + index as u16)))
-        .collect();
-    let item_indices: BTreeMap<&str, u16> = item_entries
-        .keys()
-        .enumerate()
-        .map(|(index, id)| (*id, index as u16))
-        .collect();
-    let tool_indices: BTreeMap<&str, u16> = tool_entries
-        .keys()
-        .enumerate()
-        .map(|(index, id)| (*id, index as u16))
-        .collect();
-    let tier_indices: BTreeMap<&str, u16> = tier_entries
-        .keys()
-        .enumerate()
-        .map(|(index, id)| (*id, BUILTIN_TIER_COUNT + index as u16))
-        .collect();
-
-    let resolver = Resolver {
-        block_ids: &block_ids,
-        item_indices: &item_indices,
-        tool_indices: &tool_indices,
-    };
-
-    // ---- blocks ---------------------------------------------------------
-    let mut blocks: Vec<BlockDef> = base.blocks().to_vec();
-
-    // Patches apply in stack order; later fields win. They can change
-    // presentation and gameplay fields but never `name`/`id` (save vocabulary).
-    for (folder, patch) in &block_patches {
-        let Some(id) = names::builtin_block_id_by_name(&patch.id) else {
-            error(
-                &mut diagnostics,
-                format!("patch {}", patch.id),
-                format!("pack `{folder}` patches an unknown block"),
-            );
-            continue;
-        };
-        let Some(def) = blocks.get_mut(usize::from(id.to_raw())) else {
-            continue;
-        };
-        if def.id != id {
-            continue;
-        }
-        if let Some(display_name) = &patch.display_name {
-            def.display_name = display_name.clone();
-        }
-        if let Some(hardness) = patch.hardness {
-            def.hardness = Some(hardness);
-        }
-        if let Some(tool) = patch.tool {
-            def.tool_class = Some(tool);
-        }
-        if let Some(limit) = patch.stack_limit {
-            def.stack_limit = limit;
-        }
-        if let Some(drop) = &patch.drop {
-            match resolver.item_ref(drop) {
-                Some(reference) => def.drop = Some(reference),
-                None => error(
-                    &mut diagnostics,
-                    format!("patch {}", patch.id),
-                    format!("unresolved drop item `{drop}`"),
-                ),
-            }
-        }
-    }
-
-    // Pack blocks append in sorted id order so raw ids round-trip.
-    for (id, (_folder, entry)) in &block_entries {
-        let block_id = *block_ids
-            .get(id)
-            .expect("every collected block id is allocated");
-        let drop = match &entry.drop {
-            Some(target) => match resolver.item_ref(target) {
-                Some(reference) => Some(reference),
-                None => {
-                    error(
-                        &mut diagnostics,
-                        format!("block {id}"),
-                        format!("unresolved drop item `{target}`"),
-                    );
-                    None
-                }
-            },
-            None => Some(ItemRef::Block(block_id)),
-        };
-        blocks.push(BlockDef {
-            id: block_id,
-            name: (*id).to_string(),
-            display_name: entry
-                .display_name
-                .clone()
-                .unwrap_or_else(|| derive_display_name(id)),
-            // Assigned by the layer allocator below.
-            faces: [PLACEHOLDER_BLOCK_LAYER; 6],
-            hardness: Some(entry.hardness),
-            drop,
-            tool_class: entry.tool,
-            stack_limit: entry.stack_limit,
-            placeholder: false,
-        });
-    }
-
-    // ---- items ----------------------------------------------------------
-    let mut items: Vec<ItemDef> = Vec::with_capacity(item_entries.len());
-    for (id, (_folder, entry)) in &item_entries {
-        items.push(ItemDef {
-            index: item_indices[id],
-            name: (*id).to_string(),
-            display_name: entry
-                .display_name
-                .clone()
-                .unwrap_or_else(|| derive_display_name(id)),
-            icon_layer: PLACEHOLDER_ICON_LAYER,
-            stack_limit: entry.stack_limit,
-            food: entry.food.as_ref().map(|food| FoodDef {
-                nutrition: food.nutrition,
-                eat_seconds: food.eat_seconds,
-            }),
-            placeholder: false,
-            placeholder_tool: false,
-        });
-    }
-
-    // ---- tiers ----------------------------------------------------------
-    let mut tiers: Vec<TierDef> = base.tiers().to_vec();
-    for (id, (_folder, entry)) in &tier_entries {
-        tiers.push(TierDef {
-            index: tier_indices[id],
-            name: (*id).to_string(),
-            display_name: entry
-                .display_name
-                .clone()
-                .unwrap_or_else(|| derive_display_name(id)),
-            speed: entry.speed,
-            durability: entry.durability,
-            damage: entry.damage,
-        });
-    }
-    let resolve_tier = |name: &str| -> Option<u16> {
-        names::builtin_tier_by_name(name).map(|tier| match tier {
-            ToolTier::Wood => 0,
-            ToolTier::Stone => 1,
-            ToolTier::Iron => 2,
-        })
-    };
-
-    // ---- tools ----------------------------------------------------------
-    let mut tools: Vec<ToolDef> = Vec::with_capacity(tool_entries.len());
-    for (id, (_folder, entry)) in &tool_entries {
-        let tier = match resolve_tier(&entry.tier)
-            .or_else(|| tier_indices.get(entry.tier.as_str()).copied())
-        {
-            Some(index) => index,
-            None => {
-                error(
-                    &mut diagnostics,
-                    format!("tool {id}"),
-                    format!("unknown tier `{}`", entry.tier),
-                );
-                0
-            }
-        };
-        tools.push(ToolDef {
-            index: tool_indices[id],
-            name: (*id).to_string(),
-            display_name: entry
-                .display_name
-                .clone()
-                .unwrap_or_else(|| derive_display_name(id)),
-            kind: entry.kind,
-            tier,
-            icon_layer: PLACEHOLDER_ICON_LAYER,
-        });
-    }
-
-    // ---- recipes --------------------------------------------------------
-    let mut recipes: Vec<RecipeDef> = base.recipes().to_vec();
-    let builtin_recipe_count = recipes.len();
-    for (folder, patch) in &recipe_patches {
-        match recipes.iter_mut().find(|recipe| recipe.name == patch.id) {
-            Some(recipe) => recipe.enabled = patch.enabled,
-            None => error(
-                &mut diagnostics,
-                format!("patch {}", patch.id),
-                format!("pack `{folder}` patches an unknown recipe"),
-            ),
-        }
-    }
-    for (id, (_folder, entry)) in &recipe_entries {
-        let Some(output) = resolver.item_ref(&entry.output) else {
-            error(
-                &mut diagnostics,
-                format!("recipe {id}"),
-                format!("unresolved output item `{}`", entry.output),
-            );
-            continue;
-        };
-        let mut key = BTreeMap::new();
-        let mut malformed = false;
-        for (character, target) in &entry.key {
-            match resolver.item_ref(target) {
-                Some(reference) => {
-                    key.insert(*character, reference);
-                }
-                None => {
-                    error(
-                        &mut diagnostics,
-                        format!("recipe {id}"),
-                        format!("unresolved key item `{target}`"),
-                    );
-                    malformed = true;
-                }
-            }
-        }
-        if malformed {
-            continue;
-        }
-        let index = recipes.len() as u16;
-        recipes.push(RecipeDef {
-            index,
-            name: (*id).to_string(),
-            pattern: entry.pattern.clone(),
-            key,
-            output,
-            count: entry.count,
-            enabled: true,
-            placeholder: false,
-        });
-    }
-
-    // ---- worldgen -------------------------------------------------------
-    let mut worldgen_rules: Vec<WorldgenRule> = Vec::new();
-    for (folder, entry) in &worldgen {
-        if worldgen_rules.len() >= WORLDGEN_RULE_CAP {
-            error(
-                &mut diagnostics,
-                format!("worldgen {folder}"),
-                format!("stack already holds {WORLDGEN_RULE_CAP} worldgen rules; rule dropped"),
-            );
-            continue;
-        }
-        match &entry.kind {
-            WorldgenKind::Ore {
-                block,
-                replace,
-                min_y,
-                max_y,
-                vein,
-                attempts,
-            } => {
-                let Some(block) = resolver.block(block) else {
-                    error(
-                        &mut diagnostics,
-                        format!("worldgen {folder}"),
-                        format!("unresolved ore block `{}`", entry_kind_block(entry)),
-                    );
-                    continue;
-                };
-                let Some(replace) = resolver.block(replace) else {
-                    error(
-                        &mut diagnostics,
-                        format!("worldgen {folder}"),
-                        "unresolved ore host block".to_string(),
-                    );
-                    continue;
-                };
-                worldgen_rules.push(WorldgenRule::Ore {
-                    block,
-                    replace,
-                    min_y: *min_y,
-                    max_y: *max_y,
-                    vein: *vein,
-                    attempts: *attempts,
-                });
-            }
-            WorldgenKind::Patch {
-                block,
-                replace,
-                biomes,
-                min_y,
-                max_y,
-                chance,
-            } => {
-                let Some(block) = resolver.block(block) else {
-                    error(
-                        &mut diagnostics,
-                        format!("worldgen {folder}"),
-                        "unresolved patch block".to_string(),
-                    );
-                    continue;
-                };
-                let Some(replace) = resolver.block(replace) else {
-                    error(
-                        &mut diagnostics,
-                        format!("worldgen {folder}"),
-                        "unresolved patch host block".to_string(),
-                    );
-                    continue;
-                };
-                let mut resolved_biomes = Vec::with_capacity(biomes.len());
-                let mut bad_biome = false;
-                for name in biomes {
-                    match biome_by_name(name) {
-                        Some(biome) => resolved_biomes.push(biome),
-                        None => {
-                            error(
-                                &mut diagnostics,
-                                format!("worldgen {folder}"),
-                                format!("unknown biome `{name}`"),
-                            );
-                            bad_biome = true;
-                        }
-                    }
-                }
-                if bad_biome || resolved_biomes.is_empty() {
-                    continue;
-                }
-                worldgen_rules.push(WorldgenRule::Patch {
-                    block,
-                    replace,
-                    biomes: resolved_biomes,
-                    min_y: *min_y,
-                    max_y: *max_y,
-                    chance: *chance,
-                });
-            }
-        }
-    }
-
-    // ---- block face layers ---------------------------------------------
-    let mut pack_layers: Vec<Vec<u8>> = Vec::new();
-    let mut pack_layer_sources: Vec<LayerSource> = Vec::new();
-    let mut layer_slots: BTreeMap<(String, String), u8> = BTreeMap::new();
-    // One diagnostic per (entry, path): `all` resolves to six identical faces
-    // and a broken asset must not be reported six times.
-    let mut reported_paths: BTreeSet<(String, String)> = BTreeSet::new();
-    for (id, (folder, entry)) in &block_entries {
-        let raw = block_ids[id];
-        let def_index = usize::from(raw.to_raw());
-        for face in 0..6 {
-            let Some(path) = face_texture(&entry.textures, face) else {
-                error(
-                    &mut diagnostics,
-                    format!("block {id}"),
-                    format!("face {face} has no authored texture"),
-                );
-                blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
-                continue;
-            };
-            let key = (folder.to_string(), path.clone());
-            if !assets.contains_key(&key) {
-                if reported_paths.insert((id.to_string(), path.clone())) {
-                    error(
-                        &mut diagnostics,
-                        format!("block {id}"),
-                        format!("texture `{path}` is not a loaded asset"),
-                    );
-                }
-                blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
-                continue;
-            }
-            let layer = if let Some(existing) = layer_slots.get(&key) {
-                *existing
-            } else {
-                let slot = pack_layers.len();
-                if PACK_LAYER_BASE as usize + slot >= PACK_LAYER_CAP as usize {
-                    if reported_paths.insert((id.to_string(), path.clone())) {
-                        error(
-                            &mut diagnostics,
-                            format!("block {id}"),
-                            format!(
-                                "pack layer space exhausted at {PACK_LAYER_CAP}; `{path}` falls back to layer {PLACEHOLDER_BLOCK_LAYER}"
-                            ),
-                        );
-                    }
-                    blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
-                    continue;
-                }
-                let layer = PACK_LAYER_BASE + slot as u8;
-                pack_layers.push(assets[&key].rgba.clone());
-                pack_layer_sources.push(LayerSource {
-                    folder: folder.to_string(),
-                    path: path.clone(),
-                });
-                layer_slots.insert(key, layer);
-                layer
-            };
-            blocks[def_index].faces[face] = layer;
-        }
-    }
-
-    // ---- icons ----------------------------------------------------------
-    let mut pack_icons: Vec<Vec<u8>> = Vec::new();
-    let mut pack_icon_sources: Vec<LayerSource> = Vec::new();
-    let mut icon_slots: BTreeMap<(String, String), u8> = BTreeMap::new();
-
-    let mut icons = IconAllocation {
-        assets: &assets,
-        pack_icons: &mut pack_icons,
-        pack_icon_sources: &mut pack_icon_sources,
-        icon_slots: &mut icon_slots,
-        diagnostics: &mut diagnostics,
-    };
-
-    for (id, (folder, entry)) in &item_entries {
-        let layer = icons.allocate(folder, &entry.icon, &format!("item {id}"));
-        items[usize::from(item_indices[id])].icon_layer = layer;
-    }
-    for (id, (folder, entry)) in &tool_entries {
-        let layer = icons.allocate(folder, &entry.icon, &format!("tool {id}"));
-        tools[usize::from(tool_indices[id])].icon_layer = layer;
-    }
-
-    // ---- digest ---------------------------------------------------------
-    let digest = compute_digest(&DigestInputs {
-        packs,
-        blocks: &blocks,
-        items: &items,
-        tiers: &tiers,
-        tools: &tools,
-        recipes: &recipes,
-        builtin_recipe_count,
-        worldgen_rules: &worldgen_rules,
-        block_entries: &block_entries,
-        item_entries: &item_entries,
-        tier_entries: &tier_entries,
-        tool_entries: &tool_entries,
-        block_patches: &block_patches,
-        recipe_patches: &recipe_patches,
-    });
-
-    let identity_list: Vec<PackIdentity> =
-        packs.iter().map(|(identity, _)| identity.clone()).collect();
-
-    let registry = ContentRegistry {
-        blocks,
-        items,
-        tiers,
-        tools,
-        recipes,
-        worldgen_rules,
-        pack_layers,
-        pack_icons,
-        pack_layer_sources,
-        pack_icon_sources,
-        packs: identity_list,
-        digest,
-    };
-    (
-        registry,
-        ContentLoadReport {
-            entries,
-            diagnostics,
-        },
+/// Converts the game's built-in tables into a neutral base catalog.
+///
+/// Only the block, tier and recipe tables are populated: items, tools,
+/// worldgen rules and every pack table start empty, exactly like today's
+/// built-in-only registry. The game base `worldgen` table stays ignored.
+fn base_catalog(base: &ContentRegistry) -> Catalog {
+    Catalog::from_base(
+        base.blocks().iter().map(block_to_catalog).collect(),
+        base.tiers().iter().map(tier_to_catalog).collect(),
+        base.recipes().iter().map(recipe_to_catalog).collect(),
     )
 }
 
-/// Mutable icon-layer allocation state for one pack-stack build.
-struct IconAllocation<'a> {
-    assets: &'a BTreeMap<(String, String), &'a PackAsset>,
-    pack_icons: &'a mut Vec<Vec<u8>>,
-    pack_icon_sources: &'a mut Vec<LayerSource>,
-    icon_slots: &'a mut BTreeMap<(String, String), u8>,
-    diagnostics: &'a mut Vec<ContentDiagnostic>,
-}
-
-impl IconAllocation<'_> {
-    /// Allocate one icon layer for an authored icon path.
-    ///
-    /// Icons are deduplicated by `(pack folder, path)` and appended from
-    /// [`PACK_ICON_BASE`] up to [`PACK_ICON_CAP`]. A missing asset or an exhausted
-    /// icon space records a diagnostic and returns the built-in sprite placeholder
-    /// instead of panicking.
-    fn allocate(&mut self, folder: &str, path: &str, entry: &str) -> u8 {
-        let key = (folder.to_string(), path.to_string());
-        if !self.assets.contains_key(&key) {
-            error(
-                self.diagnostics,
-                entry.to_string(),
-                format!("icon `{path}` is not a loaded asset"),
-            );
-            return PLACEHOLDER_ICON_LAYER;
-        }
-        if let Some(existing) = self.icon_slots.get(&key) {
-            return *existing;
-        }
-        let slot = self.pack_icons.len();
-        if PACK_ICON_BASE as usize + slot >= PACK_ICON_CAP as usize {
-            error(
-                self.diagnostics,
-                entry.to_string(),
-                format!(
-                    "icon space exhausted at {PACK_ICON_CAP}; `{path}` falls back to layer {PLACEHOLDER_ICON_LAYER}"
-                ),
-            );
-            return PLACEHOLDER_ICON_LAYER;
-        }
-        let layer = PACK_ICON_BASE + slot as u8;
-        self.pack_icons.push(self.assets[&key].rgba.clone());
-        self.pack_icon_sources.push(LayerSource {
-            folder: folder.to_string(),
-            path: path.to_string(),
-        });
-        self.icon_slots.insert(key, layer);
-        layer
+/// Converts every neutral catalog table back into a [`ContentRegistry`].
+fn from_catalog(catalog: Catalog) -> ContentRegistry {
+    ContentRegistry {
+        blocks: catalog
+            .blocks()
+            .iter()
+            .cloned()
+            .map(block_from_catalog)
+            .collect(),
+        items: catalog
+            .items()
+            .iter()
+            .cloned()
+            .map(item_from_catalog)
+            .collect(),
+        tiers: catalog
+            .tiers()
+            .iter()
+            .cloned()
+            .map(tier_from_catalog)
+            .collect(),
+        tools: catalog
+            .tools()
+            .iter()
+            .cloned()
+            .map(tool_from_catalog)
+            .collect(),
+        recipes: catalog
+            .recipes()
+            .iter()
+            .cloned()
+            .map(recipe_from_catalog)
+            .collect(),
+        worldgen_rules: catalog
+            .worldgen_rules()
+            .iter()
+            .cloned()
+            .map(worldgen_from_catalog)
+            .collect(),
+        pack_layers: catalog.pack_layers().to_vec(),
+        pack_icons: catalog.pack_icons().to_vec(),
+        pack_layer_sources: catalog.pack_layer_sources().to_vec(),
+        pack_icon_sources: catalog.pack_icon_sources().to_vec(),
+        packs: catalog.packs().to_vec(),
+        digest: catalog.digest(),
     }
 }
 
-fn entry_kind_block(entry: &WorldgenEntry) -> &'static str {
-    match entry.kind {
-        WorldgenKind::Ore { .. } => "ore",
-        WorldgenKind::Patch { .. } => "patch",
-    }
-}
-
-/// Resolve the authored texture path for face index 0..6 (+X,-X,+Y,-Y,+Z,-Z).
-fn face_texture(textures: &BlockTextures, face: usize) -> Option<&String> {
-    let specific = match face {
-        0 | 1 | 4 | 5 => textures.side.as_ref(),
-        2 => textures.top.as_ref(),
-        3 => textures.bottom.as_ref(),
-        _ => None,
-    };
-    specific.or(textures.all.as_ref())
-}
-
-/// Map an authored biome name to the world enum.
-fn biome_by_name(name: &str) -> Option<Biome> {
-    match name {
-        "plains" => Some(Biome::Plains),
-        "forest" => Some(Biome::Forest),
-        "mountains" => Some(Biome::Mountains),
-        "ocean" => Some(Biome::Ocean),
-        _ => None,
-    }
-}
-
-/// Derive a human-readable name from a namespaced id (`mymod:ruby_ore` →
-/// `Ruby Ore`). Authored `display_name` always wins.
-fn derive_display_name(id: &str) -> String {
-    let short = id.rsplit(':').next().unwrap_or(id);
-    short
-        .split('_')
-        .filter(|word| !word.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn error(
-    diagnostics: &mut Vec<ContentDiagnostic>,
-    entry: impl Into<String>,
-    reason: impl Into<String>,
-) {
-    diagnostics.push(ContentDiagnostic {
-        severity: Severity::Error,
-        entry: entry.into(),
-        reason: reason.into(),
-    });
-}
-
-fn warning(
-    diagnostics: &mut Vec<ContentDiagnostic>,
-    entry: impl Into<String>,
-    reason: impl Into<String>,
-) {
-    diagnostics.push(ContentDiagnostic {
-        severity: Severity::Warning,
-        entry: entry.into(),
-        reason: reason.into(),
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Digest
-// ---------------------------------------------------------------------------
-
-/// Minimal FNV-1a 64 sink over a canonical little-endian byte stream.
+/// Converts one neutral block row into the game definition.
 ///
-/// Never uses `DefaultHasher`: the digest is part of the pack contract and must
-/// be reproducible across processes, platforms and Rust versions.
-struct Digest(u64);
-
-impl Digest {
-    fn new() -> Digest {
-        Digest(EMPTY_DIGEST)
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-
-    fn byte(&mut self, value: u8) {
-        self.0 ^= u64::from(value);
-        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-
-    fn bytes(&mut self, value: &[u8]) {
-        for &byte in value {
-            self.byte(byte);
-        }
-    }
-
-    fn u8(&mut self, value: u8) {
-        self.byte(value);
-    }
-
-    fn u16(&mut self, value: u16) {
-        self.bytes(&value.to_le_bytes());
-    }
-
-    fn i32(&mut self, value: i32) {
-        self.bytes(&value.to_le_bytes());
-    }
-
-    fn f32(&mut self, value: f32) {
-        self.bytes(&value.to_bits().to_le_bytes());
-    }
-
-    fn str(&mut self, value: &str) {
-        self.u16(u16::try_from(value.len()).unwrap_or(u16::MAX));
-        self.bytes(value.as_bytes());
-    }
-
-    fn opt_str(&mut self, value: Option<&str>) {
-        match value {
-            None => self.u8(0),
-            Some(text) => {
-                self.u8(1);
-                self.str(text);
-            }
-        }
-    }
-
-    fn opt_f32(&mut self, value: Option<f32>) {
-        match value {
-            None => self.u8(0),
-            Some(number) => {
-                self.u8(1);
-                self.f32(number);
-            }
-        }
-    }
-
-    fn opt_u16(&mut self, value: Option<u16>) {
-        match value {
-            None => self.u8(0),
-            Some(number) => {
-                self.u8(1);
-                self.u16(number);
-            }
-        }
-    }
-
-    fn opt_tool_kind(&mut self, value: Option<ToolKind>) {
-        match value {
-            None => self.u8(0),
-            Some(kind) => {
-                self.u8(1);
-                self.u8(tool_kind_tag(kind));
-            }
-        }
-    }
-
-    fn block(&mut self, block: BlockId) {
-        self.u16(block.to_raw());
-    }
-
-    fn item_id(&mut self, id: ItemId) {
-        match id {
-            ItemId::Block(block) => {
-                self.u8(0);
-                self.block(block);
-            }
-            ItemId::Material(material) => {
-                self.u8(1);
-                self.str(names::builtin_material_id_name(material));
-            }
-            ItemId::Tool { kind, tier } => {
-                self.u8(2);
-                self.u8(tool_kind_tag(kind));
-                self.u8(tool_tier_tag(tier));
-            }
-            // A widened pack identity hashes by its dense item index. It
-            // cannot appear in a built-in recipe output, so existing digests
-            // are unchanged.
-            ItemId::Item(index) => {
-                self.u8(3);
-                self.u16(index);
-            }
-            // A pack tool hashes by its dense tool index. Built-in recipes
-            // cannot produce one, so existing digests are unchanged.
-            ItemId::ModTool(index) => {
-                self.u8(4);
-                self.u16(index);
-            }
-        }
-    }
-
-    fn item_ref(&mut self, reference: ItemRef) {
-        match reference {
-            ItemRef::Block(block) => {
-                self.u8(0);
-                self.block(block);
-            }
-            ItemRef::Builtin(id) => {
-                self.u8(1);
-                self.item_id(id);
-            }
-            ItemRef::Item(index) => {
-                self.u8(2);
-                self.u16(index);
-            }
-            ItemRef::Tool(index) => {
-                self.u8(3);
-                self.u16(index);
-            }
-        }
-    }
-
-    fn opt_item_ref(&mut self, reference: Option<ItemRef>) {
-        match reference {
-            None => self.u8(0),
-            Some(reference) => {
-                self.u8(1);
-                self.item_ref(reference);
-            }
-        }
+/// Shared with placeholder allocation in later slices so a placeholder block
+/// has exactly one construction path.
+pub(crate) fn block_from_catalog(row: NeutralBlockDef) -> BlockDef {
+    BlockDef {
+        id: BlockId::from_raw(row.id),
+        name: row.name,
+        display_name: row.display_name,
+        faces: row.faces,
+        hardness: row.hardness,
+        drop: row.drop.map(item_ref_from_catalog),
+        tool_class: row.tool_class,
+        stack_limit: row.stack_limit,
+        placeholder: row.placeholder,
     }
 }
 
-fn tool_kind_tag(kind: ToolKind) -> u8 {
-    match kind {
-        ToolKind::Pickaxe => 0,
-        ToolKind::Axe => 1,
-        ToolKind::Shovel => 2,
-        ToolKind::Hoe => 3,
-        ToolKind::Sword => 4,
-        ToolKind::Bow => 5,
-    }
-}
-
-fn tool_tier_tag(tier: ToolTier) -> u8 {
-    match tier {
-        ToolTier::Wood => 0,
-        ToolTier::Stone => 1,
-        ToolTier::Iron => 2,
-    }
-}
-
-/// Everything the deterministic registry digest folds in.
+/// Converts one neutral generic item row into the game definition.
 ///
-/// The builder's working set (resolved definitions, authored patch lists, and
-/// the winning entry map per content kind) travels as one bundle so the digest
-/// stays a single entry point as new content kinds appear.
-#[derive(Clone, Copy)]
-struct DigestInputs<'a> {
-    packs: &'a [(PackIdentity, PackContentSpec)],
-    blocks: &'a [BlockDef],
-    items: &'a [ItemDef],
-    tiers: &'a [TierDef],
-    tools: &'a [ToolDef],
-    recipes: &'a [RecipeDef],
-    builtin_recipe_count: usize,
-    worldgen_rules: &'a [WorldgenRule],
-    block_entries: &'a BTreeMap<&'a str, (&'a str, &'a BlockEntry)>,
-    item_entries: &'a BTreeMap<&'a str, (&'a str, &'a ItemEntry)>,
-    tier_entries: &'a BTreeMap<&'a str, (&'a str, &'a TierEntry)>,
-    tool_entries: &'a BTreeMap<&'a str, (&'a str, &'a ToolEntry)>,
-    block_patches: &'a [(&'a str, &'a BlockPatch)],
-    recipe_patches: &'a [(&'a str, &'a RecipePatch)],
+/// Shared with placeholder allocation in later slices so a placeholder item
+/// has exactly one construction path.
+pub(crate) fn item_from_catalog(row: NeutralItemDef) -> ItemDef {
+    ItemDef {
+        index: row.index,
+        name: row.name,
+        display_name: row.display_name,
+        icon_layer: row.icon_layer,
+        stack_limit: row.stack_limit,
+        food: row.food.map(food_from_catalog),
+        placeholder: row.placeholder,
+        placeholder_tool: row.placeholder_tool,
+    }
 }
 
-fn compute_digest(input: &DigestInputs<'_>) -> u64 {
-    let DigestInputs {
-        packs,
-        blocks,
-        items,
-        tiers,
-        tools,
-        recipes,
-        builtin_recipe_count,
-        worldgen_rules,
-        block_entries,
-        item_entries,
-        tier_entries,
-        tool_entries,
-        block_patches,
-        recipe_patches,
-    } = *input;
-    // No packs means no pack definitions: report the empty-stack digest so a
-    // rebuilt stack with zero packs matches the built-in registry exactly.
-    if packs.is_empty() {
-        return EMPTY_DIGEST;
+/// Converts one neutral tier row into the game definition.
+fn tier_from_catalog(row: NeutralTierDef) -> TierDef {
+    TierDef {
+        index: row.index,
+        name: row.name,
+        display_name: row.display_name,
+        speed: row.speed,
+        durability: row.durability,
+        damage: row.damage,
     }
-    let mut digest = Digest::new();
-
-    // Pack identities in folder order.
-    let mut identities: Vec<&PackIdentity> = packs.iter().map(|(identity, _)| identity).collect();
-    identities.sort_by(|left, right| left.folder.cmp(&right.folder));
-    digest.u16(identities.len() as u16);
-    for identity in identities {
-        digest.str(&identity.folder);
-        digest.opt_str(identity.version.as_deref());
-    }
-
-    // Pack block definitions in index (sorted id) order, including the
-    // authored texture paths so a rename moves the digest even when the
-    // allocated layer index is unchanged.
-    digest.u16(block_entries.len() as u16);
-    for (id, (_folder, entry)) in block_entries {
-        let resolved = blocks
-            .iter()
-            .find(|def| def.name == *id)
-            .expect("every collected block has a definition");
-        digest.str(id);
-        digest.u16(resolved.id.to_raw());
-        digest.opt_str(entry.display_name.as_deref());
-        digest.f32(entry.hardness);
-        digest.opt_str(entry.drop.as_deref());
-        digest.opt_tool_kind(entry.tool);
-        digest.u16(entry.stack_limit);
-        for face in 0..6 {
-            digest.opt_str(face_texture(&entry.textures, face).map(String::as_str));
-        }
-        digest.opt_item_ref(resolved.drop);
-    }
-
-    // Items in index order.
-    digest.u16(items.len() as u16);
-    for (id, (_folder, entry)) in item_entries {
-        let resolved = items
-            .iter()
-            .find(|def| def.name == *id)
-            .expect("every collected item has a definition");
-        digest.str(id);
-        digest.u16(resolved.index);
-        digest.opt_str(entry.display_name.as_deref());
-        digest.str(&entry.icon);
-        digest.u16(entry.stack_limit);
-        match &entry.food {
-            None => digest.u8(0),
-            Some(food) => {
-                digest.u8(1);
-                digest.u16(food.nutrition);
-                digest.f32(food.eat_seconds);
-            }
-        }
-    }
-
-    // Pack tiers in index order (built-ins are excluded).
-    digest.u16(tier_entries.len() as u16);
-    for (id, (_folder, entry)) in tier_entries {
-        let resolved = tiers
-            .iter()
-            .find(|def| def.name == *id)
-            .expect("every collected tier has a definition");
-        digest.str(id);
-        digest.u16(resolved.index);
-        digest.opt_str(entry.display_name.as_deref());
-        digest.f32(entry.speed);
-        digest.u16(entry.durability);
-        digest.u16(entry.damage);
-    }
-
-    // Tools in index order.
-    digest.u16(tools.len() as u16);
-    for (id, (_folder, entry)) in tool_entries {
-        let resolved = tools
-            .iter()
-            .find(|def| def.name == *id)
-            .expect("every collected tool has a definition");
-        digest.str(id);
-        digest.u16(resolved.index);
-        digest.opt_str(entry.display_name.as_deref());
-        digest.u8(tool_kind_tag(entry.kind));
-        digest.u16(resolved.tier);
-        digest.str(&entry.icon);
-    }
-
-    // Pack recipes in index order.
-    let pack_recipes = &recipes[builtin_recipe_count..];
-    digest.u16(pack_recipes.len() as u16);
-    for recipe in pack_recipes {
-        digest.u16(recipe.index);
-        digest.str(&recipe.name);
-        digest.u16(recipe.pattern.len() as u16);
-        for row in &recipe.pattern {
-            digest.str(row);
-        }
-        digest.u16(recipe.key.len() as u16);
-        for (character, reference) in &recipe.key {
-            digest.u8(*character as u8);
-            digest.item_ref(*reference);
-        }
-        digest.item_ref(recipe.output);
-        digest.u16(recipe.count);
-        digest.u8(u8::from(recipe.enabled));
-    }
-
-    // Worldgen rules in authored order.
-    digest.u16(worldgen_rules.len() as u16);
-    for rule in worldgen_rules {
-        match rule {
-            WorldgenRule::Ore {
-                block,
-                replace,
-                min_y,
-                max_y,
-                vein,
-                attempts,
-            } => {
-                digest.u8(0);
-                digest.block(*block);
-                digest.block(*replace);
-                digest.i32(*min_y);
-                digest.i32(*max_y);
-                digest.u8(*vein);
-                digest.u8(*attempts);
-            }
-            WorldgenRule::Patch {
-                block,
-                replace,
-                biomes,
-                min_y,
-                max_y,
-                chance,
-            } => {
-                digest.u8(1);
-                digest.block(*block);
-                digest.block(*replace);
-                digest.u16(biomes.len() as u16);
-                for biome in biomes {
-                    digest.u8(biome_tag(*biome));
-                }
-                digest.i32(*min_y);
-                digest.i32(*max_y);
-                digest.f32(*chance);
-            }
-        }
-    }
-
-    // Authored patches in stack order.
-    digest.u16(block_patches.len() as u16);
-    for (_folder, patch) in block_patches {
-        digest.str(&patch.id);
-        digest.opt_str(patch.display_name.as_deref());
-        digest.opt_f32(patch.hardness);
-        digest.opt_str(patch.drop.as_deref());
-        digest.opt_tool_kind(patch.tool);
-        digest.opt_u16(patch.stack_limit);
-    }
-    digest.u16(recipe_patches.len() as u16);
-    for (_folder, patch) in recipe_patches {
-        digest.str(&patch.id);
-        digest.u8(u8::from(patch.enabled));
-    }
-
-    digest.finish()
 }
 
-fn biome_tag(biome: Biome) -> u8 {
-    match biome {
-        Biome::Plains => 0,
-        Biome::Forest => 1,
-        Biome::Mountains => 2,
-        Biome::Ocean => 3,
+/// Converts one neutral tool row into the game definition.
+fn tool_from_catalog(row: NeutralToolDef) -> ToolDef {
+    ToolDef {
+        index: row.index,
+        name: row.name,
+        display_name: row.display_name,
+        kind: row.kind,
+        tier: row.tier,
+        icon_layer: row.icon_layer,
+    }
+}
+
+/// Converts one neutral recipe row into the game definition.
+fn recipe_from_catalog(row: NeutralRecipeDef) -> RecipeDef {
+    RecipeDef {
+        index: row.index,
+        name: row.name,
+        pattern: row.pattern,
+        key: row
+            .key
+            .into_iter()
+            .map(|(character, reference)| (character, item_ref_from_catalog(reference)))
+            .collect(),
+        output: item_ref_from_catalog(row.output),
+        count: row.count,
+        enabled: row.enabled,
+        placeholder: row.placeholder,
+    }
+}
+
+/// Converts one neutral worldgen rule into the game rule.
+fn worldgen_from_catalog(row: NeutralWorldgenRule) -> WorldgenRule {
+    match row {
+        NeutralWorldgenRule::Ore {
+            block,
+            replace,
+            min_y,
+            max_y,
+            vein,
+            attempts,
+        } => WorldgenRule::Ore {
+            block: BlockId::from_raw(block),
+            replace: BlockId::from_raw(replace),
+            min_y,
+            max_y,
+            vein,
+            attempts,
+        },
+        NeutralWorldgenRule::Patch {
+            block,
+            replace,
+            biomes,
+            min_y,
+            max_y,
+            chance,
+        } => WorldgenRule::Patch {
+            block: BlockId::from_raw(block),
+            replace: BlockId::from_raw(replace),
+            biomes: biomes.iter().map(|tag| biome_from_tag(*tag)).collect(),
+            min_y,
+            max_y,
+            chance,
+        },
+    }
+}
+
+/// Converts one game worldgen rule into the neutral catalog rule.
+///
+/// Exact inverse of [`worldgen_from_catalog`]: block ids become raw `u16`,
+/// biomes become neutral tags, and every field and vector entry keeps its
+/// authored order. The empty rule stack is not special-cased here; the
+/// terrain adapter borrows it without calling this function.
+pub(crate) fn worldgen_to_catalog(rule: &WorldgenRule) -> NeutralWorldgenRule {
+    match rule {
+        WorldgenRule::Ore {
+            block,
+            replace,
+            min_y,
+            max_y,
+            vein,
+            attempts,
+        } => NeutralWorldgenRule::Ore {
+            block: block.to_raw(),
+            replace: replace.to_raw(),
+            min_y: *min_y,
+            max_y: *max_y,
+            vein: *vein,
+            attempts: *attempts,
+        },
+        WorldgenRule::Patch {
+            block,
+            replace,
+            biomes,
+            min_y,
+            max_y,
+            chance,
+        } => NeutralWorldgenRule::Patch {
+            block: block.to_raw(),
+            replace: replace.to_raw(),
+            biomes: biomes.iter().map(|biome| biome.tag()).collect(),
+            min_y: *min_y,
+            max_y: *max_y,
+            chance: *chance,
+        },
+    }
+}
+
+/// Converts a game block definition into its neutral row.
+fn block_to_catalog(def: &BlockDef) -> NeutralBlockDef {
+    NeutralBlockDef {
+        id: def.id.to_raw(),
+        name: def.name.clone(),
+        display_name: def.display_name.clone(),
+        faces: def.faces,
+        hardness: def.hardness,
+        drop: def.drop.map(item_ref_to_catalog),
+        tool_class: def.tool_class,
+        stack_limit: def.stack_limit,
+        placeholder: def.placeholder,
+    }
+}
+
+/// Converts a game tier definition into its neutral row.
+fn tier_to_catalog(def: &TierDef) -> NeutralTierDef {
+    NeutralTierDef {
+        index: def.index,
+        name: def.name.clone(),
+        display_name: def.display_name.clone(),
+        speed: def.speed,
+        durability: def.durability,
+        damage: def.damage,
+    }
+}
+
+/// Converts a game recipe definition into its neutral row.
+fn recipe_to_catalog(def: &RecipeDef) -> NeutralRecipeDef {
+    NeutralRecipeDef {
+        index: def.index,
+        name: def.name.clone(),
+        pattern: def.pattern.clone(),
+        key: def
+            .key
+            .iter()
+            .map(|(character, reference)| (*character, item_ref_to_catalog(*reference)))
+            .collect::<BTreeMap<_, _>>(),
+        output: item_ref_to_catalog(def.output),
+        count: def.count,
+        enabled: def.enabled,
+        placeholder: def.placeholder,
+    }
+}
+
+/// Converts a neutral item reference into the game reference.
+///
+/// `BuiltinMaterial` indexes the frozen [`crate::content::names`] material
+/// table and `BuiltinTool` the frozen tier table, so built-in identity (and
+/// therefore the digest bytes) survives the round trip.
+fn item_ref_from_catalog(reference: NeutralItemRef) -> ItemRef {
+    match reference {
+        NeutralItemRef::Block(raw) => ItemRef::Block(BlockId::from_raw(raw)),
+        NeutralItemRef::BuiltinMaterial(index) => {
+            let material = names::builtin_material_by_index(index)
+                .expect("the catalog only allocates in-range material indexes");
+            ItemRef::Builtin(ItemId::Material(material))
+        }
+        NeutralItemRef::BuiltinTool { kind, tier } => {
+            let tier = names::builtin_tier_by_index(tier)
+                .expect("the catalog only allocates in-range tool tier indexes");
+            ItemRef::Builtin(ItemId::Tool { kind, tier })
+        }
+        NeutralItemRef::Item(index) => ItemRef::Item(index),
+        NeutralItemRef::Tool(index) => ItemRef::Tool(index),
+    }
+}
+
+/// Converts a game item reference into the neutral reference.
+fn item_ref_to_catalog(reference: ItemRef) -> NeutralItemRef {
+    match reference {
+        ItemRef::Block(block) => NeutralItemRef::Block(block.to_raw()),
+        ItemRef::Builtin(id) => item_id_to_catalog(id),
+        ItemRef::Item(index) => NeutralItemRef::Item(index),
+        ItemRef::Tool(index) => NeutralItemRef::Tool(index),
+    }
+}
+
+/// Converts a built-in [`ItemId`] into the neutral reference variants.
+///
+/// `ItemId::Block` stays a block; materials and tools use the frozen
+/// vocabulary indexes so the digest hashes the same bytes as before.
+fn item_id_to_catalog(id: ItemId) -> NeutralItemRef {
+    match id {
+        ItemId::Block(block) => NeutralItemRef::Block(block.to_raw()),
+        ItemId::Material(material) => {
+            NeutralItemRef::BuiltinMaterial(names::builtin_material_index(material))
+        }
+        ItemId::Tool { kind, tier } => NeutralItemRef::BuiltinTool {
+            kind,
+            tier: names::builtin_tier_index(tier),
+        },
+        ItemId::Item(index) => NeutralItemRef::Item(index),
+        ItemId::ModTool(index) => NeutralItemRef::Tool(index),
+    }
+}
+
+/// Converts neutral authored food behaviour into the game definition.
+fn food_from_catalog(food: FoodSpec) -> FoodDef {
+    FoodDef {
+        nutrition: food.nutrition,
+        eat_seconds: food.eat_seconds,
+    }
+}
+
+/// Maps a neutral biome tag onto the world enum.
+fn biome_from_tag(tag: opencraft_content::catalog::BiomeTag) -> Biome {
+    match tag {
+        opencraft_content::catalog::BiomeTag::Plains => Biome::Plains,
+        opencraft_content::catalog::BiomeTag::Forest => Biome::Forest,
+        opencraft_content::catalog::BiomeTag::Mountains => Biome::Mountains,
+        opencraft_content::catalog::BiomeTag::Ocean => Biome::Ocean,
     }
 }
 
@@ -1208,8 +380,12 @@ fn biome_tag(biome: Biome) -> u8 {
 mod tests {
     use super::*;
     use crate::content::spec::{
-        BlockTextures, FoodSpec, ItemEntry, RecipeEntry, TierEntry, ToolEntry,
+        BlockEntry, BlockPatch, BlockTextures, ItemEntry, RecipeEntry, TierEntry, ToolEntry,
+        WorldgenEntry, WorldgenKind,
     };
+    use crate::content::EMPTY_DIGEST;
+    use crate::player::inventory::{Material, ToolKind};
+    use crate::world::block::BUILTIN_BLOCK_COUNT;
 
     fn identity(folder: &str) -> PackIdentity {
         PackIdentity {
@@ -1218,8 +394,8 @@ mod tests {
         }
     }
 
-    fn asset(byte: u8) -> PackAsset {
-        PackAsset {
+    fn asset(byte: u8) -> crate::content::spec::PackAsset {
+        crate::content::spec::PackAsset {
             rgba: vec![byte; 1024],
             source_side: 16,
         }
@@ -1278,316 +454,163 @@ mod tests {
         (identity(folder), spec)
     }
 
-    #[test]
-    fn builtin_patches_change_fields_but_never_discriminants_or_stable_names() {
+    /// One stack that exercises every content kind the adapter converts.
+    fn representative_pack() -> (PackIdentity, PackContentSpec) {
         let mut spec = PackContentSpec::default();
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ruby_ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ruby_ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 3.0,
+            drop: Some("mymod:ruby".to_string()),
+            tool: Some(ToolKind::Pickaxe),
+            stack_limit: 64,
+        });
+        spec.assets.insert("ruby_ore.png".to_string(), asset(0x11));
+        spec.items.push(item_entry("mymod:ruby", "ruby.png"));
+        spec.assets.insert("ruby.png".to_string(), asset(0x22));
+        spec.tiers.push(tier_entry("mymod:ruby"));
+        spec.tools.push(tool_entry(
+            "mymod:ruby_pickaxe",
+            "mymod:ruby",
+            "ruby_pickaxe.png",
+        ));
+        spec.assets
+            .insert("ruby_pickaxe.png".to_string(), asset(0x33));
+        let mut key = BTreeMap::new();
+        key.insert('R', "mymod:ruby".to_string());
+        key.insert('S', "stick".to_string());
+        spec.recipes.push(RecipeEntry {
+            id: "mymod:ruby_pickaxe".to_string(),
+            pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
+            key,
+            output: "mymod:ruby_pickaxe".to_string(),
+            count: 1,
+        });
         spec.block_patches.push(BlockPatch {
             id: "stone".to_string(),
             display_name: Some("Granite".to_string()),
             hardness: Some(2.5),
-            drop: Some("cobblestone".to_string()),
-            tool: Some(ToolKind::Shovel),
-            stack_limit: Some(32),
+            drop: None,
+            tool: None,
+            stack_limit: None,
         });
+        spec.worldgen.push(WorldgenEntry {
+            kind: WorldgenKind::Ore {
+                block: "mymod:ruby_ore".to_string(),
+                replace: "stone".to_string(),
+                min_y: 4,
+                max_y: 40,
+                vein: 4,
+                attempts: 8,
+            },
+        });
+        spec.worldgen.push(WorldgenEntry {
+            kind: WorldgenKind::Patch {
+                block: "mymod:ruby_ore".to_string(),
+                replace: "grass".to_string(),
+                biomes: vec!["plains".to_string(), "forest".to_string()],
+                min_y: 40,
+                max_y: 110,
+                chance: 0.02,
+            },
+        });
+        (identity("mymod-ruby"), spec)
+    }
 
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-
-        let def = registry
-            .block(BlockId::Stone)
-            .expect("stone stays registered");
-        assert_eq!(def.id, BlockId::Stone);
-        assert_eq!(def.name, "stone");
-        assert_eq!(def.display_name, "Granite");
-        assert_eq!(def.hardness, Some(2.5));
-        assert_eq!(def.drop, Some(ItemRef::Block(BlockId::Cobblestone)));
-        assert_eq!(def.tool_class, Some(ToolKind::Shovel));
-        assert_eq!(def.stack_limit, 32);
-        assert_eq!(registry.blocks().len(), usize::from(BUILTIN_BLOCK_COUNT));
+    /// Compares a neutral worldgen rule with its game conversion.
+    fn same_worldgen_rule(neutral: &NeutralWorldgenRule, game: &WorldgenRule) -> bool {
+        match (neutral, game) {
+            (
+                NeutralWorldgenRule::Ore {
+                    block,
+                    replace,
+                    min_y,
+                    max_y,
+                    vein,
+                    attempts,
+                },
+                WorldgenRule::Ore {
+                    block: game_block,
+                    replace: game_replace,
+                    min_y: game_min_y,
+                    max_y: game_max_y,
+                    vein: game_vein,
+                    attempts: game_attempts,
+                },
+            ) => {
+                *block == game_block.to_raw()
+                    && *replace == game_replace.to_raw()
+                    && *min_y == *game_min_y
+                    && *max_y == *game_max_y
+                    && *vein == *game_vein
+                    && *attempts == *game_attempts
+            }
+            (
+                NeutralWorldgenRule::Patch {
+                    block,
+                    replace,
+                    biomes,
+                    min_y,
+                    max_y,
+                    chance,
+                },
+                WorldgenRule::Patch {
+                    block: game_block,
+                    replace: game_replace,
+                    biomes: game_biomes,
+                    min_y: game_min_y,
+                    max_y: game_max_y,
+                    chance: game_chance,
+                },
+            ) => {
+                *block == game_block.to_raw()
+                    && *replace == game_replace.to_raw()
+                    && biomes
+                        .iter()
+                        .map(|tag| biome_from_tag(*tag))
+                        .eq(game_biomes.iter().copied())
+                    && *min_y == *game_min_y
+                    && *max_y == *game_max_y
+                    && *chance == *game_chance
+            }
+            _ => false,
+        }
     }
 
     #[test]
-    fn recipe_patch_disables_a_builtin_recipe() {
+    fn malformed_references_report_through_the_adapter() {
         let mut spec = PackContentSpec::default();
-        spec.recipe_patches.push(RecipePatch {
-            id: "planks".to_string(),
+        spec.blocks.push(BlockEntry {
+            id: "mymod:ore".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("ore.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 1.0,
+            drop: Some("mymod:missing".to_string()),
+            tool: None,
+            stack_limit: 64,
+        });
+        spec.assets.insert("ore.png".to_string(), asset(0x11));
+        spec.recipe_patches.push(crate::content::spec::RecipePatch {
+            id: "not_a_recipe".to_string(),
             enabled: false,
         });
 
         let (registry, report) =
             build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        let recipe = registry.recipe_by_name("planks").expect("planks exists");
-        assert!(!recipe.enabled);
-        assert_eq!(recipe.index, 0);
-        assert_eq!(recipe.output, ItemRef::Block(BlockId::OakPlanks));
-        assert!(
-            registry
-                .recipe_by_name("sticks")
-                .expect("sticks exists")
-                .enabled
-        );
-    }
 
-    #[test]
-    fn modded_blocks_start_at_builtin_count_in_sorted_id_order() {
-        let mut spec = PackContentSpec::default();
-        spec.blocks.push(block_entry("mymod:zeta", "z.png"));
-        spec.blocks.push(block_entry("mymod:alpha", "a.png"));
-        spec.assets.insert("a.png".to_string(), asset(1));
-        spec.assets.insert("z.png".to_string(), asset(2));
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(
-            registry.blocks().len(),
-            usize::from(BUILTIN_BLOCK_COUNT) + 2
-        );
-
-        let alpha = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("alpha at the first modded index");
-        let zeta = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT + 1))
-            .expect("zeta at the second modded index");
-        assert_eq!(alpha.name, "mymod:alpha");
-        assert_eq!(zeta.name, "mymod:zeta");
-        assert_eq!(alpha.id.to_raw(), BUILTIN_BLOCK_COUNT);
-        assert_eq!(zeta.id.to_raw(), BUILTIN_BLOCK_COUNT + 1);
-        assert_eq!(BlockId::from_raw(BUILTIN_BLOCK_COUNT), alpha.id);
-        assert_eq!(BlockId::from_raw(BUILTIN_BLOCK_COUNT + 1), zeta.id);
-        assert_eq!(registry.items().len(), 0);
-    }
-
-    #[test]
-    fn later_pack_replaces_a_definition_without_moving_other_indices() {
-        let mut first = PackContentSpec::default();
-        first.blocks.push(block_entry("mymod:alpha", "a.png"));
-        first.blocks.push(block_entry("mymod:zeta", "z.png"));
-        first.assets.insert("a.png".to_string(), asset(1));
-        first.assets.insert("z.png".to_string(), asset(2));
-
-        let mut second = PackContentSpec::default();
-        let mut replacement = block_entry("mymod:alpha", "a2.png");
-        replacement.display_name = Some("Alpha Two".to_string());
-        second.blocks.push(replacement);
-        second.assets.insert("a2.png".to_string(), asset(3));
-
-        let (registry, report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("first"), first), (identity("second"), second)],
-        );
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(report.warnings(), 1);
-        assert!(report.diagnostics[0].reason.contains("`second`"));
-
-        assert_eq!(
-            registry.blocks().len(),
-            usize::from(BUILTIN_BLOCK_COUNT) + 2
-        );
-        let alpha = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("alpha stays at the first modded index");
-        let zeta = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT + 1))
-            .expect("zeta stays at the second modded index");
-        assert_eq!(alpha.name, "mymod:alpha");
-        assert_eq!(alpha.display_name, "Alpha Two");
-        assert_eq!(zeta.name, "mymod:zeta");
-    }
-
-    #[test]
-    fn shared_assets_get_one_layer() {
-        let mut spec = PackContentSpec::default();
-        let mut entry = block_entry("mymod:all_sides", "shared.png");
-        entry.textures = BlockTextures {
-            all: Some("shared.png".to_string()),
-            top: Some("shared.png".to_string()),
-            bottom: Some("shared.png".to_string()),
-            side: Some("shared.png".to_string()),
-        };
-        spec.blocks.push(entry);
-        spec.assets.insert("shared.png".to_string(), asset(0x55));
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(registry.pack_layers().len(), 1);
-        assert_eq!(
-            registry.pack_layer_sources(),
-            &[LayerSource {
-                folder: "p".to_string(),
-                path: "shared.png".to_string(),
-            }],
-            "a shared asset is deduplicated into one layer and one source"
-        );
-        let def = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("pack block");
-        assert_eq!(def.faces, [PACK_LAYER_BASE; 6]);
-        assert_eq!(
-            registry.pack_layer(PACK_LAYER_BASE),
-            Some(&[0x55u8; 1024][..])
-        );
-        assert!(registry.pack_layer(PACK_LAYER_BASE - 1).is_none());
-    }
-
-    #[test]
-    fn block_layers_append_from_48_and_cap_at_208_with_fallback_26() {
-        let mut spec = PackContentSpec::default();
-        for index in 0..161 {
-            let texture = format!("layer_{index:03}.png");
-            spec.assets.insert(texture.clone(), asset(index as u8));
-            spec.blocks
-                .push(block_entry(&format!("mymod:block_{index:03}"), &texture));
-        }
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(registry.pack_layers().len(), 160);
-        assert_eq!(
-            PACK_LAYER_BASE as usize + registry.pack_layers().len(),
-            PACK_LAYER_CAP as usize
-        );
-        assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
-
-        let first = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("first pack block");
-        assert_eq!(first.name, "mymod:block_000");
-        assert_eq!(first.faces, [PACK_LAYER_BASE; 6]);
-        assert_eq!(registry.pack_layer(PACK_LAYER_BASE), Some(&[0u8; 1024][..]));
-
-        let last = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT + 160))
-            .expect("161st pack block");
-        assert_eq!(last.name, "mymod:block_160");
-        assert_eq!(last.faces, [PLACEHOLDER_BLOCK_LAYER; 6]);
-    }
-
-    #[test]
-    fn icons_append_from_32_and_cap_at_224_with_fallback_27() {
-        let mut spec = PackContentSpec::default();
-        for index in 0..193 {
-            let icon = format!("icon_{index:03}.png");
-            spec.assets.insert(icon.clone(), asset(index as u8));
-            spec.items
-                .push(item_entry(&format!("mymod:item_{index:03}"), &icon));
-        }
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(registry.pack_icons().len(), 192);
-        assert_eq!(
-            PACK_ICON_BASE as usize + registry.pack_icons().len(),
-            PACK_ICON_CAP as usize
-        );
-        assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
-        assert_eq!(registry.items()[0].icon_layer, PACK_ICON_BASE);
-        assert_eq!(
-            registry.item(0).map(|def| def.icon_layer),
-            Some(PACK_ICON_BASE)
-        );
-        assert_eq!(registry.items()[192].icon_layer, PLACEHOLDER_ICON_LAYER);
-        assert_eq!(registry.pack_icon(PACK_ICON_BASE), Some(&[0u8; 1024][..]));
-    }
-
-    #[test]
-    fn layer_and_icon_sources_align_with_allocated_bytes() {
-        let mut spec = PackContentSpec::default();
-        spec.blocks.push(block_entry("mymod:block", "block.png"));
-        spec.assets.insert("block.png".to_string(), asset(0x21));
-        spec.items.push(item_entry("mymod:item", "icon.png"));
-        spec.assets.insert("icon.png".to_string(), asset(0x31));
-
-        let (registry, report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("pack-a"), spec.clone())],
-        );
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-
-        assert_eq!(registry.pack_layers().len(), 1);
-        assert_eq!(registry.pack_layers()[0], vec![0x21; 1024]);
-        assert_eq!(
-            registry.pack_layer_sources(),
-            &[LayerSource {
-                folder: "pack-a".to_string(),
-                path: "block.png".to_string(),
-            }]
-        );
-        assert_eq!(registry.pack_icons().len(), 1);
-        assert_eq!(registry.pack_icons()[0], vec![0x31; 1024]);
-        assert_eq!(
-            registry.pack_icon_sources(),
-            &[LayerSource {
-                folder: "pack-a".to_string(),
-                path: "icon.png".to_string(),
-            }]
-        );
-
-        // Asset bytes are not digest input: a recolor leaves both the digest
-        // and the frozen provenance unchanged.
-        let mut recolored = spec;
-        recolored
-            .assets
-            .insert("block.png".to_string(), asset(0xEE));
-        recolored.assets.insert("icon.png".to_string(), asset(0xFF));
-        let (recolored, report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("pack-a"), recolored)],
-        );
-        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(recolored.digest(), registry.digest());
-        assert_eq!(
-            recolored.pack_layer_sources(),
-            registry.pack_layer_sources()
-        );
-        assert_eq!(recolored.pack_icon_sources(), registry.pack_icon_sources());
-        assert_eq!(recolored.pack_layers()[0], vec![0xEE; 1024]);
-        assert_eq!(recolored.pack_icons()[0], vec![0xFF; 1024]);
-    }
-
-    #[test]
-    fn digest_is_stable_and_excludes_asset_bytes() {
-        let mut spec = PackContentSpec::default();
-        spec.blocks.push(block_entry("mymod:ore", "ore.png"));
-        spec.assets.insert("ore.png".to_string(), asset(1));
-        let base = build_registry(ContentRegistry::builtin(), &[(identity("p"), spec.clone())]).0;
-        let again = build_registry(ContentRegistry::builtin(), &[(identity("p"), spec.clone())]).0;
-        assert_eq!(base.digest(), again.digest());
-
-        // Asset bytes are excluded: same path, different RGBA bytes.
-        let mut recolored = spec.clone();
-        recolored.assets.insert("ore.png".to_string(), asset(0xEE));
-        let recolored = build_registry(ContentRegistry::builtin(), &[(identity("p"), recolored)]).0;
-        assert_eq!(base.digest(), recolored.digest());
-
-        // A definition change moves the digest.
-        let mut renamed = spec.clone();
-        renamed.blocks[0].display_name = Some("Ruby Ore".to_string());
-        let renamed = build_registry(ContentRegistry::builtin(), &[(identity("p"), renamed)]).0;
-        assert_ne!(base.digest(), renamed.digest());
-
-        // A texture path change moves the digest even when the layer index is
-        // unchanged.
-        let mut repathed = spec.clone();
-        repathed.blocks[0].textures.all = Some("ore2.png".to_string());
-        repathed.assets.insert("ore2.png".to_string(), asset(1));
-        let repathed = build_registry(ContentRegistry::builtin(), &[(identity("p"), repathed)]).0;
-        assert_eq!(repathed.pack_layers().len(), base.pack_layers().len());
-        assert_ne!(base.digest(), repathed.digest());
-
-        // A pack version change moves the digest.
-        let mut versioned_identity = identity("p");
-        versioned_identity.version = Some("2.0.0".to_string());
-        let versioned = build_registry(
-            ContentRegistry::builtin(),
-            &[(versioned_identity, spec.clone())],
-        )
-        .0;
-        assert_ne!(versioned.digest(), base.digest());
+        assert_eq!(report.errors(), 2, "{:?}", report.diagnostics);
+        let block = registry
+            .block_by_name("mymod:ore")
+            .expect("the block is still allocated");
+        assert_eq!(block.drop, None, "an unresolved drop falls back to none");
+        assert!(registry.recipe_by_name("not_a_recipe").is_none());
     }
 
     #[test]
@@ -1604,289 +627,125 @@ mod tests {
     }
 
     #[test]
-    fn worldgen_rules_keep_authored_order_and_cap_at_8() {
-        let mut spec = PackContentSpec::default();
-        spec.blocks.push(block_entry("mymod:ore", "ore.png"));
-        spec.assets.insert("ore.png".to_string(), asset(1));
-        for index in 0..10 {
-            spec.worldgen.push(WorldgenEntry {
-                kind: WorldgenKind::Ore {
-                    block: "mymod:ore".to_string(),
-                    replace: "stone".to_string(),
-                    min_y: index,
-                    max_y: 128,
-                    vein: 4,
-                    attempts: 8,
-                },
-            });
-        }
+    fn empty_stack_rebuilds_the_builtin_registry() {
+        let builtin = ContentRegistry::builtin();
+        let (registry, report) = build_registry(builtin, &[]);
 
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        assert_eq!(registry.worldgen_rules().len(), 8);
-        assert_eq!(report.errors(), 2, "{:?}", report.diagnostics);
-        for (index, rule) in registry.worldgen_rules().iter().enumerate() {
-            match rule {
-                WorldgenRule::Ore { min_y, .. } => assert_eq!(*min_y, index as i32),
-                other => panic!("expected an ore rule, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn registry_rebuild_is_deterministic() {
-        let mut spec = PackContentSpec::default();
-        spec.blocks.push(block_entry("mymod:ore", "ore.png"));
-        spec.blocks
-            .push(block_entry("mymod:gem_block", "gem_block.png"));
-        spec.assets.insert("ore.png".to_string(), asset(1));
-        spec.assets.insert("gem_block.png".to_string(), asset(2));
-        spec.items.push(item_entry("mymod:gem", "gem.png"));
-        spec.assets.insert("gem.png".to_string(), asset(3));
-        spec.tiers.push(tier_entry("mymod:ruby"));
-        spec.tools
-            .push(tool_entry("mymod:ruby_pickaxe", "mymod:ruby", "pick.png"));
-        spec.assets.insert("pick.png".to_string(), asset(4));
-        let mut food_item = item_entry("mymod:snack", "snack.png");
-        food_item.food = Some(FoodSpec {
-            nutrition: 4,
-            eat_seconds: 0.8,
-        });
-        food_item.display_name = Some("Snack".to_string());
-        spec.items.push(food_item);
-        spec.assets.insert("snack.png".to_string(), asset(5));
-        spec.recipes.push(RecipeEntry {
-            id: "mymod:ruby_pickaxe".to_string(),
-            pattern: vec!["RRR".to_string(), " S ".to_string(), " S ".to_string()],
-            key: [('R', "mymod:gem".to_string()), ('S', "stick".to_string())]
-                .into_iter()
-                .collect(),
-            output: "mymod:ruby_pickaxe".to_string(),
-            count: 1,
-        });
-        spec.worldgen.push(WorldgenEntry {
-            kind: WorldgenKind::Patch {
-                block: "mymod:gem_block".to_string(),
-                replace: "grass".to_string(),
-                biomes: vec!["plains".to_string(), "forest".to_string()],
-                min_y: 60,
-                max_y: 80,
-                chance: 0.01,
-            },
-        });
-
-        let pack = (identity("p"), spec);
-        let (first, first_report) =
-            build_registry(ContentRegistry::builtin(), std::slice::from_ref(&pack));
-        let (second, second_report) =
-            build_registry(ContentRegistry::builtin(), std::slice::from_ref(&pack));
-
-        assert_eq!(first_report, second_report);
-        assert_eq!(first.digest(), second.digest());
+        assert_eq!(registry.blocks(), builtin.blocks());
+        assert_eq!(registry.tiers(), builtin.tiers());
+        assert_eq!(registry.recipes(), builtin.recipes());
+        assert!(registry.items().is_empty());
+        assert!(registry.tools().is_empty());
+        assert!(registry.worldgen_rules().is_empty());
         assert_eq!(
-            first
-                .blocks()
-                .iter()
-                .map(|def| (def.id, def.faces))
-                .collect::<Vec<_>>(),
-            second
-                .blocks()
-                .iter()
-                .map(|def| (def.id, def.faces))
-                .collect::<Vec<_>>()
+            report,
+            crate::content::registry::ContentLoadReport::default()
         );
-        assert_eq!(first.pack_layers(), second.pack_layers());
-        assert_eq!(first.pack_icons(), second.pack_icons());
-        assert_eq!(first.recipes().len(), 23);
-        assert_eq!(first.recipes()[22].name, "mymod:ruby_pickaxe");
-        assert_eq!(first.recipes()[22].output, ItemRef::Tool(0));
-        assert_eq!(first.recipes()[22].key[&'R'], ItemRef::Item(0));
-        assert_eq!(
-            first.recipes()[22].key[&'S'],
-            ItemRef::Builtin(ItemId::Material(crate::player::inventory::Material::Stick))
-        );
-        assert_eq!(first.tools()[0].tier, 3);
-        assert_eq!(first.tiers().len(), 4);
-        assert_eq!(first.items()[0].name, "mymod:gem");
-        assert_eq!(
-            first.items()[1].food,
-            Some(FoodDef {
-                nutrition: 4,
-                eat_seconds: 0.8
-            })
-        );
-    }
-
-    #[test]
-    fn content_report_counts_errors_and_warnings() {
-        let mut first = PackContentSpec::default();
-        first.blocks.push(block_entry("mymod:ore", "ore.png"));
-        first.assets.insert("ore.png".to_string(), asset(1));
-        first.worldgen.push(WorldgenEntry {
-            kind: WorldgenKind::Ore {
-                block: "mymod:ore".to_string(),
-                replace: "stone".to_string(),
-                min_y: -16,
-                max_y: 16,
-                vein: 4,
-                attempts: 8,
-            },
-        });
-
-        let mut second = PackContentSpec::default();
-        // Replaces the earlier definition (warning) and references a missing
-        // asset (error).
-        second.blocks.push(block_entry("mymod:ore", "missing.png"));
-
-        let (_, report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("first"), first), (identity("second"), second)],
-        );
-        assert_eq!(report.entries, 3);
-        assert_eq!(report.warnings(), 1);
-        assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
-        assert_eq!(
-            report.diagnostics.len(),
-            report.warnings() + report.errors()
-        );
-        assert!(report
-            .diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.severity == Severity::Error
-                && diagnostic.reason.contains("missing.png")));
-    }
-
-    #[test]
-    fn unresolved_references_fall_back_instead_of_panicking() {
-        let mut spec = PackContentSpec::default();
-        let mut entry = block_entry("mymod:broken", "broken.png");
-        entry.drop = Some("mymod:does_not_exist".to_string());
-        spec.blocks.push(entry);
-        spec.assets.insert("broken.png".to_string(), asset(1));
-        spec.recipe_patches.push(RecipePatch {
-            id: "not_a_recipe".to_string(),
-            enabled: false,
-        });
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        let def = registry
-            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
-            .expect("block still exists");
-        assert_eq!(def.drop, None);
-        assert_eq!(report.errors(), 2, "{:?}", report.diagnostics);
-        assert!(registry.recipe_by_name("not_a_recipe").is_none());
-    }
-
-    #[test]
-    fn empty_stack_is_the_builtin_registry() {
-        let (registry, report) = build_registry(ContentRegistry::builtin(), &[]);
-        assert_eq!(report, ContentLoadReport::default());
-        assert_eq!(registry.blocks(), ContentRegistry::builtin().blocks());
-        assert_eq!(registry.recipes(), ContentRegistry::builtin().recipes());
         assert_eq!(registry.digest(), EMPTY_DIGEST);
     }
 
     #[test]
-    fn display_names_are_derived_from_namespaced_ids() {
-        assert_eq!(derive_display_name("mymod:ruby_ore"), "Ruby Ore");
-        assert_eq!(derive_display_name("mymod:Iron"), "Iron");
-        assert_eq!(derive_display_name("stone"), "Stone");
+    fn catalog_conversion_is_lossless_for_builtin_tables() {
+        let builtin = ContentRegistry::builtin();
+        let catalog = base_catalog(builtin);
+        let round_tripped = from_catalog(catalog);
+
+        assert_eq!(round_tripped.blocks(), builtin.blocks());
+        assert_eq!(round_tripped.tiers(), builtin.tiers());
+        assert_eq!(round_tripped.recipes(), builtin.recipes());
+        assert!(round_tripped.items().is_empty());
+        assert!(round_tripped.tools().is_empty());
+        assert!(round_tripped.worldgen_rules().is_empty());
+        assert!(round_tripped.pack_layers().is_empty());
+        assert!(round_tripped.pack_icons().is_empty());
+        assert!(round_tripped.packs().is_empty());
+        assert_eq!(round_tripped.digest(), EMPTY_DIGEST);
     }
 
     #[test]
-    fn builtin_icons_do_not_move_digest_allocation_or_entry_count() {
-        let mut plain = PackContentSpec::default();
-        plain.items.push(item_entry("mymod:iconful", "icon.png"));
-        plain.assets.insert("icon.png".to_string(), asset(0x22));
+    fn game_digest_matches_the_neutral_catalog_for_a_representative_pack() {
+        let packs = [representative_pack()];
 
-        let mut with_override = plain.clone();
-        with_override
-            .builtin_icons
-            .insert("apple".to_string(), "apple.png".to_string());
-        with_override
-            .builtin_icons
-            .insert("wood_pickaxe".to_string(), "pickaxe.png".to_string());
-        with_override
-            .assets
-            .insert("apple.png".to_string(), asset(0x33));
-        with_override
-            .assets
-            .insert("pickaxe.png".to_string(), asset(0x44));
+        let (registry, report) = build_registry(ContentRegistry::builtin(), &packs);
+        let base = base_catalog(ContentRegistry::builtin());
+        let (catalog, neutral_report) = neutral::build_catalog(&base, &packs);
 
-        let (plain_registry, plain_report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("p"), plain.clone())],
-        );
-        let (override_registry, override_report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("p"), with_override.clone())],
-        );
-
-        assert_eq!(override_report.entries, plain_report.entries);
-        assert_eq!(
-            override_report.errors(),
-            0,
-            "{:?}",
-            override_report.diagnostics
-        );
-        assert_eq!(
-            override_report.warnings(),
-            0,
-            "{:?}",
-            override_report.diagnostics
-        );
-        assert_eq!(override_registry.digest(), plain_registry.digest());
-        assert_eq!(
-            override_registry.pack_layers(),
-            plain_registry.pack_layers()
-        );
-        assert_eq!(override_registry.pack_icons(), plain_registry.pack_icons());
-        assert_eq!(
-            override_registry.pack_icon_sources(),
-            plain_registry.pack_icon_sources()
-        );
-        assert_eq!(
-            override_registry.pack_layers().len(),
-            plain_registry.pack_layers().len()
-        );
-        assert_eq!(
-            override_registry.pack_icons().len(),
-            plain_registry.pack_icons().len()
-        );
-
-        // Removing the override again is the same identity.
-        let (restored, restored_report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), plain)]);
-        assert_eq!(restored.digest(), override_registry.digest());
-        assert_eq!(restored_report.entries, override_report.entries);
-    }
-
-    #[test]
-    fn builtin_icon_with_unloaded_asset_warns_without_changing_identity() {
-        let mut spec = PackContentSpec::default();
-        spec.builtin_icons
-            .insert("apple".to_string(), "missing.png".to_string());
-
-        let (registry, report) =
-            build_registry(ContentRegistry::builtin(), &[(identity("p"), spec)]);
-        let (empty, empty_report) = build_registry(
-            ContentRegistry::builtin(),
-            &[(identity("p"), PackContentSpec::default())],
-        );
-
+        // The adapter is a field-for-field conversion: every observable value,
+        // including the digest, matches the neutral catalog byte for byte.
+        assert_eq!(report, neutral_report);
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(report.warnings(), 1, "{:?}", report.diagnostics);
-        assert_eq!(report.diagnostics[0].severity, Severity::Warning);
-        assert_eq!(report.diagnostics[0].entry, "builtin_icon apple");
-        assert!(
-            report.diagnostics[0].reason.contains("not a loaded asset"),
-            "{:?}",
-            report.diagnostics
+        assert_eq!(registry.digest(), catalog.digest());
+        assert_eq!(registry.packs(), catalog.packs());
+        assert_eq!(registry.pack_layers(), catalog.pack_layers());
+        assert_eq!(registry.pack_icons(), catalog.pack_icons());
+        assert_eq!(registry.pack_layer_sources(), catalog.pack_layer_sources());
+        assert_eq!(registry.pack_icon_sources(), catalog.pack_icon_sources());
+        assert_eq!(registry.worldgen_rules().len(), 2);
+        assert_eq!(
+            registry.worldgen_rules().len(),
+            catalog.worldgen_rules().len()
         );
-        assert_eq!(report.entries, empty_report.entries);
-        assert_eq!(registry.digest(), empty.digest());
-        assert_eq!(registry.pack_layers().len(), 0);
-        assert_eq!(registry.pack_icons().len(), 0);
+        for (game, neutral) in registry
+            .worldgen_rules()
+            .iter()
+            .zip(catalog.worldgen_rules())
+        {
+            assert!(
+                same_worldgen_rule(neutral, game),
+                "worldgen rule conversion is lossless: {game:?}"
+            );
+            // The inverse direction must also be exact, or the terrain
+            // adapter could reorder or rewrite a rule on its way back into
+            // the crate (pack ores/patches would drift).
+            assert_eq!(
+                worldgen_from_catalog(worldgen_to_catalog(game)),
+                *game,
+                "game -> neutral -> game must round-trip every rule field"
+            );
+        }
+
+        let block = registry
+            .block_by_name("mymod:ruby_ore")
+            .expect("the pack block is registered");
+        assert_eq!(block.id, BlockId::Modded(24));
+        assert_eq!(block.faces, [48; 6]);
+        assert_eq!(block.drop, Some(ItemRef::Item(0)));
+        assert_eq!(block.tool_class, Some(ToolKind::Pickaxe));
+
+        let item = registry
+            .item_by_name("mymod:ruby")
+            .expect("the pack item is registered");
+        assert_eq!(item.index, 0);
+        assert_eq!(item.icon_layer, 32);
+
+        assert_eq!(
+            registry.tier(3).map(|tier| tier.name.as_str()),
+            Some("mymod:ruby")
+        );
+        let tool = registry
+            .tool_by_name("mymod:ruby_pickaxe")
+            .expect("the pack tool is registered");
+        assert_eq!(tool.index, 0);
+        assert_eq!(tool.tier, 3);
+
+        let recipe = registry
+            .recipe_by_name("mymod:ruby_pickaxe")
+            .expect("the pack recipe is registered");
+        assert_eq!(recipe.index, 22);
+        assert_eq!(recipe.output, ItemRef::Tool(0));
+        assert_eq!(recipe.key.get(&'R'), Some(&ItemRef::Item(0)));
+        assert_eq!(
+            recipe.key.get(&'S'),
+            Some(&ItemRef::Builtin(ItemId::Material(Material::Stick)))
+        );
+
+        // The block patch survives in both directions and does not move the
+        // game-side identity.
+        let stone = registry
+            .block(BlockId::Stone)
+            .expect("stone stays registered");
+        assert_eq!(stone.display_name, "Granite");
+        assert_eq!(stone.hardness, Some(2.5));
+        assert_eq!(stone.id, BlockId::Stone);
     }
 }

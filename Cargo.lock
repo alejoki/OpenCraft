@@ -596,10 +596,13 @@ name = "engine-reuse-proof"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "opencraft-content",
  "opencraft-core",
  "opencraft-gfx",
  "opencraft-pathfinding",
  "opencraft-physics",
+ "opencraft-storage",
+ "opencraft-worldgen",
 ]
 
 [[package]]
@@ -1672,16 +1675,19 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opencraft"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "crossbeam-channel",
  "glam",
  "glyphon",
+ "opencraft-content",
  "opencraft-core",
  "opencraft-gfx",
  "opencraft-pathfinding",
  "opencraft-physics",
+ "opencraft-storage",
+ "opencraft-worldgen",
  "png",
  "rayon",
  "rodio",
@@ -1691,6 +1697,16 @@ dependencies = [
  "toml",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "opencraft-content"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+ "png",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]
@@ -1726,6 +1742,25 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "opencraft-core",
+]
+
+[[package]]
+name = "opencraft-storage"
+version = "0.1.0"
+dependencies = [
+ "opencraft-core",
+ "tempfile",
+]
+
+[[package]]
+name = "opencraft-worldgen"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "opencraft-content",
+ "opencraft-core",
+ "tempfile",
+ "toml",
 ]
 
 [[package]]

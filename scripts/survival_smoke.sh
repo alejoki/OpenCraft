@@ -12,42 +12,26 @@
 #         survival fact: fall damage 4, eat restore 4, drowning with air 0,
 #         starvation death, respawn with inventory kept, Survival mode, and
 #         the loaded v6 vitals at 20/20/300.
-#     (d) the save exists, starts with the `MCVX` magic, its version word is
-#         9, and its exact length is 201 bytes (an edit-free v9 save with
-#         zero chests, exactly two occupied inventory slots, a two-name
-#         content table, and a zero mob count).
-#     (e) the save's chunk count is 0, proving the demo performed no chunk
-#         edits.
-#     (f) the v6 survival header at the pinned offsets decodes to mode 0
-#         (Survival), health 20, hunger 20, air 300, chest count 0, and the
-#         v7 mob count at offset 175 is 0; the v8 pack count at 179 is 0, the
-#         v9 config schema at 191 is 1, and the config digest 193..201 ends
-#         at EOF.
+#     (d) the save is a valid sectioned v10 archive: `MCVX` magic, version
+#         10 at offset 4, flags 0 at offset 8, a 16-byte header, and a
+#         validated contiguous section directory (scripts/save_witness.sh).
+#     (e) section 1 holds exactly the two kind-tagged names `2:apple` and
+#         `2:stick`, proving the two kept inventory stacks were persisted by
+#         name through the v10 content table.
+#     (f) section 2 decodes to mode 0 (Survival), health 20, hunger 20, air
+#         300, and a fresh day-0 calendar with one-day seasons; section 4
+#         chests, section 5 mobs, section 8 crops, and section 9 chunk index
+#         each hold a zero count, proving the survival demo performed no
+#         chest, mob, crop, or chunk edits. Section 7 carries config schema 1
+#         and the default effective-value digest.
 #
-# Why the offsets are fixed here: the survival demo is edit-free by
-# construction (it never mines, places, or edits a chunk), so the
-# variable-length chunk section writes a zero chunk count. With an EMPTY
-# inventory the v9 layout would be the header (36) + content table (4) +
-# hotbar (27) + time_of_day (4) + chunk count (4) + v4 inventory extension
-# (59) = 134 bytes before the v5 calendar tail (8 bytes), then the v6
-# survival header (11 bytes), the v7 mob count (4 bytes), the v8-format
-# pack tail (u32 pack count + u64 digest = 12 bytes), and the 10-byte v9
-# config tail (u16 schema + u64 digest), i.e. exactly 179 bytes.
-# The survival demo, however, must prove `inventory_kept=true`: it eats one
-# of two Apples and keeps the Stick marker, so at save time it holds exactly
-# two stacks (Apple x1 and Stick x1). The save-local content table then holds
-# two names (`apple` and `stick`): 4-byte count plus (2 + 5) + (2 + 5) = 18
-# bytes. Each occupied v8 item record is 5 bytes (tag + u16 name index + u16
-# payload) instead of the legacy 4, so the v4 extension grows by 2. The v5
-# calendar tail therefore moves to 130 + 18 + 8 = 156, the v6 header to 164,
-# the v7 mob count to 175, the pack tail to 191, and the v9 config tail
-# ends at 201.
-# This script asserts that shifted layout together with the exact size, so a
-# header move or an inventory change fails loudly. A future header move must
-# update the persistence.rs test constants first, then this script.
-#
-# The content smoke deliberately does not use fixed offsets: its chunk edits
-# shift the variable-length chunk section (see scripts/content_smoke.sh).
+# Why the old v9 flat offsets are gone: v10 replaces the single flat payload
+# with a 16-byte header plus a 21-byte directory and section bodies. The
+# survival demo is edit-free by construction (it never mines, places, or
+# edits a chunk), so the smokes assert the fixed sections by id instead of
+# pinning offsets that move whenever a section grows. The historical v9
+# edit-free layout was 179 bytes (201 bytes with the two kept stacks); those
+# offsets live only in docs/SAVE-NOTES.md and the frozen v9 witnesses.
 #
 # The script builds the debug binary itself with `cargo build --locked` and
 # runs target/debug/opencraft. `SMOKE_PROFILE=release` is the opt-in
@@ -77,24 +61,14 @@ else
     BUILD_ARGS=(build --locked)
 fi
 
-# Display auto-detection: agent/CI shells can lack DISPLAY/WAYLAND_DISPLAY even
-# when a desktop session is live. Attach to the running session so winit can
-# create its window. Prefer the Wayland socket: Xwayland's :0 needs an xauth
-# cookie the launching shell may not have, and winit picks the X11 backend
-# whenever DISPLAY is set (it does not fall back cleanly to Wayland).
-if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-    if [[ -e "/run/user/$(id -u)/wayland-0" ]]; then
-        export WAYLAND_DISPLAY="wayland-0"
-        export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-    elif [[ -e "/tmp/.X11-unix/X0" ]]; then
-        export DISPLAY=":0"
-    fi
-fi
-
 # Resolve the crate root and binary absolutely before changing directory (the
-# build runs from the crate root).
+# build runs from the crate root), then source the shared v10 archive witness
+# helper and attach to a live display (preferring a wayland-* socket).
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CRATE_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=scripts/save_witness.sh
+source "$SCRIPT_DIR/save_witness.sh"
+smoke_detect_display
 BIN="$CRATE_ROOT/target/$PROFILE/opencraft"
 BUILD_LOG="$(mktemp /tmp/opencraft-survival-build.XXXXXX.log)" || {
     echo "SURVIVAL SMOKE FAIL: could not create a build log" >&2
@@ -126,63 +100,26 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Survival wire layout (see the header comment and persistence.rs). The
-# LEGACY_V5_SEASON_OFFSET is the empty-inventory offset pinned by the
-# persistence.rs unit tests. v8 inserts an 18-byte content table (`apple` and
-# `stick`) after render_distance, and the two occupied items each grow by one
-# byte over the legacy record, so every later offset shifts by 26. v9 appends
-# the 10-byte config tail after the pack-identity tail.
-LEGACY_V5_SEASON_OFFSET=130
-V5_SEASON_LEN=8
-V8_CONTENT_TABLE_OFFSET=36
-# Measured: count u32 + "apple" (2+5) + "stick" (2+5).
-V8_CONTENT_TABLE_LEN=18
-# Two occupied v8 item records at 5 bytes each instead of the legacy 4.
-SURVIVAL_INVENTORY_EXPANSION=8
-V5_SEASON_OFFSET=$((LEGACY_V5_SEASON_OFFSET + V8_CONTENT_TABLE_LEN + SURVIVAL_INVENTORY_EXPANSION))
-V6_MODE_OFFSET=$((V5_SEASON_OFFSET + V5_SEASON_LEN))
-V6_HEALTH_OFFSET=$((V6_MODE_OFFSET + 1))
-V6_HUNGER_OFFSET=$((V6_HEALTH_OFFSET + 2))
-V6_AIR_OFFSET=$((V6_HUNGER_OFFSET + 2))
-V6_CHEST_COUNT_OFFSET=$((V6_AIR_OFFSET + 2))
-V6_FIRST_CHEST_OFFSET=$((V6_CHEST_COUNT_OFFSET + 4))
-
-# The v7 mob tail appends a u32 count after the last chest record. The
-# survival demo never spawns a mob, so the count is 0.
-V7_MOB_COUNT_LEN=4
-# v9 tail: the v8 u32 pack count plus u64 FNV-1a digest (12 bytes), then the
-# v9 u16 config schema plus u64 effective-value digest (10 bytes).
-V9_TAIL_LEN=22
-# The content table precedes the hotbar, so it shifts the chunk count too.
-CHUNK_COUNT_OFFSET=$((67 + V8_CONTENT_TABLE_LEN))
-
-SAVE_MODE_OFFSET=$V6_MODE_OFFSET
-SAVE_HEALTH_OFFSET=$V6_HEALTH_OFFSET
-SAVE_HUNGER_OFFSET=$V6_HUNGER_OFFSET
-SAVE_AIR_OFFSET=$V6_AIR_OFFSET
-SAVE_CHEST_COUNT_OFFSET=$V6_CHEST_COUNT_OFFSET
-SAVE_FIRST_CHEST_OFFSET=$V6_FIRST_CHEST_OFFSET
-SAVE_MOB_COUNT_OFFSET=$SAVE_FIRST_CHEST_OFFSET
-SAVE_PACK_COUNT_OFFSET=$((SAVE_MOB_COUNT_OFFSET + V7_MOB_COUNT_LEN))
-# The config schema follows the u32 pack count and the u64 registry digest.
-SAVE_CONFIG_SCHEMA_OFFSET=$((SAVE_PACK_COUNT_OFFSET + 4 + 8))
-SURVIVAL_SAVE_LEN=$((SAVE_PACK_COUNT_OFFSET + V9_TAIL_LEN))
+# Section 2 world/player layout (scripts/save_witness.sh documents the full
+# section list): seed u32, position x/y/z f32, yaw f32, pitch f32, fly u8,
+# selected_slot u8, render_distance u16, time_of_day u32, day_index u32,
+# season_length_days u32, mode u8, health u16, hunger u16, air u16.
+WORLD_DAY_OFFSET=32
+WORLD_SEASON_OFFSET=36
+WORLD_MODE_OFFSET=40
+WORLD_HEALTH_OFFSET=41
+WORLD_HUNGER_OFFSET=43
+WORLD_AIR_OFFSET=45
+# Section 7 config: u16 schema + u64 effective-value digest. The smokes run
+# with built-in defaults (no config/ directory in the temp cwd), so the
+# digest is the frozen default `0xeaeac8ddce568dec`.
+CONFIG_SCHEMA_OFFSET=0
+CONFIG_DIGEST_OFFSET=2
+DEFAULT_CONFIG_DIGEST=16927563004400537068
 
 # The demo's own wall-clock deadline is 120 s; the outer timeout is only a
 # backstop for a hang, and a kill here is an explicit failure.
 OUTER_TIMEOUT=180
-
-read_u8() {
-    od -An -tu1 -j "$2" -N 1 "$1" | tr -d ' '
-}
-
-read_u16_le() {
-    od -An -tu2 --endian=little -j "$2" -N 2 "$1" | tr -d ' '
-}
-
-read_u32_le() {
-    od -An -tu4 --endian=little -j "$2" -N 4 "$1" | tr -d ' '
-}
 
 cd "$TEMP_DIR"
 SAVE="$TEMP_DIR/survival.mcvx"
@@ -250,83 +187,82 @@ do
     require_token "$token"
 done
 
-SAVE_SIZE=$(wc -c <"$SAVE")
-if [[ "$SAVE_SIZE" -ne "$SURVIVAL_SAVE_LEN" ]]; then
-    echo "SURVIVAL SMOKE FAIL: save is $SAVE_SIZE bytes (expected exactly $SURVIVAL_SAVE_LEN: an edit-free v9 save with zero chests, zero mobs, a two-name content table, and two occupied inventory slots)"
+assert_mcvx_v10 "$SAVE"
+
+CONTENT_NAMES=()
+mapfile -t CONTENT_NAMES < <(mcvx_content_table_names "$SAVE")
+if [[ ${#CONTENT_NAMES[@]} -ne 2 || "${CONTENT_NAMES[0]}" != "2:apple" || "${CONTENT_NAMES[1]}" != "2:stick" ]]; then
+    echo "SURVIVAL SMOKE FAIL: v10 content table is [${CONTENT_NAMES[*]}] (expected exactly 2:apple and 2:stick)"
     exit 1
 fi
 
-MAGIC=$(head -c 4 "$SAVE")
-if [[ "$MAGIC" != "MCVX" ]]; then
-    echo "SURVIVAL SMOKE FAIL: save magic is '$MAGIC' (expected MCVX)"
-    exit 1
-fi
-
-VERSION=$(read_u32_le "$SAVE" 4)
-if [[ "$VERSION" -ne 9 ]]; then
-    echo "SURVIVAL SMOKE FAIL: save version is $VERSION (expected 9)"
-    exit 1
-fi
-
-CONTENT_NAME_COUNT=$(read_u32_le "$SAVE" "$V8_CONTENT_TABLE_OFFSET")
-if [[ "$CONTENT_NAME_COUNT" -ne 2 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v8 content table holds $CONTENT_NAME_COUNT names (expected 2: apple and stick)"
-    exit 1
-fi
-
-CHUNK_COUNT=$(read_u32_le "$SAVE" "$CHUNK_COUNT_OFFSET")
-if [[ "$CHUNK_COUNT" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: chunk count is $CHUNK_COUNT (expected 0: the survival demo must be edit-free)"
-    exit 1
-fi
-
-MODE=$(read_u8 "$SAVE" "$SAVE_MODE_OFFSET")
+DAY_INDEX=$(mcvx_section_u32 "$SAVE" 2 "$WORLD_DAY_OFFSET")
+SEASON_LENGTH=$(mcvx_section_u32 "$SAVE" 2 "$WORLD_SEASON_OFFSET")
+MODE=$(mcvx_section_u8 "$SAVE" 2 "$WORLD_MODE_OFFSET")
+HEALTH=$(mcvx_section_u16 "$SAVE" 2 "$WORLD_HEALTH_OFFSET")
+HUNGER=$(mcvx_section_u16 "$SAVE" 2 "$WORLD_HUNGER_OFFSET")
+AIR=$(mcvx_section_u16 "$SAVE" 2 "$WORLD_AIR_OFFSET")
 if [[ "$MODE" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v6 mode byte is $MODE (expected 0 = Survival)"
+    echo "SURVIVAL SMOKE FAIL: section 2 mode byte is $MODE (expected 0 = Survival)"
     exit 1
 fi
 
-HEALTH=$(read_u16_le "$SAVE" "$SAVE_HEALTH_OFFSET")
+if [[ "$DAY_INDEX" -ne 0 || "$SEASON_LENGTH" -ne 1 ]]; then
+    echo "SURVIVAL SMOKE FAIL: section 2 calendar is day $DAY_INDEX with $SEASON_LENGTH-day seasons (expected day 0 with 1-day seasons for a fresh world)"
+    exit 1
+fi
+
 if [[ "$HEALTH" -ne 20 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v6 health is $HEALTH (expected 20)"
+    echo "SURVIVAL SMOKE FAIL: section 2 health is $HEALTH (expected 20)"
     exit 1
 fi
 
-HUNGER=$(read_u16_le "$SAVE" "$SAVE_HUNGER_OFFSET")
 if [[ "$HUNGER" -ne 20 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v6 hunger is $HUNGER (expected 20)"
+    echo "SURVIVAL SMOKE FAIL: section 2 hunger is $HUNGER (expected 20)"
     exit 1
 fi
 
-AIR=$(read_u16_le "$SAVE" "$SAVE_AIR_OFFSET")
 if [[ "$AIR" -ne 300 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v6 air is $AIR (expected 300)"
+    echo "SURVIVAL SMOKE FAIL: section 2 air is $AIR (expected 300)"
     exit 1
 fi
 
-CHEST_COUNT=$(read_u32_le "$SAVE" "$SAVE_CHEST_COUNT_OFFSET")
+CHEST_COUNT=$(mcvx_section_u32 "$SAVE" 4 0)
 if [[ "$CHEST_COUNT" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v6 chest count is $CHEST_COUNT (expected 0)"
+    echo "SURVIVAL SMOKE FAIL: section 4 chest count is $CHEST_COUNT (expected 0)"
     exit 1
 fi
 
-MOB_COUNT=$(read_u32_le "$SAVE" "$SAVE_MOB_COUNT_OFFSET")
+MOB_COUNT=$(mcvx_section_u32 "$SAVE" 5 0)
 if [[ "$MOB_COUNT" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v7 mob count is $MOB_COUNT (expected 0)"
+    echo "SURVIVAL SMOKE FAIL: section 5 mob count is $MOB_COUNT (expected 0)"
     exit 1
 fi
 
-PACK_COUNT=$(read_u32_le "$SAVE" "$SAVE_PACK_COUNT_OFFSET")
-if [[ "$PACK_COUNT" -ne 0 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v8 pack count is $PACK_COUNT (expected 0 for a built-in-only stack)"
+CROP_COUNT=$(mcvx_section_u32 "$SAVE" 8 0)
+if [[ "$CROP_COUNT" -ne 0 ]]; then
+    echo "SURVIVAL SMOKE FAIL: section 8 crop count is $CROP_COUNT (expected 0: the survival demo plants nothing)"
     exit 1
 fi
 
-CONFIG_SCHEMA=$(read_u16_le "$SAVE" "$SAVE_CONFIG_SCHEMA_OFFSET")
+CHUNK_COUNT=$(mcvx_section_u32 "$SAVE" 9 0)
+if [[ "$CHUNK_COUNT" -ne 0 ]]; then
+    echo "SURVIVAL SMOKE FAIL: section 9 chunk count is $CHUNK_COUNT (expected 0: the survival demo must be edit-free)"
+    exit 1
+fi
+
+CONFIG_SCHEMA=$(mcvx_section_u16 "$SAVE" 7 "$CONFIG_SCHEMA_OFFSET")
 if [[ "$CONFIG_SCHEMA" -ne 1 ]]; then
-    echo "SURVIVAL SMOKE FAIL: v9 config schema is $CONFIG_SCHEMA (expected 1)"
+    echo "SURVIVAL SMOKE FAIL: section 7 config schema is $CONFIG_SCHEMA (expected 1)"
     exit 1
 fi
 
-echo "SURVIVAL SMOKE PASS [profile=$PROFILE]: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote an edit-free ${SURVIVAL_SAVE_LEN}-byte v9 save (mode Survival, vitals 20/20/300, 0 chests, 0 mobs, 0 chunk edits, 2 kept inventory stacks, 2 content names, 0 packs, config schema 1)"
+CONFIG_DIGEST=$(mcvx_section_u64 "$SAVE" 7 "$CONFIG_DIGEST_OFFSET")
+if [[ "$CONFIG_DIGEST" != "$DEFAULT_CONFIG_DIGEST" ]]; then
+    echo "SURVIVAL SMOKE FAIL: section 7 config digest is $CONFIG_DIGEST (expected $DEFAULT_CONFIG_DIGEST = default config)"
+    exit 1
+fi
+
+SAVE_SIZE=$(wc -c <"$SAVE")
+echo "SURVIVAL SMOKE PASS [profile=$PROFILE]: seed 12345 walked fall/eat/drown/starve/respawn with exit 0 and wrote a sectioned ${SAVE_SIZE}-byte v10 save (mode Survival, vitals 20/20/300, day 0 with 1-day seasons, 0 chests, 0 mobs, 0 crops, 0 chunk edits, 2 kept inventory stacks as 2:apple + 2:stick content names, config schema 1 with the default digest)"
 echo "SURVIVAL SMOKE EVIDENCE: $SURVIVAL_LINE"

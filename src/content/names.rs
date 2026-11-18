@@ -1,126 +1,19 @@
-//! Frozen built-in name vocabulary for content identity.
+//! Game-side content name vocabulary: id mappings over the neutral tables.
 //!
-//! This module is pure data plus lookups: no I/O, GPU, window, audio or
-//! filesystem dependency. It is the single authoritative string vocabulary
-//! that the pack parser (S02) and the v8 save writer (S03) resolve against, so
-//! names are frozen here before any pack data exists.
+//! The frozen name tables, biome lookups and the pure `is_builtin_*` /
+//! namespace predicates live in `opencraft-content::vocabulary` and are
+//! re-exported here, so there is exactly one source of truth. This module adds
+//! only the game-side reverse lookups that map a stable short name onto a
+//! [`BlockId`], [`ItemId`], [`Material`], [`ToolTier`] or [`RecipeId`].
 //!
 //! Every table is index-aligned to the declaration order of its Rust enum
 //! (or, for blocks, the frozen raw id order `0..=23`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
-use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolTier};
+use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolKindTiers, ToolTier};
 use crate::world::block::BlockId;
 
-/// Longest content name accepted anywhere a name is persisted or namespaced.
-///
-/// This is the shared cap for the v8 save content string table and pack ids,
-/// so a name accepted by the pack parser can always be written to a save and
-/// vice versa. Bytes, not chars: the save table stores UTF-8 length.
-pub const MAX_CONTENT_NAME_LEN: usize = 255;
-
-/// Built-in block id names, index-aligned to raw ids `0..=23`.
-pub const BLOCK_ID_NAMES: [&str; 24] = [
-    "air",
-    "grass",
-    "dirt",
-    "stone",
-    "cobblestone",
-    "sand",
-    "oak_log",
-    "oak_leaves",
-    "oak_planks",
-    "brick",
-    "snow",
-    "bedrock",
-    "coal_ore",
-    "iron_ore",
-    "crafting_table",
-    "water",
-    "farmland",
-    "wheat_stage_0",
-    "wheat_stage_1",
-    "wheat_stage_2",
-    "wheat_stage_3",
-    "chest",
-    "loot_chest",
-    "socket_marker",
-];
-
-/// Material names in `Material` declaration order.
-pub const MATERIAL_ID_NAMES: [&str; 11] = [
-    "stick",
-    "apple",
-    "wheat",
-    "wheat_seeds",
-    "bread",
-    "leather",
-    "raw_porkchop",
-    "raw_beef",
-    "rotten_flesh",
-    "bone",
-    "arrow",
-];
-
-/// Tool tier names in `ToolTier` declaration order.
-pub const TIER_ID_NAMES: [&str; 3] = ["wood", "stone", "iron"];
-
-/// Tool names: tier-major, then kind, with the wood-only bow last.
-pub const TOOL_ID_NAMES: [&str; 16] = [
-    "wood_pickaxe",
-    "wood_axe",
-    "wood_shovel",
-    "wood_hoe",
-    "wood_sword",
-    "stone_pickaxe",
-    "stone_axe",
-    "stone_shovel",
-    "stone_hoe",
-    "stone_sword",
-    "iron_pickaxe",
-    "iron_axe",
-    "iron_shovel",
-    "iron_hoe",
-    "iron_sword",
-    "wood_bow",
-];
-
-/// Recipe names in `RecipeId` declaration order.
-pub const RECIPE_ID_NAMES: [&str; 22] = [
-    "planks",
-    "sticks",
-    "crafting_table",
-    "chest",
-    "wood_pickaxe",
-    "wood_axe",
-    "wood_shovel",
-    "stone_pickaxe",
-    "stone_axe",
-    "stone_shovel",
-    "iron_pickaxe",
-    "iron_axe",
-    "iron_shovel",
-    "bread",
-    "wood_hoe",
-    "stone_hoe",
-    "iron_hoe",
-    "wood_sword",
-    "stone_sword",
-    "iron_sword",
-    "shortbow",
-    "arrows",
-];
-
-/// Biome names accepted by declarative worldgen patches.
-pub const BIOME_NAMES: [&str; 4] = ["plains", "forest", "mountains", "ocean"];
-
-/// Namespaces reserved for the engine and built-in content.
-pub const RESERVED_NAMESPACES: [&str; 3] = ["opencraft", "builtin", "minecraft"];
-
-/// Canonical biome name for `name`, or `None` when it is unknown.
-pub fn biome_from_name(name: &str) -> Option<&'static str> {
-    BIOME_NAMES.iter().copied().find(|known| *known == name)
-}
+pub use opencraft_content::vocabulary::*;
 
 /// Reverse lookup for a built-in block short name.
 pub fn builtin_block_id_by_name(name: &str) -> Option<BlockId> {
@@ -138,12 +31,46 @@ pub fn builtin_material_by_name(name: &str) -> Option<Material> {
         .map(|index| MATERIAL_VALUES[index])
 }
 
+/// Frozen table index of `material` in [`MATERIAL_ID_NAMES`].
+///
+/// This is the neutral catalog's `ItemRef::BuiltinMaterial` payload; the
+/// table is complete by construction, so every `Material` has an index.
+pub(crate) fn builtin_material_index(material: Material) -> u8 {
+    let index = MATERIAL_VALUES
+        .iter()
+        .position(|candidate| *candidate == material)
+        .expect("every material has a frozen vocabulary index");
+    index as u8
+}
+
+/// The material at a frozen table index, or `None` when it is out of range.
+pub(crate) fn builtin_material_by_index(index: u8) -> Option<Material> {
+    MATERIAL_VALUES.get(usize::from(index)).copied()
+}
+
 /// Reverse lookup for a built-in tool tier short name.
 pub fn builtin_tier_by_name(name: &str) -> Option<ToolTier> {
     TIER_ID_NAMES
         .iter()
         .position(|candidate| *candidate == name)
         .map(|index| TIER_VALUES[index])
+}
+
+/// Frozen table index of `tier` in [`TIER_ID_NAMES`].
+///
+/// This is the neutral catalog's `ItemRef::BuiltinTool` tier payload; the
+/// table is complete by construction, so every `ToolTier` has an index.
+pub(crate) fn builtin_tier_index(tier: ToolTier) -> u8 {
+    let index = TIER_VALUES
+        .iter()
+        .position(|candidate| *candidate == tier)
+        .expect("every tier has a frozen vocabulary index");
+    index as u8
+}
+
+/// The tier at a frozen table index, or `None` when it is out of range.
+pub(crate) fn builtin_tier_by_index(index: u8) -> Option<ToolTier> {
+    TIER_VALUES.get(usize::from(index)).copied()
 }
 
 /// Reverse lookup for a built-in constructible tool short name.
@@ -339,35 +266,6 @@ pub fn builtin_recipe_index(recipe: RecipeId) -> Option<usize> {
     RECIPE_VALUES
         .iter()
         .position(|candidate| *candidate == recipe)
-}
-
-/// Whether `namespace` is reserved for the engine or built-in content.
-pub fn is_reserved_namespace(namespace: &str) -> bool {
-    RESERVED_NAMESPACES.contains(&namespace)
-}
-
-/// Whether `value` is a well-formed namespaced id: exactly one `:`, both
-/// sides non-empty, and each side composed only of `a-z`, `0-9`, and `_`.
-///
-/// Uppercase letters, spaces, and extra colons are rejected.
-pub fn is_namespaced_id(value: &str) -> bool {
-    let mut parts = value.split(':');
-    let Some(namespace) = parts.next() else {
-        return false;
-    };
-    let Some(path) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    !namespace.is_empty() && !path.is_empty() && is_id_segment(namespace) && is_id_segment(path)
-}
-
-fn is_id_segment(segment: &str) -> bool {
-    segment
-        .bytes()
-        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[cfg(test)]
@@ -670,29 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn reserved_namespaces_and_namespaced_ids() {
-        assert!(is_reserved_namespace("opencraft"));
-        assert!(is_reserved_namespace("builtin"));
-        assert!(is_reserved_namespace("minecraft"));
-        assert!(!is_reserved_namespace("mymod"));
-
-        for valid in ["mymod:ruby", "mymod:ruby_ore"] {
-            assert!(is_namespaced_id(valid), "{valid} should be valid");
-        }
-        for invalid in [
-            "mymod",
-            ":ruby",
-            "mymod:",
-            "my:mod:ruby",
-            "MyMod:ruby",
-            "mymod:Ruby",
-            "my mod:ruby",
-        ] {
-            assert!(!is_namespaced_id(invalid), "{invalid} should be invalid");
-        }
-    }
-
-    #[test]
     fn reverse_lookups_cover_every_table_entry() {
         for (raw, name) in BLOCK_ID_NAMES.iter().enumerate() {
             let id = builtin_block_id_by_name(name)
@@ -762,31 +637,5 @@ mod tests {
         assert_eq!(builtin_recipe_index(RecipeId::Modded(0)), None);
         assert_eq!(builtin_recipe_index(RecipeId::Modded(22)), None);
         assert_eq!(builtin_recipe_id_name(RecipeId::Modded(22)), None);
-    }
-
-    #[test]
-    fn biome_names_are_canonical_and_reject_unknown() {
-        assert_eq!(BIOME_NAMES, ["plains", "forest", "mountains", "ocean"]);
-        for name in BIOME_NAMES {
-            assert_eq!(biome_from_name(name), Some(name));
-        }
-        assert_eq!(biome_from_name("desert"), None);
-        assert_eq!(biome_from_name("Plains"), None);
-    }
-
-    #[test]
-    fn builtin_names_are_unqualified() {
-        let tables: [&[&str]; 5] = [
-            &BLOCK_ID_NAMES,
-            &MATERIAL_ID_NAMES,
-            &TIER_ID_NAMES,
-            &TOOL_ID_NAMES,
-            &RECIPE_ID_NAMES,
-        ];
-        for table in tables {
-            for name in table {
-                assert!(!name.contains(':'), "{name} must be unqualified");
-            }
-        }
     }
 }

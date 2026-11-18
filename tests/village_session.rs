@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use opencraft::content::ContentRegistry;
 use opencraft::player::survival::GameMode;
+use opencraft::world::block::BlockId;
 use opencraft::world::chunk::{ChunkPos, CHUNK_SIZE};
 use opencraft::world::season::{Season, DEFAULT_SEASON_LENGTH_DAYS};
 use opencraft::world::terrain::{find_spawn_column, generate_chunk_seeded_with};
@@ -190,7 +191,7 @@ fn real_session_streams_the_seed_14_village() {
         for cell in plan.cells_for_chunk(pos) {
             assert_eq!(
                 session_block(&session, cell.world),
-                cell.block,
+                BlockId::from_raw(cell.block),
                 "streamed block at {:?} in {pos:?} must match the plan",
                 cell.world
             );
@@ -244,7 +245,8 @@ fn two_independent_sessions_stream_identical_village_cells() {
                 cell.world
             );
             assert_eq!(
-                left, cell.block,
+                left,
+                BlockId::from_raw(cell.block),
                 "both sessions must reproduce the plan at {:?}",
                 cell.world
             );
@@ -282,7 +284,7 @@ fn a_village_catalog_installed_after_construction_is_used_by_the_first_stream() 
         for cell in plan.cells_for_chunk(pos) {
             assert_eq!(
                 session_block(&session, cell.world),
-                cell.block,
+                BlockId::from_raw(cell.block),
                 "the first stream after the install must use the catalog at {:?}",
                 cell.world
             );
@@ -302,7 +304,8 @@ fn a_village_catalog_installed_after_construction_is_used_by_the_first_stream() 
             cell.world[1] - chunk_min_y,
             cell.world[2] - chunk_min_z,
         );
-        legacy.get(local.0 as usize, local.1 as usize, local.2 as usize) != cell.block
+        legacy.get(local.0 as usize, local.1 as usize, local.2 as usize)
+            != BlockId::from_raw(cell.block)
     });
     assert!(
         differs,

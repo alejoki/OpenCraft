@@ -1,0 +1,15 @@
+[package]
+name = "opencraft-worldgen"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[dependencies]
+opencraft-core = { path = "../opencraft-core" }
+opencraft-content = { path = "../opencraft-content" }
+glam = "0.27"
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"

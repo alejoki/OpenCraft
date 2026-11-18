@@ -188,6 +188,53 @@ pub fn load_pack_by_name(packs_root: &Path, name: &str) -> LoadedPack {
     load_pack_from_dir(&dir)
 }
 
+/// A tiny PNG whose IHDR declares `width`x`height` and whose IDAT is empty.
+///
+/// The empty IDAT is load-bearing: the decoder stops at the first IDAT, so the
+/// declared dimensions reach the pack guards instead of failing earlier with
+/// `MissingImageData`. This duplicates the content crate's test-private helper
+/// because a `#[cfg(test)]` item in another crate is not visible here.
+#[cfg(test)]
+pub(crate) fn png_bomb_bytes(width: u32, height: u32) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= byte as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    fn chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + data.len());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_input = Vec::with_capacity(4 + data.len());
+        crc_input.extend_from_slice(kind);
+        crc_input.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        out
+    }
+
+    let mut out = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&width.to_be_bytes());
+    ihdr.extend_from_slice(&height.to_be_bytes());
+    ihdr.push(8); // bit depth
+    ihdr.push(6); // color type: RGBA
+    ihdr.push(0); // compression
+    ihdr.push(0); // filter
+    ihdr.push(0); // interlace
+    out.extend_from_slice(&chunk(b"IHDR", &ihdr));
+    out.extend_from_slice(&chunk(b"IDAT", &[]));
+    out.extend_from_slice(&chunk(b"IEND", &[]));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -674,11 +721,7 @@ whatever = true
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "hostile");
         read_pack_toml(&dir, "name = \"Hostile\"\n");
-        fs::write(
-            dir.join(LAYER_FILES[3]),
-            decode::png_bomb_bytes(30000, 30000),
-        )
-        .unwrap();
+        fs::write(dir.join(LAYER_FILES[3]), png_bomb_bytes(30000, 30000)).unwrap();
 
         let pack = load_pack_from_dir(&dir);
         let procedural = procedural_layers();
