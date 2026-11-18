@@ -220,6 +220,47 @@ fn worldgen_from_catalog(row: NeutralWorldgenRule) -> WorldgenRule {
     }
 }
 
+/// Converts one game worldgen rule into the neutral catalog rule.
+///
+/// Exact inverse of [`worldgen_from_catalog`]: block ids become raw `u16`,
+/// biomes become neutral tags, and every field and vector entry keeps its
+/// authored order. The empty rule stack is not special-cased here; the
+/// terrain adapter borrows it without calling this function.
+pub(crate) fn worldgen_to_catalog(rule: &WorldgenRule) -> NeutralWorldgenRule {
+    match rule {
+        WorldgenRule::Ore {
+            block,
+            replace,
+            min_y,
+            max_y,
+            vein,
+            attempts,
+        } => NeutralWorldgenRule::Ore {
+            block: block.to_raw(),
+            replace: replace.to_raw(),
+            min_y: *min_y,
+            max_y: *max_y,
+            vein: *vein,
+            attempts: *attempts,
+        },
+        WorldgenRule::Patch {
+            block,
+            replace,
+            biomes,
+            min_y,
+            max_y,
+            chance,
+        } => NeutralWorldgenRule::Patch {
+            block: block.to_raw(),
+            replace: replace.to_raw(),
+            biomes: biomes.iter().map(|biome| biome.tag()).collect(),
+            min_y: *min_y,
+            max_y: *max_y,
+            chance: *chance,
+        },
+    }
+}
+
 /// Converts a game block definition into its neutral row.
 fn block_to_catalog(def: &BlockDef) -> NeutralBlockDef {
     NeutralBlockDef {
@@ -652,6 +693,14 @@ mod tests {
             assert!(
                 same_worldgen_rule(neutral, game),
                 "worldgen rule conversion is lossless: {game:?}"
+            );
+            // The inverse direction must also be exact, or the terrain
+            // adapter could reorder or rewrite a rule on its way back into
+            // the crate (pack ores/patches would drift).
+            assert_eq!(
+                worldgen_from_catalog(worldgen_to_catalog(game)),
+                *game,
+                "game -> neutral -> game must round-trip every rule field"
             );
         }
 
