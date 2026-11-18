@@ -3704,8 +3704,8 @@ mod tests {
     /// per season) is byte-identical across repeat runs.
     #[test]
     fn test_acceptance_four_season_generation_is_byte_identical_across_repeats() {
-        // SPRING_START_SEED precedent: seed 1 starts in Spring, so the named
-        // FIRST_*_DAY consts land exactly on the four seasons.
+        // SPRING_START_SEED precedent: seed 1 starts in Spring, so days 0..3
+        // (the game's one-day seasons) land exactly on the four seasons.
         let seed = 1;
         let positions = biome_spanning_chunk_positions(seed);
         let seasons = [
