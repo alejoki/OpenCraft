@@ -251,7 +251,7 @@ SMOKE_PROFILE=release bash scripts/creator_smoke.sh
 The codebase is organized into several modules within the `src/` directory:
 
 *   `main.rs`: The main application entry point, handling the event loop, windowing, and state management.
-*   `world/`: Contains all logic related to the game world, including chunk management, procedural terrain generation, and persistence (saving/loading).
+*   `world/`: Contains all logic related to the game world, including chunk management, the world-generation adapter over `opencraft-worldgen`, and persistence (saving/loading).
 *   `render/`: Owns game-side content identity, texture-pack art, and mob/arrow scene assembly. The `wgpu` renderer, sky/weather and frame passes live in `opencraft-gfx`.
 *   `player/`: Handles player state, physics, camera, and input processing.
 *   `mesh/`: Implements the greedy meshing algorithm for creating optimized chunk geometry.
@@ -266,7 +266,7 @@ The workspace also contains the engine crates and their external reuse proof und
 *   `opencraft-pathfinding`: Steering plus nav-grid A*. Not yet wired into mobs.
 *   `opencraft-storage`: The neutral sectioned save archive, canonical chunk-section codec, and bounded file I/O. Depends on `opencraft-core` only.
 *   `opencraft-content`: The neutral pack format and validation layer — `pack.toml` manifest and v2 content parsing, per-entry diagnostics, asset confinement and caps, PNG decode, 16x16 resample, deterministic allocation, patch precedence, placeholders and the FNV digest over raw u16 ids, and the deterministic `--validate-pack` renderer. The game's `ContentRegistry` is a thin adapter over this crate. Depends on `opencraft-core`, `toml` and `png`.
-*   `opencraft-worldgen`: Neutral world generation — biome/height/ruin/tree/spawn queries, the loot vocabulary, the prefab codec/catalog/serializer behind a two-method `BlockNameResolver`, and the village codec/catalog/fingerprint/plan/chunk-local emission over raw u16 ids. Depends on `opencraft-core`, `opencraft-content`, `toml` and `glam` (dev `tempfile`); no storage, GPU, windowing or game edge.
-*   `engine-reuse-proof`: An external, device-free consumer of the engine crates. It runs headless, prints a deterministic 21-line report (including a village plan from embedded prefab/village TOML), has no `opencraft` dependency, and never creates a GPU adapter.
+*   `opencraft-worldgen`: Neutral world generation — biome/height/ruin/tree/spawn queries, the loot vocabulary, the prefab codec/catalog/serializer behind a two-method `BlockNameResolver`, the village codec/catalog/fingerprint/plan/chunk-local emission, and the complete terrain-generation pass (3D caves, coal/iron and pack ore veins, surface ruins with loot, oak trees, pack surface patches, sky shortcuts, the seasonal surface/leaf policy and village chunk assembly) over a neutral raw-u16 `ChunkBuffer`. The game reaches it through a move-only adapter in `src/world/terrain.rs`. Depends on `opencraft-core`, `opencraft-content`, `toml` and `glam` (dev `tempfile`); no storage, GPU, windowing or game edge.
+*   `engine-reuse-proof`: An external, device-free consumer of the engine crates. It runs headless, prints a deterministic 22-line report (including a device-free four-chunk terrain proof and a village plan from embedded prefab/village TOML), has no `opencraft` dependency, and never creates a GPU adapter.
 
 See [the engine crate guide](docs/CRATES.md) for the workspace layout, neutral-API rules, gate commands and M018 scope.
