@@ -36,6 +36,10 @@ pub use opencraft_worldgen::village::*;
 ///
 /// Only then is the plan materialized for this chunk. Every emitted cell is
 /// asserted to belong to `pos` in debug builds.
+// The game-side `Chunk` writer intentionally shadows the crate's buffer-based
+// emitter until the T03 adapter switch deletes it; the shadow is the point of
+// this transitional duplicate, not an accident.
+#[allow(hidden_glob_reexports)]
 pub(crate) fn place_village_cells(
     chunk: &mut Chunk,
     pos: ChunkPos,
