@@ -12,17 +12,20 @@
 //! [`default_pack_digest`] pins that exact byte stream. Writing those entries
 //! to disk is [`export_default_pack`]'s only job.
 //!
-//! This module intentionally contains no restore policy (see the later
-//! `ensure_default_pack` task): exporting always overwrites, while restoring
-//! must never touch bytes that are already present.
+//! [`ensure_default_pack`] is the opposite policy on purpose: exporting always
+//! overwrites, while restoring only fills absent files and repairs an unusable
+//! manifest, so user edits and corrupt-present bytes survive a relaunch.
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::audio::{default_buffers, encode_pcm16_wav, SoundSlot};
 use crate::content::names::builtin_sprite_name_for;
+use crate::pack::default_master::DEFAULT_PACK_FILES;
+use crate::pack::manifest::{format_gate_error, parse_pack_file, read_manifest_text};
 use crate::pack::{LAYER_FILES, MOB_LAYER_FILES};
 use crate::render::texture::{generate_all_texture_layers_rgba, MOB_LAYER_BASE, TEX_SIZE};
+use crate::settings::SettingsWarning;
 use crate::ui::item_icon::{generate_item_sprite_layers_rgba, item_sprite_table};
 
 /// Folder name of the shipped pack, resolved under `packs/`.
@@ -234,7 +237,7 @@ where
 /// Write every generated file under `dir`, creating parents as needed.
 ///
 /// This is the exporter, so overwriting is correct here; the restore policy
-/// that must never overwrite present bytes lives in a later task. Returns the
+/// in [`ensure_default_pack`] must never overwrite present bytes. Returns the
 /// first I/O error, which the example binary turns into a non-zero exit.
 pub fn export_default_pack(dir: &Path) -> std::io::Result<()> {
     for (relative, bytes) in build_default_pack() {
@@ -245,6 +248,152 @@ pub fn export_default_pack(dir: &Path) -> std::io::Result<()> {
         std::fs::write(&path, &bytes)?;
     }
     Ok(())
+}
+
+/// Warning field used for every restore-policy notice.
+pub const DEFAULT_PACK_RESTORE_FIELD: &str = "packs/default";
+
+/// Result of one [`ensure_default_pack`] call.
+///
+/// `restored_files` counts the files actually written by this call (the
+/// manifest included), `manifest_rewritten` reports whether `pack.toml` was
+/// rebuilt from the embedded master, `ready` is the post-call manifest gate,
+/// and `warnings` carries the single success notice or one entry per failing
+/// path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefaultPackOutcome {
+    /// Files written by this call; absent files only, plus a repaired manifest.
+    pub restored_files: usize,
+    /// Whether `pack.toml` was rewritten from the embedded master.
+    pub manifest_rewritten: bool,
+    /// Whether the folder now declares an accepted v3 `pack.toml`.
+    pub ready: bool,
+    /// Restore notices for the first Settings open; never logged directly.
+    pub warnings: Vec<SettingsWarning>,
+}
+
+impl DefaultPackOutcome {
+    /// Build one warning on the pinned restore field.
+    fn warning(reason: String) -> SettingsWarning {
+        SettingsWarning {
+            field: DEFAULT_PACK_RESTORE_FIELD.to_string(),
+            reason,
+        }
+    }
+}
+
+/// Whether `packs_root/default/pack.toml` is a readable, accepted v3 manifest.
+///
+/// This is deliberately manifest-only: it never decodes a PNG or a WAV, so a
+/// missing or corrupt art file cannot make an otherwise usable pack look
+/// unusable. A syntactically invalid manifest (no TOML root), a non-regular or
+/// oversized file (rejected by [`read_manifest_text`]) and any format other
+/// than v3 all return `false`.
+pub fn default_pack_ready(packs_root: &Path) -> bool {
+    let manifest_path = packs_root.join(DEFAULT_PACK_FOLDER).join("pack.toml");
+    let Ok(text) = read_manifest_text(&manifest_path) else {
+        return false;
+    };
+    let (manifest, root, _warnings) = parse_pack_file(&text);
+    root.is_some() && format_gate_error(manifest.format_version).is_none()
+}
+
+/// Restore the shipped default pack without ever overwriting present bytes.
+///
+/// Policy, in order:
+///
+/// 1. If `packs_root/default` cannot be created, return one warning naming the
+///    folder and its OS error with `ready = false`.
+/// 2. Write every embedded file except `pack.toml` only when its target path
+///    does not already exist. Parent folders (`icons/`) are created as needed.
+///    An edited or corrupt-but-present file keeps its bytes untouched.
+/// 3. When the manifest is missing or unusable (see [`default_pack_ready`]),
+///    rewrite `pack.toml` last from the embedded master. A ready manifest is
+///    never touched, so a user-edited display name survives.
+/// 4. A failing write records one warning naming the path and continues; a
+///    blocked `icons/` therefore still lets the manifest repair run. This
+///    function never panics and never logs.
+/// 5. When any file was written, append exactly one success notice
+///    `restored the shipped Default pack (N files)`, where `N` counts every
+///    file written by this call (the manifest included).
+pub fn ensure_default_pack(packs_root: &Path) -> DefaultPackOutcome {
+    let initial_ready = default_pack_ready(packs_root);
+    let mut outcome = DefaultPackOutcome {
+        restored_files: 0,
+        manifest_rewritten: false,
+        ready: initial_ready,
+        warnings: Vec::new(),
+    };
+
+    let pack_dir = packs_root.join(DEFAULT_PACK_FOLDER);
+    if let Err(err) = std::fs::create_dir_all(&pack_dir) {
+        outcome.ready = false;
+        outcome.warnings.push(DefaultPackOutcome::warning(format!(
+            "failed to create {}: {err}",
+            pack_dir.display()
+        )));
+        return outcome;
+    }
+
+    // Only report each blocked parent folder once: a blocked `icons/` would
+    // otherwise emit 27 identical warnings for the same cause.
+    let mut reported_parents: BTreeSet<PathBuf> = BTreeSet::new();
+    for (relative, bytes) in DEFAULT_PACK_FILES {
+        if *relative == "pack.toml" {
+            continue;
+        }
+        let target = pack_dir.join(relative);
+        // `symlink_metadata` treats a present broken symlink as present, so a
+        // restore never replaces something the user can see in the folder.
+        if target.symlink_metadata().is_ok() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                if reported_parents.insert(parent.to_path_buf()) {
+                    outcome.warnings.push(DefaultPackOutcome::warning(format!(
+                        "failed to create {}: {err}",
+                        parent.display()
+                    )));
+                }
+                continue;
+            }
+        }
+        match std::fs::write(&target, bytes) {
+            Ok(()) => outcome.restored_files += 1,
+            Err(err) => outcome.warnings.push(DefaultPackOutcome::warning(format!(
+                "failed to write {}: {err}",
+                target.display()
+            ))),
+        }
+    }
+
+    if !initial_ready {
+        let manifest_path = pack_dir.join("pack.toml");
+        let manifest_bytes = DEFAULT_PACK_FILES
+            .iter()
+            .find_map(|(path, bytes)| (*path == "pack.toml").then_some(*bytes))
+            .expect("the embedded master always contains pack.toml");
+        match std::fs::write(&manifest_path, manifest_bytes) {
+            Ok(()) => {
+                outcome.restored_files += 1;
+                outcome.manifest_rewritten = true;
+            }
+            Err(err) => outcome.warnings.push(DefaultPackOutcome::warning(format!(
+                "failed to write {}: {err}",
+                manifest_path.display()
+            ))),
+        }
+    }
+
+    outcome.ready = default_pack_ready(packs_root);
+    if outcome.restored_files > 0 {
+        outcome.warnings.push(DefaultPackOutcome::warning(format!(
+            "restored the shipped Default pack ({} files)",
+            outcome.restored_files
+        )));
+    }
+    outcome
 }
 
 /// Assert the shipped manifest parses as a clean v3 manifest with 27 icons.
@@ -302,6 +451,18 @@ mod tests {
         let dir = root.join(DEFAULT_PACK_FOLDER);
         export_default_pack(&dir).expect("export the default pack");
         dir
+    }
+
+    /// The embedded master bytes for one relative path.
+    fn master_bytes(relative: &str) -> &'static [u8] {
+        DEFAULT_PACK_FILES
+            .iter()
+            .find_map(|(path, bytes)| (*path == relative).then_some(*bytes))
+            .unwrap_or_else(|| panic!("master is missing {relative}"))
+    }
+
+    fn restore_success_reason(count: usize) -> String {
+        format!("restored the shipped Default pack ({count} files)")
     }
 
     #[test]
@@ -484,6 +645,253 @@ mod tests {
             default_pack_digest(),
             PINNED,
             "default-pack bytes drifted from the pinned digest"
+        );
+    }
+
+    #[test]
+    fn restore_creates_all_75_files_in_a_missing_root() {
+        let root = temp_root();
+        let outcome = ensure_default_pack(root.path());
+
+        assert_eq!(
+            outcome.restored_files, DEFAULT_PACK_FILE_COUNT,
+            "a fresh root restores every shipped file"
+        );
+        assert!(outcome.manifest_rewritten);
+        assert!(outcome.ready);
+        assert_eq!(
+            outcome.warnings.len(),
+            1,
+            "warnings: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(outcome.warnings[0].field, DEFAULT_PACK_RESTORE_FIELD);
+        assert_eq!(
+            outcome.warnings[0].reason,
+            restore_success_reason(DEFAULT_PACK_FILE_COUNT)
+        );
+
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+        for (relative, bytes) in DEFAULT_PACK_FILES {
+            let written = std::fs::read(dir.join(relative))
+                .unwrap_or_else(|err| panic!("missing restored {relative}: {err}"));
+            assert_eq!(&written, bytes, "restored {relative} must equal the master");
+        }
+    }
+
+    #[test]
+    fn restore_is_a_silent_noop_when_the_folder_is_complete() {
+        let root = temp_root();
+        let first = ensure_default_pack(root.path());
+        assert!(first.ready, "warnings: {:?}", first.warnings);
+
+        let second = ensure_default_pack(root.path());
+        assert_eq!(second.restored_files, 0);
+        assert!(!second.manifest_rewritten);
+        assert!(second.ready);
+        assert!(
+            second.warnings.is_empty(),
+            "a complete folder must stay silent, got {:?}",
+            second.warnings
+        );
+    }
+
+    #[test]
+    fn restore_fills_absent_files_and_keeps_edited_bytes() {
+        let root = temp_root();
+        let _ = ensure_default_pack(root.path());
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+
+        let edited = b"user-edited stone bytes, not a PNG";
+        std::fs::write(dir.join("stone.png"), edited).expect("edit stone.png");
+        std::fs::remove_file(dir.join("grass_top.png")).expect("delete grass_top.png");
+
+        let outcome = ensure_default_pack(root.path());
+        assert_eq!(outcome.restored_files, 1, "only the absent file is written");
+        assert!(!outcome.manifest_rewritten);
+        assert!(outcome.ready);
+        assert_eq!(
+            outcome.warnings[0].reason,
+            restore_success_reason(1),
+            "warnings: {:?}",
+            outcome.warnings
+        );
+
+        assert_eq!(
+            std::fs::read(dir.join("stone.png")).unwrap(),
+            edited,
+            "edited bytes must survive the restore"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("grass_top.png")).unwrap(),
+            master_bytes("grass_top.png"),
+            "a deleted file is restored from the master"
+        );
+    }
+
+    #[test]
+    fn restore_rewrites_a_missing_or_non_v3_manifest_and_keeps_art_edits() {
+        let root = temp_root();
+        let _ = ensure_default_pack(root.path());
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+        let manifest_path = dir.join("pack.toml");
+
+        let edited = b"user-edited stone bytes, not a PNG";
+        std::fs::write(dir.join("stone.png"), edited).expect("edit stone.png");
+
+        std::fs::remove_file(&manifest_path).expect("delete pack.toml");
+        let missing = ensure_default_pack(root.path());
+        assert_eq!(missing.restored_files, 1);
+        assert!(missing.manifest_rewritten);
+        assert!(missing.ready);
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            master_bytes("pack.toml")
+        );
+        assert_eq!(std::fs::read(dir.join("stone.png")).unwrap(), edited);
+
+        let v2 = default_pack_manifest().replace("format_version = 3", "format_version = 2");
+        std::fs::write(&manifest_path, v2).expect("write a v2 manifest");
+        assert!(!default_pack_ready(root.path()));
+
+        let non_v3 = ensure_default_pack(root.path());
+        assert_eq!(non_v3.restored_files, 1, "only the manifest is rewritten");
+        assert!(non_v3.manifest_rewritten);
+        assert!(non_v3.ready, "warnings: {:?}", non_v3.warnings);
+        assert_eq!(
+            std::fs::read(&manifest_path).unwrap(),
+            master_bytes("pack.toml")
+        );
+        assert_eq!(
+            std::fs::read(dir.join("stone.png")).unwrap(),
+            edited,
+            "manifest repair must not touch art bytes"
+        );
+    }
+
+    #[test]
+    fn restore_leaves_corrupt_present_art_alone() {
+        let root = temp_root();
+        let _ = ensure_default_pack(root.path());
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+
+        let corrupt = b"this is present but not a PNG";
+        std::fs::write(dir.join("stone.png"), corrupt).expect("write corrupt stone.png");
+        assert!(
+            default_pack_ready(root.path()),
+            "readiness is manifest-only and must ignore corrupt art"
+        );
+
+        let outcome = ensure_default_pack(root.path());
+        assert_eq!(outcome.restored_files, 0);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(std::fs::read(dir.join("stone.png")).unwrap(), corrupt);
+
+        let spec = crate::pack::spec::load_spec_from_dir(&dir);
+        assert!(
+            spec.warnings
+                .iter()
+                .any(|warning| warning.field == "stone.png"),
+            "the loader still reports the corrupt file: {:?}",
+            spec.warnings
+        );
+    }
+
+    #[test]
+    fn restore_reports_a_write_failure_without_panicking() {
+        // (a) The packs root itself is a regular file: folder creation fails
+        // with exactly one warning naming the path, and nothing panics.
+        let root = temp_root();
+        let blocked_root = root.path().join("packs");
+        std::fs::write(&blocked_root, b"not a directory").expect("block the packs root");
+
+        let outcome = ensure_default_pack(&blocked_root);
+        assert_eq!(outcome.restored_files, 0);
+        assert!(!outcome.manifest_rewritten);
+        assert!(!outcome.ready);
+        assert_eq!(
+            outcome.warnings.len(),
+            1,
+            "warnings: {:?}",
+            outcome.warnings
+        );
+        assert_eq!(outcome.warnings[0].field, DEFAULT_PACK_RESTORE_FIELD);
+        assert!(
+            outcome.warnings[0].reason.contains("packs"),
+            "warning must name the path: {}",
+            outcome.warnings[0].reason
+        );
+
+        // (b) `icons/` is blocked by a regular file: one warning names that
+        // folder, the absent non-icon files and the manifest still restore.
+        let root = temp_root();
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+        std::fs::create_dir_all(&dir).expect("create the pack folder");
+        std::fs::write(dir.join("icons"), b"blocked").expect("block icons/");
+
+        let outcome = ensure_default_pack(root.path());
+        assert!(outcome.manifest_rewritten, "the manifest must still repair");
+        assert!(outcome.ready);
+        assert_eq!(
+            std::fs::read(dir.join("pack.toml")).unwrap(),
+            master_bytes("pack.toml")
+        );
+        assert!(
+            dir.join("arrow.png").exists(),
+            "non-icon files are restored"
+        );
+        assert_eq!(
+            outcome.restored_files, 48,
+            "74 non-manifest files minus 27 icons plus the manifest"
+        );
+
+        let icon_failures: Vec<&SettingsWarning> = outcome
+            .warnings
+            .iter()
+            .filter(|warning| warning.reason.contains("icons"))
+            .collect();
+        assert_eq!(
+            icon_failures.len(),
+            1,
+            "a blocked icons/ reports one warning: {:?}",
+            outcome.warnings
+        );
+        assert!(icon_failures[0].reason.contains("failed to create"));
+        assert!(outcome
+            .warnings
+            .iter()
+            .any(|warning| warning.reason == restore_success_reason(48)));
+    }
+
+    #[test]
+    fn restore_default_pack_ready_rejects_v1_v2_and_future_manifests() {
+        let root = temp_root();
+        let dir = root.path().join(DEFAULT_PACK_FOLDER);
+        std::fs::create_dir_all(&dir).expect("create the pack folder");
+        let manifest_path = dir.join("pack.toml");
+
+        assert!(
+            !default_pack_ready(root.path()),
+            "absent manifest is not ready"
+        );
+
+        for text in [
+            "format_version = 1\nname = \"Old\"\n",
+            "format_version = 2\nname = \"Old\"\n",
+            "format_version = 4\nname = \"Future\"\n",
+            "[unterminated",
+        ] {
+            std::fs::write(&manifest_path, text).expect("write candidate manifest");
+            assert!(
+                !default_pack_ready(root.path()),
+                "candidate manifest must be rejected: {text:?}"
+            );
+        }
+
+        std::fs::write(&manifest_path, default_pack_manifest()).expect("write master manifest");
+        assert!(
+            default_pack_ready(root.path()),
+            "the master v3 manifest is ready"
         );
     }
 
