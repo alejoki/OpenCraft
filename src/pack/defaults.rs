@@ -203,12 +203,30 @@ fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
 /// The separator and the explicit little-endian length make the framing
 /// unambiguous, so the pinned constant is reproducible on every platform.
 pub fn default_pack_digest() -> u64 {
+    let entries = build_default_pack();
+    pack_digest(
+        entries
+            .iter()
+            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
+    )
+}
+
+/// Fold arbitrary `(path, bytes)` entries into the pinned digest framing.
+///
+/// Shared with the embedded-master drift tests so the folder-derived bytes,
+/// the compile-time master and the in-memory generator all fold the exact same
+/// way. As with [`default_pack_digest`], entries must be supplied in sorted
+/// path order.
+pub(crate) fn pack_digest<'a, I>(entries: I) -> u64
+where
+    I: IntoIterator<Item = (&'a str, &'a [u8])>,
+{
     let mut hash = FNV_OFFSET_BASIS;
-    for (path, bytes) in build_default_pack() {
+    for (path, bytes) in entries {
         fnv1a_update(&mut hash, path.as_bytes());
         fnv1a_update(&mut hash, &[0x00]);
         fnv1a_update(&mut hash, &(bytes.len() as u32).to_le_bytes());
-        fnv1a_update(&mut hash, &bytes);
+        fnv1a_update(&mut hash, bytes);
     }
     hash
 }

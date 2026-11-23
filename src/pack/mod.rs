@@ -20,6 +20,7 @@ use crate::settings::SettingsWarning;
 
 pub mod asset;
 pub mod decode;
+pub mod default_master;
 pub mod defaults;
 pub mod faces;
 pub mod manifest;
