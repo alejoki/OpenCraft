@@ -283,6 +283,16 @@ const ITEM_SPRITE_TABLE: [(ItemId, u32); 27] = [
     ),
 ];
 
+/// The append-only item sprite table, borrowed for deterministic exporters.
+///
+/// The returned slice is index-pinned: exactly 27 entries at layers `0..=26`
+/// in declaration order. Keep [`ITEM_SPRITE_TABLE`] private and append-only;
+/// callers read the table but must never reorder or renumber it.
+#[allow(dead_code)] // Consumed by the S02 default-pack exporter.
+pub fn item_sprite_table() -> &'static [(ItemId, u32)] {
+    &ITEM_SPRITE_TABLE
+}
+
 /// Procedural sprite layer for a material or constructible tool identity.
 ///
 /// Blocks use the block texture array instead and return `None`. An
@@ -2696,6 +2706,34 @@ mod tests {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         hash
+    }
+
+    #[test]
+    fn item_sprite_table_is_index_pinned_and_round_trips_through_lookup() {
+        let table = item_sprite_table();
+        assert_eq!(table.len(), 27, "the append-only table has 27 entries");
+        let mut unique = std::collections::HashSet::new();
+        for (index, (id, layer)) in table.iter().enumerate() {
+            assert_eq!(
+                usize::try_from(*layer).unwrap(),
+                index,
+                "entry {index} must own layer {index}; the table is index-pinned"
+            );
+            assert!(
+                unique.insert(*id),
+                "duplicate item identity at entry {index}"
+            );
+            assert_eq!(
+                item_sprite_layer(*id),
+                Some(*layer),
+                "entry {index} must resolve through the public lookup"
+            );
+        }
+        assert_eq!(
+            table.iter().map(|(_, layer)| *layer).max(),
+            Some(26),
+            "the pinned layers are exactly 0..=26"
+        );
     }
 
     #[test]

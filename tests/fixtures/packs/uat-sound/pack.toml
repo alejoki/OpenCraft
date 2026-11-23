@@ -1,3 +1,4 @@
+format_version = 3
 name = "UAT Sound Test"
 description = "Agent-authored pack for M005/M009 human UAT: five valid sounds (including mob_hurt and arrow_impact) plus one corrupt file to prove per-slot fallback"
 

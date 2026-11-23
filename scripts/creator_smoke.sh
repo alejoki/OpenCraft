@@ -39,7 +39,7 @@
 #     `0xeaeac8ddce568dec`). The release profile skips this leg: release has
 #     no creator watcher.
 #
-#   Leg C live textures (debug only): a v2 texture-only pack overrides
+#   Leg C live textures (debug only): a v3 texture-only pack overrides
 #     block stone (layer 3), mob pig_body (layer 32), and the built-in apple
 #     sprite (layer 1); rewriting all three applies each frozen layer, and a
 #     corrupt stone.png is rejected once while the pack files stay
@@ -230,7 +230,7 @@ install_texture_pack() {
     install_config "$dest"
     mkdir -p "$dest/packs/textures" || fail "cannot create $dest/packs/textures"
     cat >"$dest/packs/textures/pack.toml" <<'EOF'
-format_version = 2
+format_version = 3
 name = "Texture Watch"
 
 [builtin_icons]

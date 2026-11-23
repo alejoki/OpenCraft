@@ -11,9 +11,10 @@
 # Scenarios (all inside mktemp working directories — the crate root's saves/,
 # settings.toml, and packs/ are never touched):
 #   0. Doc reader-test gate, no launch: docs/TEXTURE-PACKS.md exists, its
-#      `## Quickstart` ```toml block extracts non-empty with `name =` and
-#      `overlay_tint`, and all 25 block layer names, all 13 mob layer names,
-#      and all 9 sound stems appear in the guide.
+#      `## Quickstart` ```toml block extracts non-empty with a
+#      `format_version = 3` line, `name =`, and `overlay_tint`, and all 25
+#      block layer names, all 13 mob layer names, and all 9 sound stems appear
+#      in the guide.
 #   1. Selected pack + persistence: a `[packs]`-only settings.toml selects
 #      "demo", whose pack.toml is the extracted Quickstart block verbatim.
 #      The pack also ships valid crafting_table_top.png / crafting_table_side.png
@@ -153,6 +154,7 @@ awk '
 ' "$DOC" > "$QUICKSTART_TOML"
 
 [[ -s "$QUICKSTART_TOML" ]] || fail "scenario 0: found no toml fenced block under the '## Quickstart' heading in $DOC"
+grep -q 'format_version = 3' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart TOML block must declare 'format_version = 3' (v3 is the only accepted format)"
 grep -q 'name =' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart TOML block has no 'name =' line"
 grep -q 'overlay_tint' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart TOML block has no 'overlay_tint' line"
 
@@ -223,7 +225,7 @@ for sound in "${SOUNDS[@]}"; do
     grep -Fq "$sound" "$DOC" || fail "scenario 0: guide does not document sound stem '$sound'"
 done
 
-echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with name/overlay_tint and all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
+echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with format_version = 3, name/overlay_tint and all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: selected pack + persistence across relaunch.

@@ -4,7 +4,7 @@
 # Proves the M010/S04 presentation surface end to end through the production
 # binary, with no test harness and no screenshot automation:
 #
-#   Digest leg: `"$BIN" --demo-presentation --save fixture.mcvx` (with a v2
+#   Digest leg: `"$BIN" --demo-presentation --save fixture.mcvx` (with a v3
 #   pack whose stack is selected in settings.toml)
 #     (a) exit code 0 — the digest's own `ok` latch. A timeout kill or panic is
 #         an explicit FAILURE.
@@ -150,7 +150,7 @@ LAUNCH_A_OUT="$TEMP_DIR/launch-a.log"
 LAUNCH_B_OUT="$TEMP_DIR/launch-b.log"
 
 cat >"$PACK_DIR/pack.toml" <<'EOF'
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 

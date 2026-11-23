@@ -8771,14 +8771,14 @@ mod tests {
         );
     }
 
-    /// A real v2 pack on disk (two blocks, one item, one distinct 16x16 PNG
+    /// A real v3 pack on disk (two blocks, one item, one distinct 16x16 PNG
     /// per entry) loaded through the production spec+registry path.
     fn presentation_demo_registry(root: &Path) -> Arc<ContentRegistry> {
         let dir = root.join("mymod-ruby");
         std::fs::create_dir_all(&dir).expect("create fixture pack");
         std::fs::write(
             dir.join("pack.toml"),
-            r#"format_version = 2
+            r#"format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -13433,7 +13433,7 @@ stack = 64
         std::fs::create_dir_all(dir).expect("create pack dir");
         std::fs::write(
             dir.join("pack.toml"),
-            format!("name = \"{manifest_name}\"\n"),
+            format!("format_version = 3\nname = \"{manifest_name}\"\n"),
         )
         .expect("write pack.toml");
     }
@@ -13637,7 +13637,7 @@ stack = 64
         std::fs::create_dir_all(&alpha).expect("create alpha");
         std::fs::write(
             alpha.join("pack.toml"),
-            "name = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
+            "format_version = 3\nname = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
         )
         .expect("write alpha manifest");
         write_solid_png(&alpha.join("grass_top.png"), [200, 10, 20, 255]);
@@ -13648,7 +13648,7 @@ stack = 64
         std::fs::create_dir_all(&beta).expect("create beta");
         std::fs::write(
             beta.join("pack.toml"),
-            "description = \"a nameless partial pack\"\n",
+            "format_version = 3\ndescription = \"a nameless partial pack\"\n",
         )
         .expect("write beta manifest");
         write_solid_png(&beta.join("dirt.png"), [30, 220, 40, 255]);
@@ -13697,16 +13697,16 @@ stack = 64
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        let v2 = packs_root.join("mod");
-        std::fs::create_dir_all(&v2).expect("create v2 pack");
+        let v3 = packs_root.join("mod");
+        std::fs::create_dir_all(&v3).expect("create v3 pack");
         std::fs::write(
-            v2.join("pack.toml"),
-            "format_version = 2\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            v3.join("pack.toml"),
+            "format_version = 3\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
-        write_solid_png(&v2.join("ruby.png"), [200, 10, 20, 255]);
+        .expect("write v3 manifest");
+        write_solid_png(&v3.join("ruby.png"), [200, 10, 20, 255]);
 
-        let spec = pack::spec::load_spec_from_dir(&v2);
+        let spec = pack::spec::load_spec_from_dir(&v3);
         let (registry, report) = build_session_registry(&[spec]);
         assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
         assert_ne!(
@@ -13937,7 +13937,7 @@ stack = 64
         write_pack_fixture(&broken, "Broken Pack");
         std::fs::write(
             broken.join("pack.toml"),
-            "name = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
+            "format_version = 3\nname = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
         )
         .expect("write pack.toml");
         std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
@@ -13968,7 +13968,7 @@ stack = 64
         write_pack_fixture(&branded, "Branded Pack");
         std::fs::write(
             branded.join("pack.toml"),
-            "name = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
+            "format_version = 3\nname = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
         )
         .expect("write pack.toml");
         write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
@@ -14250,26 +14250,27 @@ stack = 64
             "leg=generate: the overlay alone loads without warnings: {overlay_only_warnings:?}"
         );
 
-        // (2) The checked-in overlay is a texture-only v1 pack: no
-        // format_version, no content, exactly LAYER_FILES[3], no menu art.
+        // (2) The checked-in overlay is a texture-only v3 pack: it declares
+        // format_version = 3, authors no content, exactly LAYER_FILES[3], and
+        // no menu art.
         let overlay = overlay_only_specs
             .first()
             .expect("leg=generate: the overlay pack loaded");
         assert_eq!(
             overlay.format_version,
-            PackFormat::V1,
-            "leg=generate: the overlay is a v1 pack"
+            PackFormat::V3,
+            "leg=generate: the overlay is a v3 pack"
         );
         assert_eq!(
             overlay.manifest.format_version,
-            PackFormat::V1,
-            "leg=generate: the overlay manifest defaults to v1"
+            PackFormat::V3,
+            "leg=generate: the overlay manifest declares v3"
         );
         let overlay_manifest = std::fs::read_to_string(root.join("ruby-overlay").join("pack.toml"))
             .expect("leg=generate: the overlay manifest is readable");
         assert!(
-            !overlay_manifest.contains("format_version"),
-            "leg=generate: the checked-in overlay authors no format_version"
+            overlay_manifest.contains("format_version = 3"),
+            "leg=generate: the checked-in overlay declares format_version = 3"
         );
         assert_eq!(
             overlay.content,
@@ -29811,14 +29812,14 @@ selected_name_secs = 0.5
         let pack = write_pack_manifest(&app, "mod");
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            "format_version = 3\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
+        .expect("write v3 manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
         write_solid_png(&pack.join("unused.png"), [1, 1, 1, 255]);
         apply_pack_stack_of(&mut app, &["mod"]);
 
-        let watch = app.pack_watch.as_ref().expect("v2 stack has a watch list");
+        let watch = app.pack_watch.as_ref().expect("v3 stack has a watch list");
         assert!(watch
             .entries()
             .iter()
@@ -29856,25 +29857,25 @@ selected_name_secs = 0.5
     // M014/S07-T03: live built-in icon sprite overrides
     // -----------------------------------------------------------------------
 
-    /// Write a v2 manifest whose only content is a `[builtin_icons]` table.
+    /// Write a v3 manifest whose only content is a `[builtin_icons]` table.
     /// The paths are authored even when the PNGs do not exist yet.
-    fn write_v2_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
-        let mut text = String::from("format_version = 2\nname = \"icons\"\n\n[builtin_icons]\n");
+    fn write_v3_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
+        let mut text = String::from("format_version = 3\nname = \"icons\"\n\n[builtin_icons]\n");
         for (name, path) in overrides {
             text.push_str(&format!("{name} = \"{path}\"\n"));
         }
-        std::fs::write(pack.join("pack.toml"), text).expect("write v2 builtin manifest");
+        std::fs::write(pack.join("pack.toml"), text).expect("write v3 builtin manifest");
     }
 
-    /// Write a v2 manifest with no content arrays and no `[builtin_icons]`
-    /// table. Its pack identity matches [`write_v2_builtin_manifest`], so
+    /// Write a v3 manifest with no content arrays and no `[builtin_icons]`
+    /// table. Its pack identity matches [`write_v3_builtin_manifest`], so
     /// switching between the two never changes the content fingerprint.
-    fn write_v2_empty_manifest(pack: &Path) {
+    fn write_v3_empty_manifest(pack: &Path) {
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"icons\"\n",
+            "format_version = 3\nname = \"icons\"\n",
         )
-        .expect("write v2 empty manifest");
+        .expect("write v3 empty manifest");
     }
 
     #[test]
@@ -29882,7 +29883,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(
+        write_v3_builtin_manifest(
             &pack,
             &[
                 ("apple", "apple.png"),
@@ -29958,7 +29959,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["icons"]);
         let last_good = app
@@ -29994,7 +29995,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "bad");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         std::fs::write(pack.join("apple.png"), b"not a png").expect("corrupt at launch");
         apply_pack_stack_of(&mut app, &["bad"]);
 
@@ -30031,7 +30032,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "late");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         apply_pack_stack_of(&mut app, &["late"]);
 
         let presentation = app.pack_presentation.as_ref().expect("presentation");
@@ -30069,10 +30070,10 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let alpha = write_pack_manifest(&app, "alpha");
-        write_v2_builtin_manifest(&alpha, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&alpha, &[("apple", "apple.png")]);
         write_solid_png(&alpha.join("apple.png"), [1, 2, 3, 255]);
         let beta = write_pack_manifest(&app, "beta");
-        write_v2_builtin_manifest(&beta, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&beta, &[("apple", "apple.png")]);
         write_solid_png(&beta.join("apple.png"), [4, 5, 6, 255]);
         apply_pack_stack_of(&mut app, &["alpha", "beta"]);
 
@@ -30124,7 +30125,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["icons"]);
 
@@ -30170,7 +30171,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["icons"]);
         assert_eq!(app.creator.restart_required, None);
 
@@ -30194,7 +30195,7 @@ selected_name_secs = 0.5
         // Adding the override table and its PNG is one manifest edit that
         // must apply live: the table is presentation-only.
         let t0 = Instant::now();
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [11, 22, 33, 255]);
         settle_pack(&mut app, t0);
 
@@ -30251,7 +30252,7 @@ selected_name_secs = 0.5
         // from the watch list.
         app.pack_item_sprite_dirty = false;
         let t1 = t0 + Duration::from_secs(1);
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         settle_pack(&mut app, t1);
 
         assert_eq!(app.creator.restart_required, None);
@@ -30286,7 +30287,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["icons"]);
         app.pack_item_sprite_dirty = false;
         let procedural = compose_item_sprite_layers(&[]);
@@ -30294,7 +30295,7 @@ selected_name_secs = 0.5
         // The manifest authors a path before the file exists: it must be
         // watched so the later write applies live.
         let t0 = Instant::now();
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         settle_pack(&mut app, t0);
 
         assert_eq!(app.creator.restart_required, None);
@@ -30405,7 +30406,7 @@ selected_name_secs = 0.5
         let t0 = Instant::now();
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
+            "format_version = 3\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
         )
         .expect("write combined manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
@@ -30771,41 +30772,41 @@ selected_name_secs = 0.5
     // M014/S03-T05: manifest content guard and restart-required
     // -----------------------------------------------------------------------
 
-    /// Rewrite `pack.toml` as a v2 manifest whose one block references a new
+    /// Rewrite `pack.toml` as a v3 manifest whose one block references a new
     /// PNG. This changes both the content digest and the pack-layer count, so
     /// every frozen-fingerprint comparison must report a restart.
-    fn write_v2_block_manifest(pack: &Path) {
+    fn write_v3_block_manifest(pack: &Path) {
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            "format_version = 3\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
+        .expect("write v3 manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
     }
 
-    /// Write a v2 manifest with one craftable item and one 1x1 recipe.
+    /// Write a v3 manifest with one craftable item and one 1x1 recipe.
     /// Changing `count` is a recipe-only edit: identity and allocation stay
     /// identical, only the recipe definition moves.
-    fn write_v2_recipe_manifest(pack: &Path, count: u16) {
+    fn write_v3_recipe_manifest(pack: &Path, count: u16) {
         std::fs::write(
             pack.join("pack.toml"),
             format!(
-                "format_version = 2\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
+                "format_version = 3\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
             ),
         )
-        .expect("write v2 recipe manifest");
+        .expect("write v3 recipe manifest");
         write_solid_png(&pack.join("gem.png"), [40, 50, 60, 255]);
     }
 
-    /// Write a v2 manifest whose only content is one built-in recipe patch.
-    fn write_v2_recipe_patch_manifest(pack: &Path, enabled: bool) {
+    /// Write a v3 manifest whose only content is one built-in recipe patch.
+    fn write_v3_recipe_patch_manifest(pack: &Path, enabled: bool) {
         std::fs::write(
             pack.join("pack.toml"),
             format!(
-                "format_version = 2\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
+                "format_version = 3\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
             ),
         )
-        .expect("write v2 recipe patch manifest");
+        .expect("write v3 recipe patch manifest");
     }
 
     /// Build a 1x1 stone grid through the production crafting seam so the
@@ -30835,7 +30836,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
         install_pack_session(&mut app, &dir.path().join("recipe-save.mcvx"));
 
@@ -30866,7 +30867,7 @@ selected_name_secs = 0.5
         app.pack_layer_uploads.clear();
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
 
         let reason = "demo: recipe changed; restart to apply";
@@ -30934,11 +30935,11 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_patch_manifest(&pack, false);
+        write_v3_recipe_patch_manifest(&pack, false);
         settle_pack(&mut app, t0);
 
         assert_eq!(
@@ -30960,13 +30961,13 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
+            "format_version = 3\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
         )
         .expect("write mixed manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
@@ -30991,16 +30992,16 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
 
         let t1 = t0 + Duration::from_secs(1);
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         settle_pack(&mut app, t1);
 
         assert_eq!(app.creator.restart_required, None);
@@ -31019,12 +31020,12 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
         let reason = app
             .creator
@@ -31072,7 +31073,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let save_path = dir.path().join("pack-app.mcvx");
@@ -31097,7 +31098,7 @@ selected_name_secs = 0.5
         let base_digest = app.base_registry.digest();
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
 
         let reason = "demo: recipe changed; restart to apply";
@@ -31255,7 +31256,7 @@ selected_name_secs = 0.5
         let base_digest = app.base_registry.digest();
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
 
         let reason = app
@@ -31332,7 +31333,7 @@ selected_name_secs = 0.5
             .clone();
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
         assert_eq!(
@@ -31388,7 +31389,7 @@ selected_name_secs = 0.5
             .clone();
 
         let t0 = Instant::now();
-        std::fs::write(pack.join("pack.toml"), "format_version = 2\n[[blocks]\n")
+        std::fs::write(pack.join("pack.toml"), "format_version = 3\n[[blocks]\n")
             .expect("write corrupt manifest");
         settle_pack(&mut app, t0);
 
@@ -31432,7 +31433,7 @@ selected_name_secs = 0.5
         app.pack_item_sprite_dirty = false;
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
         assert!(

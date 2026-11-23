@@ -165,7 +165,7 @@ fn missing_recipe_fails_closed_without_writing_a_save() {
     std::fs::create_dir_all(&pack).expect("create minimal pack");
     std::fs::write(
         pack.join("pack.toml"),
-        "format_version = 2\nname = \"Minimal\"\n",
+        "format_version = 3\nname = \"Minimal\"\n",
     )
     .expect("write minimal pack");
     std::fs::write(

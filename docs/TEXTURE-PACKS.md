@@ -10,6 +10,7 @@ A texture pack replaces the game's block textures and can also supply a custom t
 4. Launch the game, open **Settings**, and cycle the **Texture Pack** row until it shows your pack.
 
 ```toml
+format_version = 3
 name = "My First Pack"
 description = "A minimal pack that tints the menu"
 
@@ -17,7 +18,7 @@ description = "A minimal pack that tints the menu"
 overlay_tint = [24, 32, 48, 96]
 ```
 
-That pack is valid on its own: with no image files it simply keeps every built-in block texture and adds the darker menu tint. Add texture files from the sections below to change what you see.
+That pack is valid on its own: with no image files it simply keeps every built-in block texture and adds the darker menu tint. `format_version = 3` is required on every pack; see [Format v3](#format-v3). Add texture files from the sections below to change what you see.
 
 ## Where packs live
 
@@ -31,7 +32,7 @@ Packs are folders under `packs/`, relative to the game's working directory — t
 
 Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
 
-The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v2 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; the game never creates `packs/`.
+The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v3 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; the game never creates `packs/`.
 
 ## pack.toml reference
 
@@ -49,12 +50,12 @@ Rules that apply to every field:
 - Unknown keys, unknown tables, and unknown files are ignored silently, so future versions can add features without breaking older ones.
 - A missing or unreadable `pack.toml` uses built-in default values and shows a warning that names the pack.
 
-## Format v2
+## Format v3
 
-Set `format_version = 2` to add blocks, items, custom tool tiers and tools, shaped recipes, per-field patches over built-in content, and declarative worldgen from the same `pack.toml`. Version 1 packs keep working unchanged: without `format_version = 2`, a content array is ignored with one warning while the pack's textures and sounds still load. A `format_version` newer than 2 is ignored the same way, with one warning.
+Set `format_version = 3` to add blocks, items, custom tool tiers and tools, shaped recipes, per-field patches over built-in content, and declarative worldgen from the same `pack.toml`. Version 3 is the only accepted format. A manifest that declares `format_version = 1` or `2`, omits the field, or names a version newer than this build is rejected as a whole by one named pack-level error, and nothing in that pack is applied: there is no version-1 fallback and no warning-only downgrade. A v1 or v2 pack reports `error: pack <folder>: format_version <n> is not supported; every pack must declare format_version = 3`, while a future version reports `format_version <n> is newer than this build; every pack must declare format_version = 3`.
 
 ```toml
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -116,7 +117,7 @@ vein = 4
 attempts = 8
 ```
 
-A block needs `id`, a `textures` table that resolves one image for every face, and a finite `hardness` from 0 to 3600. `textures.all` is the fallback for every face; `textures.side` overrides the four side faces, and `textures.top` and `textures.bottom` override those faces individually. `name` is optional and a readable display name is derived from the id when it is absent. `drop` names the item produced on break and defaults to the block itself; `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) marks the block as efficiently broken by that tool kind; `stack` sets the block item's maximum stack from 1 to 999 (default 999).
+A block needs `id`, a `textures` table that resolves one image for every face, and a finite `hardness` from 0 to 3600. `textures.all` is the fallback for every face; `textures.side` overrides the four side faces, `textures.top` and `textures.bottom` override those faces individually, and `textures.north`, `textures.south`, `textures.east` and `textures.west` override one side direction each. `name` is optional and a readable display name is derived from the id when it is absent. `drop` names the item produced on break and defaults to the block itself; `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) marks the block as efficiently broken by that tool kind; `stack` sets the block item's maximum stack from 1 to 999 (default 999).
 
 An item needs `id` and `icon`. `stack` defaults to 64; `nutrition` from 1 to 20 turns the item into food, and an optional `eat_seconds` (0.1 to 10, default 1.2) sets how long the hold-to-eat gesture takes. A tier needs `id`, `speed`, `durability` and `damage`; the tool's durability comes from the tier. A tool needs `kind` (`pickaxe`, `axe`, `shovel`, `hoe` or `sword`), `tier` and `icon`; `bow` is not authorable in this format. `name` is optional on items, tiers and tools.
 
@@ -138,7 +139,7 @@ Pack content ids allocate deterministically: blocks take dense ids from 23 in so
 
 ### Built-in item sprite overrides
 
-A `format_version = 2` manifest can replace the built-in material and tool icons with its own art through one `[builtin_icons]` table. The table maps an unqualified built-in short name to a pack-relative PNG:
+A `format_version = 3` manifest can replace the built-in material and tool icons with its own art through one `[builtin_icons]` table. The table maps an unqualified built-in short name to a pack-relative PNG:
 
 ```toml
 [builtin_icons]
@@ -153,7 +154,7 @@ Overrides merge per name: a later pack's loaded image wins for that name, while 
 
 ## Declarative worldgen
 
-`[[worldgen]]` entries in a `format_version = 2` pack turn authored blocks into real terrain in newly generated chunks. The fields are part of the Format v2 schema described above; this section describes what they do to a world.
+`[[worldgen]]` entries in a `format_version = 3` pack turn authored blocks into real terrain in newly generated chunks. The fields are part of the Format v3 schema described above; this section describes what they do to a world.
 
 ```toml
 [[worldgen]]
@@ -198,7 +199,7 @@ The repository ships two content-oriented examples under `tests/fixtures/packs/`
 1. `tests/fixtures/packs/mymod-ruby`
 2. `tests/fixtures/packs/ruby-overlay`
 
-`mymod-ruby` is a complete `format_version = 2` pack. It authors:
+`mymod-ruby` is a complete `format_version = 3` pack. It authors:
 
 - Two blocks: `mymod:ruby_ore` (hardness 3, pickaxe, drops `mymod:ruby`) and `mymod:ruby_block` (hardness 4, pickaxe, drops itself).
 - Two items: `mymod:ruby` and `mymod:ruby_stew` (food, 7 nutrition, 0.8 s to eat, stack 16).
@@ -207,7 +208,7 @@ The repository ships two content-oriented examples under `tests/fixtures/packs/`
 - One recipe patch that disables the built-in shortbow while the pack is selected.
 - Two worldgen rules: a ruby-ore vein rule in stone from y 4 to 40, and a ruby-ore surface patch on plains and forest grass from y 40 to 110.
 
-`ruby-overlay` is a version 1 manifest with no content arrays and a single authored file, `stone.png`. Stacked after `mymod-ruby`, it replaces the stone block layer and leaves every other pack file, definition and field alone.
+`ruby-overlay` is a `format_version = 3` manifest with no content arrays and a single authored file, `stone.png`. Stacked after `mymod-ruby`, it replaces the stone block layer and leaves every other pack file, definition and field alone.
 
 With that stack selected, these headless commands exercise the same code paths a world does:
 
@@ -281,6 +282,19 @@ Image rules:
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
 - Every PNG file and `pack.toml` is limited to 1 MiB (1048576 bytes). A larger file falls back with a warning that names the file and the limit.
 - Partial packs always work — add one texture or all twenty-five.
+
+### Six faces per built-in block
+
+The names above are the legacy base-layer contract: `stone.png` still maps to layer 3 and keeps its built-in face pattern. A `format_version = 3` pack can also author individual faces of a built-in block with flat files named after the block. Precedence is resolved per face, most specific first:
+
+1. a direction suffix — for example `stone_east.png`, `stone_west.png`, `stone_top.png`, `stone_bottom.png`, `stone_south.png`, `stone_north.png`
+2. `stone_side.png` for the four side faces
+3. the bare stem — `stone.png`
+4. the built-in default face
+
+The block stem is usually the built-in short name. Exceptions: `oak_log` uses `log` (`log_top.png`, `log_side.png`, `log_east.png`, ...), `oak_leaves` uses `leaves`, `oak_planks` uses `planks`, and `wheat_stage_0` through `wheat_stage_3` use `wheat_stage0` through `wheat_stage3`. `air`, `water` and the socket marker have no authorable stem.
+
+A file that is already one of the 25 legacy names above (for example `stone.png`, `log_top.png`, or `grass_side.png`) reuses its existing fixed layer. Only new face files — for example `stone_top.png` next to `stone.png`, or `stone_east.png` — are decoded as content assets and allocated pack layers from layer 48, inside the same 160-layer pack budget described under [Format v3](#format-v3). A pack that authors only legacy names therefore allocates nothing and keeps every existing layer index.
 
 ## Mob textures
 
@@ -360,6 +374,7 @@ A sound pack is a `pack.toml` manifest plus up to nine optional sound files. Cop
 this manifest and save it as `packs/my-sounds/pack.toml`:
 
 ```toml
+format_version = 3
 name = "My Sounds"
 description = "Custom break, place, mine-complete, and UI-click audio"
 ```
@@ -418,13 +433,17 @@ Check a pack without launching a world, opening a window, or touching `settings.
 opencraft --validate-pack my-first-pack
 ```
 
-The folder name is the same one used under `packs/`. Each accepted authored entry prints an `ok:` line, a rejected entry prints an `error:` line naming the entry and reason, and non-fatal fallbacks (a corrupt PNG, a v1 pack declaring v2 content arrays) print a `warning:` line:
+The folder name is the same one used under `packs/`. Each accepted authored entry prints an `ok:` line, a rejected entry prints an `error:` line naming the entry and reason, and non-fatal fallbacks (a corrupt PNG, a malformed `[builtin_icons]` value) print a `warning:` line. A pack that does not declare `format_version = 3` is rejected by one pack-level error before any entry is parsed:
 
 ```text
 ok: block mymod:ruby_ore
 ok: item mymod:ruby
-warning: pack.toml: content arrays require format_version = 2
-validate-pack: my-first-pack: 2 entries, 0 errors, 1 warnings
+validate-pack: my-first-pack: 2 entries, 0 errors, 0 warnings
+```
+
+```text
+error: pack my-first-pack: format_version 2 is not supported; every pack must declare format_version = 3
+validate-pack: my-first-pack: 0 entries, 1 errors, 0 warnings
 ```
 
 An accepted built-in override prints its own `ok:` line and is counted in the summary. A missing override PNG fails validation with an `error: asset ...` line while still explaining the fallback:
@@ -436,7 +455,7 @@ warning: builtin_icon apple: icon `textures/missing.png` is not a loaded asset; 
 validate-pack: my-first-pack: 1 entries, 1 errors, 1 warnings
 ```
 
-The exit code is `0` when there are no errors (warnings still pass) and `1` when an entry was rejected or the pack folder is missing. Validation builds the same registry a normal load builds over the built-in content, so references must name a built-in block/item or an entry in the same pack — cross-pack references are not supported.
+The exit code is `0` when there are no errors (warnings still pass) and `1` when an entry was rejected, the format gate rejected the pack, or the pack folder is missing. Validation builds the same registry a normal load builds over the built-in content, so references must name a built-in block/item or an entry in the same pack — cross-pack references are not supported.
 
 ## Selecting packs in game
 
@@ -456,7 +475,7 @@ Development builds watch the active pack stack while the game is running, so you
 **Applies live**
 
 - The 25 block textures and 13 mob textures listed above. A fixed-name file that was missing from a loaded pack can be created later and immediately replaces that layer. When the edited pack is the visible author of the layer, only that one texture-array layer is re-uploaded.
-- The block-face images that a `format_version = 2` stack loaded and allocated when it was applied. Each image keeps its allocated layer index and only its bytes are replaced, so the live path can never move allocation.
+- The block-face images that a `format_version = 3` stack loaded and allocated when it was applied. Each image keeps its allocated layer index and only its bytes are replaced, so the live path can never move allocation.
 - Deleting one of the 38 fixed-name files is live too: the layer falls back to the next pack in the stack that authors it, or to the built-in procedural art when no pack does.
 - A corrupt, non-square, or out-of-range PNG (outside 16 to 256 pixels per side) is rejected. The layer keeps its last good image and the game shows one message naming the file and reason; a valid edit settling in the same poll still applies.
 - Built-in item sprites overridden by `[builtin_icons]`. Editing the authored PNG recomposes and re-uploads the single 256-layer item sprite atlas; only that name's pinned layer changes. The pinned layers are `apple` = 1, `wood_pickaxe` = 11 and `wood_bow` = 26; reserved layers 27–31 are never overridable, and pack-defined icons at layers 32 and above are untouched.

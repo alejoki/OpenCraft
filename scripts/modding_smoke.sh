@@ -5,7 +5,7 @@
 # test harness and no screenshot automation:
 #
 #   Scenario 0 (doc reader-test): the fenced `toml` block under
-#   `## Format v2` in docs/TEXTURE-PACKS.md must still author every Format v2
+#   `## Format v3` in docs/TEXTURE-PACKS.md must still author every Format v3
 #   array (blocks, items, tiers, tools, recipes, block_patches,
 #   recipe_patches), and the whole document must still name worldgen, both
 #   reference packs, `--validate-pack` and the content/save section. This is
@@ -130,7 +130,7 @@ cp -R "$CRATE_OVERLAY" "$TEMP_DIR/packs/ruby-overlay" || fail "cannot copy the t
 
 mkdir -p "$TEMP_DIR/packs/broken" || fail "cannot create packs/broken"
 cat >"$TEMP_DIR/packs/broken/pack.toml" <<'EOF'
-format_version = 2
+format_version = 3
 
 [[blocks]]
 id = "broken:missing_art"
@@ -198,15 +198,15 @@ LAUNCH_BROKEN_OUT="$TEMP_DIR/launch-broken.out"
 # Scenario 0: the authoring docs are an executable reader-test.
 # ---------------------------------------------------------------------------
 DOC_BLOCK="$(awk '
-    /^## Format v2$/ { in_section = 1; next }
+    /^## Format v3$/ { in_section = 1; next }
     in_section && /^```toml$/ { in_block = 1; next }
     in_block && /^```$/ { exit }
     in_block { print }
-' "$DOC")" || fail "cannot read the Format v2 TOML block from $DOC"
-[[ -n "$DOC_BLOCK" ]] || fail "docs reader-test: no fenced toml block under '## Format v2'"
+' "$DOC")" || fail "cannot read the Format v3 TOML block from $DOC"
+[[ -n "$DOC_BLOCK" ]] || fail "docs reader-test: no fenced toml block under '## Format v3'"
 
 for needle in \
-    'format_version = 2' \
+    'format_version = 3' \
     '[[blocks]]' \
     '[[items]]' \
     '[[tiers]]' \
@@ -215,7 +215,7 @@ for needle in \
     '[[block_patches]]' \
     '[[recipe_patches]]'; do
     grep -Fq -- "$needle" <<<"$DOC_BLOCK" ||
-        fail "docs reader-test: Format v2 TOML block is missing '$needle'"
+        fail "docs reader-test: Format v3 TOML block is missing '$needle'"
 done
 
 for needle in \
@@ -357,7 +357,7 @@ cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED/settings-broken.toml" ||
     fail "the broken-stack settings.toml was rewritten during the launch leg"
 compare_pack_tree "$TEMP_DIR/packs" "$EXPECTED/packs"
 
-echo "MODDING SMOKE PASS [profile=$PROFILE]: doc reader-test (Format v2 TOML + worldgen + both reference packs + --validate-pack), clean mymod-ruby 12/0/0, clean ruby-overlay 0/0/0, broken exit=1 with error+valid sibling, missing exit=1, good-stack launch exit=124 and broken-pack launch exit=124 with no panic, packs/settings byte-identical"
+echo "MODDING SMOKE PASS [profile=$PROFILE]: doc reader-test (Format v3 TOML + worldgen + both reference packs + --validate-pack), clean mymod-ruby 12/0/0, clean ruby-overlay 0/0/0, broken exit=1 with error+valid sibling, missing exit=1, good-stack launch exit=124 and broken-pack launch exit=124 with no panic, packs/settings byte-identical"
 echo "MODDING SMOKE EVIDENCE: clean mymod-ruby exit=$CLEAN_RC summary=12-entries-0-errors-0-warnings"
 echo "MODDING SMOKE EVIDENCE: clean ruby-overlay exit=$OVERLAY_RC summary=0-entries-0-errors-0-warnings"
 echo "MODDING SMOKE EVIDENCE: broken exit=$BROKEN_RC error=block-broken:missing_art valid-sibling=ok non-zero-errors=true"

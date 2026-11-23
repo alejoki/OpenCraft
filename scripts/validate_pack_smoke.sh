@@ -3,11 +3,13 @@
 #
 # Proves the strict validation surface without a window, GPU, save or settings
 # file:
-#   1. clean v2 pack -> exit 0, per-entry `ok:` lines, summary, no errors
+#   1. clean v3 pack -> exit 0, per-entry `ok:` lines, summary, no errors
 #   2. broken pack (block with a missing texture + valid item sibling) ->
 #      exit 1, `error: block broken:missing_art`, valid sibling still `ok:`
 #   3. missing pack -> exit 1 with `error: pack ghost:`
 #   4. `--validate-pack` with no value -> exit 1 (fails closed, never launches)
+#   5. legacy v2 pack -> exit 1 with one pack-level error naming the format
+#      version and the required `format_version = 3`, no `ok:` entries
 #
 # Everything runs in a mktemp working directory. The crate root's packs/,
 # saves/ and settings.toml are never touched; a seeded settings-free tree with
@@ -53,7 +55,7 @@ PNG_RUBY_ORE="iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGM4oaDwnx
 PNG_RUBY="iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR4nGNQUDjxnxLMMGrAqAGjBgwXAwDXNAcfEvMRpwAAAABJRU5ErkJggg=="
 
 # ---------------------------------------------------------------------------
-# Fixture: one clean v2 pack plus the sentinel state.
+# Fixture: one clean v3 pack plus the sentinel state.
 # ---------------------------------------------------------------------------
 mkdir -p packs/mymod-ruby saves || fail "cannot create fixture directories"
 printf 'sentinel payload: must stay byte-identical\n' > saves/keep.bin ||
@@ -61,7 +63,7 @@ printf 'sentinel payload: must stay byte-identical\n' > saves/keep.bin ||
 cp saves/keep.bin "$WORK/keep.expected" || fail "cannot snapshot the sentinel save"
 
 cat > packs/mymod-ruby/pack.toml <<'EOF'
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -88,7 +90,7 @@ write_valid_png "packs/mymod-ruby/ruby.png" "$PNG_RUBY" ||
 # Broken pack: one missing asset and one valid sibling.
 mkdir -p packs/broken || fail "cannot create broken pack"
 cat > packs/broken/pack.toml <<'EOF'
-format_version = 2
+format_version = 3
 
 [[blocks]]
 id = "broken:missing_art"
@@ -101,6 +103,20 @@ icon = "ok.png"
 stack = 16
 EOF
 write_valid_png "packs/broken/ok.png" "$PNG_RUBY" || fail "cannot seed broken/ok.png"
+
+# Legacy pack: a v2 manifest with content arrays must be rejected by name by
+# the v3-only gate before any entry is parsed.
+mkdir -p packs/legacy || fail "cannot create legacy pack"
+cat > packs/legacy/pack.toml <<'EOF'
+format_version = 2
+name = "Old Two"
+
+[[blocks]]
+id = "legacy:old_block"
+textures = { all = "old_block.png" }
+hardness = 1.0
+EOF
+write_valid_png "packs/legacy/old_block.png" "$PNG_RUBY" || fail "cannot seed legacy/old_block.png"
 
 cp -a packs "$WORK/packs.expected" || fail "cannot snapshot the pack tree"
 
@@ -172,6 +188,24 @@ rc="$(run_validate "$OUT" --validate-pack)"
 }
 
 # ---------------------------------------------------------------------------
+# Scenario 5: a v2 pack is rejected by name before any entry is parsed.
+# ---------------------------------------------------------------------------
+OUT="$WORK/legacy.out"
+rc="$(run_validate "$OUT" --validate-pack legacy)"
+[[ "$rc" -eq 1 ]] || {
+    cat "$OUT" >&2
+    fail "scenario 5: legacy v2 pack exit $rc (expected 1)"
+}
+grep -Fq 'error: pack legacy: format_version 2 is not supported; every pack must declare format_version = 3' "$OUT" ||
+    fail "scenario 5: missing the named v2 format-gate error"
+if grep -q '^ok:' "$OUT"; then
+    cat "$OUT" >&2
+    fail "scenario 5: a rejected v2 pack must not report ok entries"
+fi
+grep -Fq 'validate-pack: legacy: 0 entries, 1 errors, 0 warnings' "$OUT" ||
+    fail "scenario 5: summary must report exactly one pack-level error"
+
+# ---------------------------------------------------------------------------
 # Read-only contract: no settings file, untouched sentinel save and packs.
 # ---------------------------------------------------------------------------
 [[ ! -e "$WORK/settings.toml" ]] ||
@@ -183,4 +217,4 @@ if ! diff -r "$WORK/packs" "$WORK/packs.expected" >/dev/null 2>&1; then
     fail "validation modified pack files"
 fi
 
-echo "VALIDATE PACK SMOKE OK: clean=0 broken=1 missing=1 no-value=1; settings/save/packs untouched"
+echo "VALIDATE PACK SMOKE OK: clean=0 broken=1 missing=1 no-value=1 legacy-v2=1; settings/save/packs untouched"
