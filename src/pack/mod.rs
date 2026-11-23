@@ -25,7 +25,7 @@ pub mod presentation;
 pub mod resample;
 pub mod sound;
 pub mod spec;
-pub mod v2;
+pub mod v3;
 pub mod validate;
 pub mod watch;
 

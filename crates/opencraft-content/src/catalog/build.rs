@@ -1468,7 +1468,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
         let root = root.expect("the reference pack parses as TOML");
         let (mut spec, warnings, diagnostics) =
-            crate::v2::parse_content(&root, manifest.format_version);
+            crate::v3::parse_content(&root, manifest.format_version);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
 

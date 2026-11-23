@@ -22,7 +22,7 @@ use crate::pack::manifest;
 use crate::pack::manifest::{PackFormat, PackWarning};
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
-use crate::pack::v2;
+use crate::pack::v3;
 use crate::pack::{LoadedPack, PackLogo, AUTHORABLE_TEX_LAYERS, LAYER_FILES, MOB_LAYER_FILES};
 use crate::render::texture::{
     generate_all_texture_layers_rgba, MOB_AUTHORABLE_TEX_LAYERS, MOB_LAYER_BASE,
@@ -102,18 +102,19 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     };
     warnings.append(&mut manifest_warnings);
 
-    // The v2 gate owns the v1 "content arrays require format_version = 2"
-    // warning and the future-version warning. A syntactically invalid manifest
-    // has no root and produced its own warning above.
+    // The v3 gate owns the format_version gate: every pack must declare 3, so
+    // V1, V2 and future versions yield one pack-level error and no content.
+    // A syntactically invalid manifest has no root and produced its own
+    // warning above.
     let (mut content, content_warnings, mut diagnostics) = match &root {
-        Some(root) => v2::parse_content(root, manifest.format_version),
+        Some(root) => v3::parse_content(root, manifest.format_version),
         None => (PackContentSpec::default(), Vec::new(), Vec::new()),
     };
-    // The parser already speaks the neutral warning type, so the v2 gate's
+    // The parser already speaks the neutral warning type, so the v3 gate's
     // warnings append unchanged and every authored fallback keeps one order.
     warnings.extend(content_warnings);
-    if manifest.format_version == PackFormat::V2 {
-        v2::load_content_assets(dir, &mut content, &mut diagnostics);
+    if manifest.format_version == PackFormat::V3 {
+        v3::load_content_assets(dir, &mut content, &mut diagnostics);
     }
 
     // Warning order mirrors v1: manifest, then block layers, then mob layers,

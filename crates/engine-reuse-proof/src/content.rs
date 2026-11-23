@@ -1,7 +1,7 @@
 //! Device-free content-pack parse and asset-pipeline proof.
 //!
 //! This is the outside-crate proof for `opencraft-content`: an authored
-//! `format_version = 2` manifest is parsed, its blocks and items arrays are
+//! `format_version = 3` manifest is parsed, its blocks and items arrays are
 //! validated entry by entry, and one embedded PNG travels the same decode and
 //! 16x16 resample path a real pack asset takes. The resampled sprite is then
 //! inserted into the neutral spec, a `catalog::Catalog` is built from the same
@@ -16,13 +16,13 @@ use opencraft_content::decode::decode_png_rgba_bytes;
 use opencraft_content::manifest::parse_pack_file;
 use opencraft_content::resample::resample_to_16;
 use opencraft_content::spec::PackAsset;
-use opencraft_content::v2::parse_content;
+use opencraft_content::v3::parse_content;
 
-/// A minimal valid v2 manifest: one block and one item.
+/// A minimal valid v3 manifest: one block and one item.
 ///
 /// The entries are deliberately the smallest accepted shape so a rejection
 /// here means the parser or the manifest changed, not that the proof drifted.
-const PACK_TOML: &str = r#"format_version = 2
+const PACK_TOML: &str = r#"format_version = 3
 
 [[blocks]]
 id = "proof:stone"

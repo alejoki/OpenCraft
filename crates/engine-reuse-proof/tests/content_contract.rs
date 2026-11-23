@@ -1,7 +1,7 @@
 //! External contract for the device-free content half of the reuse proof.
 //!
 //! Imports come from the consumer crate and `opencraft_content`'s public
-//! modules on purpose: this target proves the pack manifest parser, the v2
+//! modules on purpose: this target proves the pack manifest parser, the v3
 //! entry parser and the PNG/resample pipeline are usable from an outside crate
 //! that never imports `opencraft` and never opens a pack directory.
 
@@ -10,11 +10,11 @@ use engine_reuse_proof::report::ProofReport;
 use opencraft_content::decode::decode_png_rgba_bytes;
 use opencraft_content::manifest::parse_pack_file;
 use opencraft_content::resample::resample_to_16;
-use opencraft_content::v2::parse_content;
+use opencraft_content::v3::parse_content;
 
 /// A valid pack whose second block is rejected, so one diagnostic must appear
 /// while the item sibling survives.
-const PARTLY_BROKEN_PACK: &str = r#"format_version = 2
+const PARTLY_BROKEN_PACK: &str = r#"format_version = 3
 
 [[blocks]]
 id = "proof:stone"
@@ -123,7 +123,7 @@ fn rejected_entries_keep_the_valid_siblings_and_name_the_entry() {
     let root = root.expect("the partly broken pack is valid TOML");
 
     let (spec, warnings, diagnostics) = parse_content(&root, manifest.format_version);
-    assert!(warnings.is_empty(), "v2 arrays produce no manifest warning");
+    assert!(warnings.is_empty(), "v3 arrays produce no manifest warning");
     assert_eq!(spec.blocks.len(), 1, "the invalid block is rejected");
     assert_eq!(spec.items.len(), 1, "the valid item sibling is kept");
     assert_eq!(
