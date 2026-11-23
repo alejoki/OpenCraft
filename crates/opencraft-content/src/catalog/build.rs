@@ -957,7 +957,7 @@ mod tests {
     /// Synthetic built-in base with the frozen default tables.
     ///
     /// The crate has no game `ContentRegistry`, so the ported builder tests
-    /// supply the same neutral base: 24 blocks raw `0..24`, three tiers and 22
+    /// supply the same neutral base: 25 blocks raw `0..25`, three tiers and 22
     /// inert recipes named from the vocabulary. Recipe contents are not part
     /// of the digest and only their names (plus the `planks` output asserted
     /// below) are consumed.
@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(def.drop, Some(ItemRef::Block(4)));
         assert_eq!(def.tool_class, Some(ToolKind::Shovel));
         assert_eq!(def.stack_limit, 32);
-        assert_eq!(catalog.blocks().len(), 24);
+        assert_eq!(catalog.blocks().len(), BLOCK_ID_NAMES.len());
     }
 
     #[test]
@@ -1072,14 +1072,18 @@ mod tests {
 
         let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
-        assert_eq!(catalog.blocks().len(), 24 + 2);
+        assert_eq!(catalog.blocks().len(), BLOCK_ID_NAMES.len() + 2);
 
-        let alpha = catalog.block(24).expect("alpha at the first modded index");
-        let zeta = catalog.block(25).expect("zeta at the second modded index");
+        let alpha = catalog
+            .block(BLOCK_ID_NAMES.len() as u16)
+            .expect("alpha at the first modded index");
+        let zeta = catalog
+            .block(BLOCK_ID_NAMES.len() as u16 + 1)
+            .expect("zeta at the second modded index");
         assert_eq!(alpha.name, "mymod:alpha");
         assert_eq!(zeta.name, "mymod:zeta");
-        assert_eq!(alpha.id, 24);
-        assert_eq!(zeta.id, 25);
+        assert_eq!(alpha.id, BLOCK_ID_NAMES.len() as u16);
+        assert_eq!(zeta.id, BLOCK_ID_NAMES.len() as u16 + 1);
         assert_eq!(catalog.items().len(), 0);
     }
 
@@ -1105,12 +1109,12 @@ mod tests {
         assert_eq!(report.warnings(), 1);
         assert!(report.diagnostics[0].reason.contains("`second`"));
 
-        assert_eq!(catalog.blocks().len(), 24 + 2);
+        assert_eq!(catalog.blocks().len(), BLOCK_ID_NAMES.len() + 2);
         let alpha = catalog
-            .block(24)
+            .block(BLOCK_ID_NAMES.len() as u16)
             .expect("alpha stays at the first modded index");
         let zeta = catalog
-            .block(25)
+            .block(BLOCK_ID_NAMES.len() as u16 + 1)
             .expect("zeta stays at the second modded index");
         assert_eq!(alpha.name, "mymod:alpha");
         assert_eq!(alpha.display_name, "Alpha Two");
@@ -1142,7 +1146,9 @@ mod tests {
             }],
             "a shared asset is deduplicated into one layer and one source"
         );
-        let def = catalog.block(24).expect("pack block");
+        let def = catalog
+            .block(BLOCK_ID_NAMES.len() as u16)
+            .expect("pack block");
         assert_eq!(def.faces, [PACK_LAYER_BASE; 6]);
         assert_eq!(catalog.pack_layers()[0], vec![0x55u8; 1024]);
         assert_eq!(catalog.pack_layers().len(), 1);
@@ -1208,7 +1214,10 @@ mod tests {
         assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
         assert_eq!(report.entries, 2, "pack block + authored built-in face");
         assert_eq!(
-            catalog.block(24).expect("pack block").faces,
+            catalog
+                .block(BLOCK_ID_NAMES.len() as u16)
+                .expect("pack block")
+                .faces,
             [PACK_LAYER_BASE; 6],
             "pack-defined blocks still start at 48"
         );
@@ -1284,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn block_layers_append_from_48_and_cap_at_208_with_fallback_26() {
+    fn block_layers_append_from_48_and_cap_at_208_with_fallback_27() {
         let mut spec = PackContentSpec::default();
         for index in 0..161 {
             let texture = format!("layer_{index:03}.png");
@@ -1301,12 +1310,16 @@ mod tests {
         );
         assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
 
-        let first = catalog.block(24).expect("first pack block");
+        let first = catalog
+            .block(BLOCK_ID_NAMES.len() as u16)
+            .expect("first pack block");
         assert_eq!(first.name, "mymod:block_000");
         assert_eq!(first.faces, [PACK_LAYER_BASE; 6]);
         assert_eq!(catalog.pack_layers()[0], vec![0u8; 1024]);
 
-        let last = catalog.block(24 + 160).expect("161st pack block");
+        let last = catalog
+            .block(BLOCK_ID_NAMES.len() as u16 + 160)
+            .expect("161st pack block");
         assert_eq!(last.name, "mymod:block_160");
         assert_eq!(last.faces, [PLACEHOLDER_BLOCK_LAYER; 6]);
     }
@@ -1583,7 +1596,9 @@ mod tests {
         });
 
         let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
-        let def = catalog.block(24).expect("block still exists");
+        let def = catalog
+            .block(BLOCK_ID_NAMES.len() as u16)
+            .expect("block still exists");
         assert_eq!(def.drop, None);
         assert_eq!(report.errors(), 2, "{:?}", report.diagnostics);
         assert!(catalog.recipe_by_name("not_a_recipe").is_none());
@@ -1734,13 +1749,19 @@ mod tests {
         assert_eq!(report.warnings(), 0, "{:?}", report.diagnostics);
 
         // Independently validated pre-change oracle: a mismatch is a builder
-        // defect, do not re-derive it.
-        assert_eq!(catalog.digest(), 0xbacb_c160_bdf7_6d08);
+        // defect, do not re-derive it. Re-pinned in M019/S03-T02 because the
+        // 25th built-in block (glass = 24) moves every pack raw id by one;
+        // the digest intentionally folds resolved raw ids.
+        assert_eq!(catalog.digest(), 0x0d8e_817f_10a2_2c47);
 
-        let ruby_block = catalog.block(24).expect("mymod:ruby_block at raw 24");
+        let ruby_block = catalog
+            .block(BLOCK_ID_NAMES.len() as u16)
+            .expect("mymod:ruby_block at the first modded raw");
         assert_eq!(ruby_block.name, "mymod:ruby_block");
         assert_eq!(ruby_block.faces, [48; 6]);
-        let ruby_ore = catalog.block(25).expect("mymod:ruby_ore at raw 25");
+        let ruby_ore = catalog
+            .block(BLOCK_ID_NAMES.len() as u16 + 1)
+            .expect("mymod:ruby_ore at the second modded raw");
         assert_eq!(ruby_ore.name, "mymod:ruby_ore");
         assert_eq!(ruby_ore.faces, [49; 6]);
 
@@ -1763,7 +1784,7 @@ mod tests {
         assert_eq!(
             catalog.worldgen_rules()[1],
             WorldgenRule::Patch {
-                block: 25,
+                block: BLOCK_ID_NAMES.len() as u16 + 1,
                 replace: 1,
                 biomes: vec![BiomeTag::Plains, BiomeTag::Forest],
                 min_y: 40,

@@ -980,7 +980,7 @@ impl std::error::Error for PersistenceError {}
 /// Rejects every block id the v1-v7 wire format cannot represent.
 ///
 /// Each block byte on disk is a `u8` and the decoder accepts only the frozen
-/// built-in ids `0..=23` (raw ids below [`BUILTIN_BLOCK_COUNT`]), so a
+/// built-in ids `0..=24` (raw ids below [`BUILTIN_BLOCK_COUNT`]), so a
 /// [`BlockId::Modded`] id would silently truncate into a different built-in
 /// id. This scan runs before the first output byte so such a save is rejected
 /// with an empty buffer instead.
@@ -1052,7 +1052,7 @@ fn validate_legacy_blocks(data: &WorldSaveData) -> Result<(), PersistenceError> 
 #[cfg(test)]
 fn write_legacy_world(out: &mut Vec<u8>, data: &WorldSaveData) -> Result<(), PersistenceError> {
     // The v1-v7 wire vocabulary is built-in only (a block id is one `u8` and
-    // the decoder accepts 0..=23). Reject every unrepresentable block before
+    // the decoder accepts 0..=24). Reject every unrepresentable block before
     // writing a single byte so a modded id can never be truncated into a
     // different built-in id on disk, and a rejected save leaves `out`
     // untouched (atomic-rejection contract).

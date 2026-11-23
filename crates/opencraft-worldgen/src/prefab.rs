@@ -61,7 +61,7 @@ pub trait BlockNameResolver {
 /// The default [`BlockNameResolver`]: the frozen built-in block vocabulary.
 ///
 /// Index-aligned to `opencraft_content::vocabulary::BLOCK_ID_NAMES`, so ids
-/// `0..=23` round-trip and every other id has no name.
+/// `0..=24` round-trip and every other id has no name.
 pub struct BuiltinBlockNames;
 
 impl BlockNameResolver for BuiltinBlockNames {
@@ -1697,7 +1697,7 @@ layers = [
                 "name for raw id {raw}"
             );
         }
-        assert_eq!(resolver.name_by_id(24), None);
+        assert_eq!(resolver.name_by_id(25), None);
         assert_eq!(resolver.name_by_id(u16::MAX), None);
         assert_eq!(resolver.id_by_name("moon_rock"), None);
     }

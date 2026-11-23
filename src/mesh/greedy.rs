@@ -896,6 +896,11 @@ mod tests {
 
         // Captured from the unmodified pre-M010 mesher. Any greedy-merge,
         // AO/light, quad packing or water-emission drift fails here.
+        //
+        // S03 re-pin: wheat is now a non-solid `BlockKind::Plant`, so the
+        // synthetic wheat cell no longer emits cube faces and the chunk is
+        // four opaque cubes plus the water cell. The later model/alpha task
+        // (T04) adds cross quads and re-pins again.
         let expected: [([usize; 6], usize, usize, u64); 2] = [
             (
                 [370, 482, 402, 471, 274, 471],
@@ -903,7 +908,7 @@ mod tests {
                 0,
                 7_499_183_456_375_510_007,
             ),
-            ([5, 5, 5, 5, 5, 5], 30, 6, 8_967_597_396_962_111_883),
+            ([4, 4, 4, 4, 4, 4], 24, 6, 7_729_742_243_065_713_213),
         ];
         let actual = [
             fnv1a64_mesh_baseline(&mesh_a),

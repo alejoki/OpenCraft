@@ -11,7 +11,7 @@
 #         or panic is an explicit FAILURE.
 #     (b) no "panicked" / "RUST_BACKTRACE" text.
 #     (c) exactly the pinned non-empty lines, compared WHOLE-LINE (never
-#         substrings), in order. The lines pin: the 47-entry stock split
+#         substrings), in order. The lines pin: the 48-entry stock split
 #         across built-in/pack blocks, items and tools; the 1280x720 layout
 #         (panel, first and 54th slot, quad and label counts); the `rub`,
 #         `mymod` and `builtin` filter results in sorted-display-name order;
@@ -126,11 +126,11 @@ fail() {
 # The contractual digest lines, in their required order. Keep byte-for-byte
 # identical to src/main.rs::palette_demo_pins_the_checked_in_reference_pack_line_set.
 EXPECTED_LINES=(
-    "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=47"
+    "palette: leg=entries builtin_blocks=15 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=48"
     "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4"
     "palette: leg=filter query=rub matched=6 names=mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword"
     "palette: leg=filter query=mymod matched=6"
-    "palette: leg=filter query=builtin matched=41"
+    "palette: leg=filter query=builtin matched=42"
     "palette: leg=grant slot=0 item=mymod:ruby_block count=64 tool=false placeable=true"
     "palette: leg=grant slot=1 item=mymod:ruby_ore count=64 tool=false placeable=true"
     "palette: leg=grant slot=2 item=mymod:ruby count=64 tool=false placeable=false"
@@ -138,7 +138,7 @@ EXPECTED_LINES=(
     "palette: leg=grant slot=4 item=mymod:ruby_pickaxe count=1 tool=true durability=900"
     "palette: leg=grant slot=5 item=mymod:ruby_sword count=1 tool=true durability=900"
     "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19"
-    "palette: leg=placeholder excluded=2 total=47"
+    "palette: leg=placeholder excluded=2 total=48"
     "palette: leg=key key=C creative=true survival=false"
     "palette: ok"
 )
@@ -262,7 +262,7 @@ if grep -q "panicked" "$LAUNCH_B_OUT" || grep -q "RUST_BACKTRACE" "$LAUNCH_B_OUT
 fi
 cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED_DIR/settings-cleared.toml" || fail "the cleared settings.toml was rewritten during the placeholder leg"
 
-echo "PALETTE SMOKE PASS [profile=$PROFILE]: --demo-palette listed 47 non-placeholder built-in and pack entries, pinned the 1280x720 panel/slot/quads/labels geometry, filtered rub/mymod/builtin in sorted-display-name order, granted six authored full stacks (64 ruby block, 64 ore, 64 ruby, 16 stew, 900-durability pickaxe and sword), used the authored 7-hunger stew, excluded two appended save placeholders, and kept the palette Creative-only; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic) while settings and pack bytes stayed byte-identical"
+echo "PALETTE SMOKE PASS [profile=$PROFILE]: --demo-palette listed 48 non-placeholder built-in and pack entries, pinned the 1280x720 panel/slot/quads/labels geometry, filtered rub/mymod/builtin in sorted-display-name order, granted six authored full stacks (64 ruby block, 64 ore, 64 ruby, 16 stew, 900-durability pickaxe and sword), used the authored 7-hunger stew, excluded two appended save placeholders, and kept the palette Creative-only; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic) while settings and pack bytes stayed byte-identical"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PALETTE SMOKE EVIDENCE: $line"
 done

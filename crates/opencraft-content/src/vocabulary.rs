@@ -8,7 +8,7 @@
 //! truth.
 //!
 //! Every table is index-aligned to the declaration order of its Rust enum
-//! (or, for blocks, the frozen raw id order `0..=23`). Built-in names are
+//! (or, for blocks, the frozen raw id order `0..=24`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
 /// Longest content name accepted anywhere a name is persisted or namespaced.
@@ -18,8 +18,8 @@
 /// vice versa. Bytes, not chars: the save table stores UTF-8 length.
 pub const MAX_CONTENT_NAME_LEN: usize = 255;
 
-/// Built-in block id names, index-aligned to raw ids `0..=23`.
-pub const BLOCK_ID_NAMES: [&str; 24] = [
+/// Built-in block id names, index-aligned to raw ids `0..=24`.
+pub const BLOCK_ID_NAMES: [&str; 25] = [
     "air",
     "grass",
     "dirt",
@@ -44,6 +44,7 @@ pub const BLOCK_ID_NAMES: [&str; 24] = [
     "chest",
     "loot_chest",
     "socket_marker",
+    "glass",
 ];
 
 /// Material names in `Material` declaration order.

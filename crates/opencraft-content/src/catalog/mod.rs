@@ -38,9 +38,10 @@ pub const PACK_ICON_CAP: u8 = 224;
 /// Reserved block face layer used when a pack asset is missing or the layer
 /// space overflows: the built-in checker placeholder.
 ///
-/// Starts at 26 so a fallback never aliases layer 25, the built-in
-/// socket-marker art that packs cannot override.
-pub const PLACEHOLDER_BLOCK_LAYER: u8 = 26;
+/// Starts at 27 so a fallback never aliases glass pane art (25) or the
+/// built-in socket-marker art (26) that packs cannot override. Layers
+/// 27..=31 are reserved block placeholders.
+pub const PLACEHOLDER_BLOCK_LAYER: u8 = 27;
 
 /// Reserved icon layer used when a pack icon is missing or icon space
 /// overflows.

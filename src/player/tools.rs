@@ -77,7 +77,8 @@ pub const fn block_tool_class(block: BlockId) -> Option<ToolKind> {
         | BlockId::WheatStage1
         | BlockId::WheatStage2
         | BlockId::WheatStage3
-        | BlockId::SocketMarker => None,
+        | BlockId::SocketMarker
+        | BlockId::Glass => None,
         // No acceleration until the registry resolves a tool class in S04:
         // fail closed rather than guessing a built-in material.
         BlockId::Modded(_) => None,
@@ -249,7 +250,7 @@ mod tests {
         assert_eq!(rules.iron_speed_multiplier, IRON_SPEED_MULTIPLIER);
     }
 
-    const ALL_BLOCKS: [BlockId; 24] = [
+    const ALL_BLOCKS: [BlockId; 25] = [
         BlockId::Air,
         BlockId::Grass,
         BlockId::Dirt,
@@ -274,6 +275,7 @@ mod tests {
         BlockId::Chest,
         BlockId::LootChest,
         BlockId::SocketMarker,
+        BlockId::Glass,
     ];
 
     const ALL_KINDS: [ToolKind; 6] = [
@@ -312,7 +314,8 @@ mod tests {
                 | BlockId::WheatStage1
                 | BlockId::WheatStage2
                 | BlockId::WheatStage3
-                | BlockId::SocketMarker => {
+                | BlockId::SocketMarker
+                | BlockId::Glass => {
                     assert_eq!(class, None, "{block:?} must not be accelerated by a tool");
                 }
                 _ => assert!(class.is_some(), "{block:?} must belong to a tool class"),
@@ -352,6 +355,7 @@ mod tests {
             BlockId::WheatStage2,
             BlockId::WheatStage3,
             BlockId::SocketMarker,
+            BlockId::Glass,
         ] {
             assert_eq!(block_tool_class(block), None);
         }

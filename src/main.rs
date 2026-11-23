@@ -8889,19 +8889,19 @@ stack = 64
 
         // Literals measured from a real run, never derived from the fixture.
         let expected = vec![
-            "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
+            "presentation_demo: leg=registry blocks=27 items=1 pack_layers=2 pack_icons=1"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
             "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
                 .to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_ore id=26 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_block id=25 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
             "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64".to_string(),
             "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49".to_string(),
             "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
             "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
-            "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26".to_string(),
+            "presentation_demo: leg=placeholder unresolved=3 face=27 icon=27 break=none mesh=27".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -8920,7 +8920,7 @@ stack = 64
             "the built-in launch is a valid presentation: {lines:#?}"
         );
         let expected = vec![
-            "presentation_demo: leg=registry blocks=24 items=0 pack_layers=0 pack_icons=0"
+            "presentation_demo: leg=registry blocks=25 items=0 pack_layers=0 pack_icons=0"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
@@ -8928,7 +8928,7 @@ stack = 64
                 .to_string(),
             "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
                 .to_string(),
-            "presentation_demo: leg=placeholder unresolved=0 face=26 icon=27 break=none mesh=26"
+            "presentation_demo: leg=placeholder unresolved=0 face=27 icon=27 break=none mesh=27"
                 .to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
@@ -8973,7 +8973,7 @@ stack = 64
         );
         assert_eq!(
             reference_registry.digest(),
-            0xbacb_c160_bdf7_6d08,
+            0x0d8e_817f_10a2_2c47,
             "the reference pack digest is pinned"
         );
 
@@ -8986,7 +8986,7 @@ stack = 64
         );
         assert_eq!(
             stacked.digest(),
-            0xabb6_212a_d750_6661,
+            0x24fa_d295_7ad2_2dbe,
             "reference + texture overlay digest is pinned"
         );
 
@@ -9071,9 +9071,9 @@ stack = 64
         let expected = vec![
             "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
             "worldgen_demo: leg=session rules=2 matches=true".to_string(),
-            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2513 min_y=4 max_y=40 in_band=true"
                 .to_string(),
-            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=346 biomes=plains,forest biomes_ok=true"
                 .to_string(),
             "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
             "worldgen_demo: leg=empty_rules identical=true".to_string(),
@@ -9129,11 +9129,11 @@ stack = 64
         // Literals measured from a real run of the checked-in pack, never
         // derived from the registry under test (D143/MEM368).
         let expected = vec![
-            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=47".to_string(),
+            "palette: leg=entries builtin_blocks=15 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=48".to_string(),
             "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4".to_string(),
             "palette: leg=filter query=rub matched=6 names=mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
             "palette: leg=filter query=mymod matched=6".to_string(),
-            "palette: leg=filter query=builtin matched=41".to_string(),
+            "palette: leg=filter query=builtin matched=42".to_string(),
             "palette: leg=grant slot=0 item=mymod:ruby_block count=64 tool=false placeable=true".to_string(),
             "palette: leg=grant slot=1 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
             "palette: leg=grant slot=2 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
@@ -9141,7 +9141,7 @@ stack = 64
             "palette: leg=grant slot=4 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
             "palette: leg=grant slot=5 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
             "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19".to_string(),
-            "palette: leg=placeholder excluded=2 total=47".to_string(),
+            "palette: leg=placeholder excluded=2 total=48".to_string(),
             "palette: leg=key key=C creative=true survival=false".to_string(),
             "palette: ok".to_string(),
         ];
@@ -16499,7 +16499,7 @@ stack = 64
     }
 
     #[test]
-    fn socket_marker_meshes_opaque_quads_on_layer_25() {
+    fn socket_marker_meshes_opaque_quads_on_layer_26() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(
             34,
@@ -16525,8 +16525,8 @@ stack = 64
         for quad in mesh.buckets.iter().flat_map(|bucket| bucket.iter()) {
             assert_eq!(
                 quad.unpack().6,
-                25,
-                "every marker face samples the built-in layer-25 art"
+                26,
+                "every marker face samples the built-in layer-26 art"
             );
         }
     }
@@ -16552,8 +16552,8 @@ stack = 64
             .filter(|entry| matches!(entry.id, ItemId::Block(block) if block.is_builtin()))
             .count();
         assert_eq!(
-            builtin_blocks, 14,
-            "the built-in carryable count is unchanged"
+            builtin_blocks, 15,
+            "the built-in carryable count includes glass"
         );
     }
 

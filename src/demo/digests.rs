@@ -2567,13 +2567,13 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         "palette: leg=entries builtin_blocks={builtin_blocks} builtin_items={builtin_items} builtin_tools={builtin_tools} pack_blocks={pack_blocks} pack_items={pack_items} pack_tools={pack_tools} total={total}"
     ));
     fail_if!(
-        builtin_blocks != 14
+        builtin_blocks != 15
             || builtin_items != 11
             || builtin_tools != 16
             || pack_blocks != 2
             || pack_items != 2
             || pack_tools != 2
-            || total != 47,
+            || total != 48,
         "entries"
     );
 
@@ -2630,7 +2630,7 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         "palette: leg=filter query=builtin matched={}",
         builtin_matches.len()
     ));
-    fail_if!(builtin_matches.len() != 41, "filter");
+    fail_if!(builtin_matches.len() != 42, "filter");
 
     // (d) Grant legs: a fresh Creative player, one authored full stack per
     // identity, granted through the real production path. Every grant writes
@@ -2769,7 +2769,7 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         placeholder_entries.len()
     ));
     fail_if!(
-        placeholder_entries.len() != 47 || ghosts_listed,
+        placeholder_entries.len() != 48 || ghosts_listed,
         "placeholder"
     );
 

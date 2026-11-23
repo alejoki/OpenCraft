@@ -29,10 +29,11 @@ pub const BLOCK_WHEAT_STAGE_3: u16 = 20;
 pub const BLOCK_CHEST: u16 = 21;
 pub const BLOCK_LOOT_CHEST: u16 = 22;
 pub const BLOCK_SOCKET_MARKER: u16 = 23;
+pub const BLOCK_GLASS: u16 = 24;
 
-/// Number of built-in block ids: `0..=23` are the frozen vocabulary and every
+/// Number of built-in block ids: `0..=24` are the frozen vocabulary and every
 /// modded registry index starts here.
-pub const BUILTIN_BLOCK_COUNT: u16 = 24;
+pub const BUILTIN_BLOCK_COUNT: u16 = 25;
 
 #[cfg(test)]
 mod tests {
@@ -41,7 +42,7 @@ mod tests {
 
     #[test]
     fn block_constants_are_index_aligned_to_the_frozen_vocabulary() {
-        let ids: [u16; 24] = [
+        let ids: [u16; 25] = [
             BLOCK_AIR,
             BLOCK_GRASS,
             BLOCK_DIRT,
@@ -66,6 +67,7 @@ mod tests {
             BLOCK_CHEST,
             BLOCK_LOOT_CHEST,
             BLOCK_SOCKET_MARKER,
+            BLOCK_GLASS,
         ];
         for (index, id) in ids.iter().enumerate() {
             assert_eq!(

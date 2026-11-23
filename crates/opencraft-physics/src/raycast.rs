@@ -2,18 +2,19 @@
 //!
 //! The traversal walks cell boundaries in `t` order, stepping the axis with the
 //! smallest pending boundary crossing and recording the entry face as the
-//! outward normal. A call samples `BlockKind::Solid` only: empty and liquid
-//! cells are passable, so a ray travels through a liquid column and stops on
-//! the first solid cell.
+//! outward normal. A call stops on the first *targetable* cell
+//! ([`BlockKind::is_targetable`]): solid blocks and plants are hittable, while
+//! empty and liquid cells are passable, so a ray travels through a liquid
+//! column and stops on the first solid cell.
 
 use glam::{IVec3, Vec3};
 
 use opencraft_core::block::BlockQuery;
 
-/// Where a reach ray first meets a solid cell.
+/// Where a reach ray first meets a targetable cell.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct RaycastHit {
-    /// The solid cell that was hit.
+    /// The targetable cell that was hit.
     pub block_pos: IVec3,
     /// The passable cell the ray entered from (the hit cell minus `normal`).
     pub adjacent_pos: IVec3,
@@ -23,8 +24,8 @@ pub struct RaycastHit {
     pub distance: f32,
 }
 
-/// Step a normalized ray through the voxel grid and return the first solid
-/// cell within `max_dist`.
+/// Step a normalized ray through the voxel grid and return the first
+/// targetable (solid or plant) cell within `max_dist`.
 ///
 /// The direction is normalized internally, so `dir` may have any non-zero
 /// length; a direction shorter than the degeneracy threshold (`1e-8`) yields
@@ -109,7 +110,7 @@ pub fn raycast_voxels(
         if dist > max_dist {
             break;
         }
-        if world.block_kind(pos.x, pos.y, pos.z).is_solid() {
+        if world.block_kind(pos.x, pos.y, pos.z).is_targetable() {
             return Some(RaycastHit {
                 block_pos: pos,
                 adjacent_pos: pos + normal,
@@ -166,8 +167,7 @@ mod tests {
 
     /// Liquid is passable, so the reach raycast must travel through it and stop
     /// on the first solid cell underneath (the floor), never treating the
-    /// liquid as a target: `is_solid()` is the only hit predicate and a liquid
-    /// cell is not solid.
+    /// liquid as a target: `is_targetable()` excludes liquids.
     #[test]
     fn raycast_skips_liquid_and_hits_the_solid_floor() {
         // Solid floor at y == 0, a 10-cell liquid column above it (1..=10),
@@ -206,6 +206,47 @@ mod tests {
         assert!(
             short.is_none(),
             "a ray ending in the liquid must not hit it, got {short:?}"
+        );
+    }
+
+    /// A plant is passable for movement yet still selectable by a reach ray:
+    /// `is_targetable()` — not `is_solid()` — is the hit predicate.
+    #[test]
+    fn raycast_hits_a_plant_but_not_a_liquid() {
+        let plant = |_x: i32, y: i32, _z: i32| {
+            if y == 4 {
+                BlockKind::Plant
+            } else {
+                BlockKind::Empty
+            }
+        };
+        let hit = raycast_voxels(
+            Vec3::new(2.5, 8.5, 2.5),
+            Vec3::new(0.0, -1.0, 0.0),
+            10.0,
+            &plant,
+        )
+        .expect("a plant cell must be hittable");
+        assert_eq!(hit.block_pos, IVec3::new(2, 4, 2));
+        assert_eq!(hit.adjacent_pos, IVec3::new(2, 5, 2));
+
+        // The same geometry classified as liquid is transparent to the ray.
+        let liquid = |_x: i32, y: i32, _z: i32| {
+            if y == 4 {
+                BlockKind::Liquid
+            } else {
+                BlockKind::Empty
+            }
+        };
+        assert_eq!(
+            raycast_voxels(
+                Vec3::new(2.5, 8.5, 2.5),
+                Vec3::new(0.0, -1.0, 0.0),
+                10.0,
+                &liquid,
+            ),
+            None,
+            "a liquid cell must never be a raycast target"
         );
     }
 

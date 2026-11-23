@@ -7,7 +7,7 @@
 //! [`BlockId`], [`ItemId`], [`Material`], [`ToolTier`] or [`RecipeId`].
 //!
 //! Every table is index-aligned to the declaration order of its Rust enum
-//! (or, for blocks, the frozen raw id order `0..=23`). Built-in names are
+//! (or, for blocks, the frozen raw id order `0..=24`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
 use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolKindTiers, ToolTier};
@@ -348,6 +348,7 @@ mod tests {
             "chest",
             "loot_chest",
             "socket_marker",
+            "glass",
         ];
         assert_eq!(expected, BLOCK_ID_NAMES);
         for name in BLOCK_ID_NAMES {

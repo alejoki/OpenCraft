@@ -719,7 +719,7 @@ mod tests {
         let block = registry
             .block_by_name("mymod:ruby_ore")
             .expect("the pack block is registered");
-        assert_eq!(block.id, BlockId::Modded(24));
+        assert_eq!(block.id, BlockId::Modded(BUILTIN_BLOCK_COUNT));
         assert_eq!(block.faces, [48; 6]);
         assert_eq!(block.drop, Some(ItemRef::Item(0)));
         assert_eq!(block.tool_class, Some(ToolKind::Pickaxe));
