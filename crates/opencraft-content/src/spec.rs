@@ -64,7 +64,45 @@ pub struct ContentDiagnostic {
     pub reason: String,
 }
 
-/// Everything a v2 pack authors, before registry allocation.
+/// Frozen face index → direction label.
+///
+/// Matches the game's `src/world/block.rs` and `prefab::Direction` order:
+/// 0=+X/east, 1=-X/west, 2=+Y/top, 3=-Y/bottom, 4=+Z/south, 5=-Z/north.
+pub const FACE_DIRECTIONS: [&str; 6] = ["east", "west", "top", "bottom", "south", "north"];
+
+/// Direction label for a face index, or `None` when the index is out of range.
+pub fn face_direction(face: usize) -> Option<&'static str> {
+    FACE_DIRECTIONS.get(face).copied()
+}
+
+/// Where a built-in block face's texture bytes come from.
+///
+/// `Layer` means the bytes already live in a fixed base layer (for example a
+/// legacy `<stem>_top.png` file that is still a built-in layer). `Authored`
+/// names a pack-relative file that the loader decoded into
+/// [`PackContentSpec::assets`] and that the catalog allocates at `48 + i`.
+/// `None` on [`BuiltinFaceEntry::faces`] means keep the built-in
+/// `face_tex_layer` default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaceSource {
+    Layer(u8),
+    Authored(String),
+}
+
+/// One loader-synthesized per-direction face plan for a built-in block.
+///
+/// The neutral crate never synthesizes these itself: the game loader inspects
+/// a pack folder and fills the table, so built-in blocks can point at new
+/// per-direction PNGs without changing their raw ids.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BuiltinFaceEntry {
+    /// Built-in block short name, for example `stone`.
+    pub block: String,
+    /// Per-face sources in the frozen [`FACE_DIRECTIONS`] order.
+    pub faces: [Option<FaceSource>; 6],
+}
+
+/// Everything a v3 pack authors, before registry allocation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PackContentSpec {
     pub blocks: Vec<BlockEntry>,
@@ -84,6 +122,11 @@ pub struct PackContentSpec {
     pub builtin_icons: BTreeMap<String, String>,
     /// Resampled 16x16 RGBA assets keyed by pack-relative authored path.
     pub assets: BTreeMap<String, PackAsset>,
+    /// Per-direction face overrides for built-in blocks, synthesized by the
+    /// loader from the pack folder. Empty means every built-in block keeps its
+    /// `face_tex_layer` default, so the plan never enters the digest until a
+    /// new authored face file exists.
+    pub builtin_faces: Vec<BuiltinFaceEntry>,
 }
 
 /// One authored block definition.

@@ -16,7 +16,8 @@
 use std::collections::BTreeMap;
 
 use crate::spec::{
-    BlockEntry, BlockPatch, ItemEntry, PackContentSpec, RecipePatch, TierEntry, ToolEntry, ToolKind,
+    BlockEntry, BlockPatch, FaceSource, ItemEntry, PackContentSpec, RecipePatch, TierEntry,
+    ToolEntry, ToolKind,
 };
 use crate::vocabulary::MATERIAL_ID_NAMES;
 
@@ -387,6 +388,32 @@ pub(super) fn compute_digest(input: &DigestInputs<'_>) -> u64 {
     for (_folder, patch) in recipe_patches {
         digest.str(&patch.id);
         digest.u8(u8::from(patch.enabled));
+    }
+
+    // Built-in per-direction face plans. The empty plan hashes nothing, so
+    // every pre-T03 digest (reference/reference+overlay/builtin pins and
+    // engine-reuse-proof) stays byte-identical. `Layer` sources are fixed
+    // base layers, not authored content, so they are not hashed either;
+    // only a new/renamed authored file moves the digest.
+    let authored_face_count = packs
+        .iter()
+        .flat_map(|(_identity, spec)| &spec.builtin_faces)
+        .flat_map(|entry| &entry.faces)
+        .filter(|source| matches!(source, Some(FaceSource::Authored(_))))
+        .count();
+    if authored_face_count > 0 {
+        digest.u16(u16::try_from(authored_face_count).unwrap_or(u16::MAX));
+        for (_identity, spec) in packs {
+            for entry in &spec.builtin_faces {
+                for (face, source) in entry.faces.iter().enumerate() {
+                    if let Some(FaceSource::Authored(path)) = source {
+                        digest.str(&entry.block);
+                        digest.u8(face as u8);
+                        digest.str(path);
+                    }
+                }
+            }
+        }
     }
 
     digest.finish()
@@ -1071,6 +1098,66 @@ mod tests {
             base,
             digest_for(&[(identity("p", None), renamed)]),
             "a directional face rename must move the digest"
+        );
+    }
+
+    #[test]
+    fn empty_and_layer_only_builtin_face_plans_keep_the_digest() {
+        let base = PackContentSpec::default();
+        let base_stack = vec![(identity("p", Some("1.0")), base.clone())];
+
+        // An empty plan and a plan built only from existing base layers are
+        // equivalent to no plan at all: neither authors a new face file.
+        let mut layer_only = base.clone();
+        layer_only
+            .builtin_faces
+            .push(crate::spec::BuiltinFaceEntry {
+                block: "stone".to_string(),
+                faces: [
+                    None,
+                    None,
+                    Some(FaceSource::Layer(0)),
+                    Some(FaceSource::Layer(26)),
+                    None,
+                    None,
+                ],
+            });
+        let layer_stack = vec![(identity("p", Some("1.0")), layer_only)];
+
+        assert_eq!(
+            digest_for(&base_stack),
+            digest_for(&layer_stack),
+            "a plan with no authored face must not move the digest"
+        );
+    }
+
+    #[test]
+    fn authored_builtin_face_moves_the_digest() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(crate::spec::BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        let base = digest_for(&[(identity("p", None), spec.clone())]);
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), PackContentSpec::default())]),
+            "an authored built-in face is authored content"
+        );
+
+        let mut renamed = spec;
+        renamed.builtin_faces[0].faces[2] = Some(FaceSource::Authored("stone_top_v2".to_string()));
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), renamed)]),
+            "renaming the authored face file must move the digest"
         );
     }
 

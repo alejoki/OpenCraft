@@ -19,9 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::spec::{
-    BlockEntry, BlockPatch, ContentDiagnostic, FoodSpec, ItemEntry, PackAsset, PackContentSpec,
-    RecipeEntry, RecipePatch, Severity, TierEntry, ToolEntry, ToolKind, WorldgenEntry,
-    WorldgenKind,
+    face_direction, BlockEntry, BlockPatch, ContentDiagnostic, FaceSource, FoodSpec, ItemEntry,
+    PackAsset, PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry, ToolEntry, ToolKind,
+    WorldgenEntry, WorldgenKind,
 };
 use crate::vocabulary::{BLOCK_ID_NAMES, MATERIAL_ID_NAMES, TIER_ID_NAMES, TOOL_ID_NAMES};
 
@@ -574,58 +574,74 @@ pub fn build_catalog(
     // One diagnostic per (entry, path): `all` resolves to six identical faces
     // and a broken asset must not be reported six times.
     let mut reported_paths: BTreeSet<(String, String)> = BTreeSet::new();
-    for (id, (folder, entry)) in &block_entries {
-        let raw = block_ids[id];
-        let def_index = usize::from(raw);
-        for face in 0..6 {
-            let Some(path) = face_texture(&entry.textures, face) else {
-                error(
-                    &mut diagnostics,
-                    format!("block {id}"),
-                    format!("face {face} has no authored texture"),
-                );
-                blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
-                continue;
-            };
-            let key = (folder.to_string(), path.clone());
-            if !assets.contains_key(&key) {
-                if reported_paths.insert((id.to_string(), path.clone())) {
+    {
+        let mut faces = FaceAllocation {
+            assets: &assets,
+            pack_layers: &mut pack_layers,
+            pack_layer_sources: &mut pack_layer_sources,
+            layer_slots: &mut layer_slots,
+            reported_paths: &mut reported_paths,
+            diagnostics: &mut diagnostics,
+        };
+        for (id, (folder, entry)) in &block_entries {
+            let raw = block_ids[id];
+            let def_index = usize::from(raw);
+            for face in 0..6 {
+                let Some(path) = face_texture(&entry.textures, face) else {
                     error(
-                        &mut diagnostics,
+                        faces.diagnostics,
                         format!("block {id}"),
-                        format!("texture `{path}` is not a loaded asset"),
+                        format!("face {face} has no authored texture"),
                     );
-                }
-                blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
-                continue;
-            }
-            let layer = if let Some(existing) = layer_slots.get(&key) {
-                *existing
-            } else {
-                let slot = pack_layers.len();
-                if PACK_LAYER_BASE as usize + slot >= PACK_LAYER_CAP as usize {
-                    if reported_paths.insert((id.to_string(), path.clone())) {
-                        error(
-                            &mut diagnostics,
-                            format!("block {id}"),
-                            format!(
-                                "pack layer space exhausted at {PACK_LAYER_CAP}; `{path}` falls back to layer {PLACEHOLDER_BLOCK_LAYER}"
-                            ),
-                        );
-                    }
                     blocks[def_index].faces[face] = PLACEHOLDER_BLOCK_LAYER;
                     continue;
+                };
+                let layer = faces.allocate(folder, path, &format!("block {id}"));
+                blocks[def_index].faces[face] = layer.unwrap_or(PLACEHOLDER_BLOCK_LAYER);
+            }
+        }
+
+        // Loader-synthesized per-direction face plans for built-in blocks.
+        // They apply in stack order after pack-defined blocks, so a later
+        // pack's face wins without moving any pack-block layer index (still
+        // 48+i).
+        for (identity, spec) in packs {
+            let folder = identity.folder.as_str();
+            for entry in &spec.builtin_faces {
+                let label = format!("face {}", entry.block);
+                let Some(raw) = builtin_block_raw(&entry.block) else {
+                    error(
+                        faces.diagnostics,
+                        label,
+                        format!("`{}` is not a built-in block", entry.block),
+                    );
+                    continue;
+                };
+                let def_index = usize::from(raw);
+                for (face, source) in entry.faces.iter().enumerate() {
+                    match source {
+                        // Keep the built-in `face_tex_layer` default.
+                        None => {}
+                        // Existing fixed layer: no allocation, no content
+                        // entry.
+                        Some(FaceSource::Layer(layer)) => blocks[def_index].faces[face] = *layer,
+                        Some(FaceSource::Authored(path)) => {
+                            // Each authored face slot is an authored content
+                            // entry.
+                            entries += 1;
+                            let face_entry = match face_direction(face) {
+                                Some(direction) => {
+                                    format!("face {} {direction}", entry.block)
+                                }
+                                None => format!("face {} {face}", entry.block),
+                            };
+                            let layer = faces.allocate(folder, path, &face_entry);
+                            blocks[def_index].faces[face] =
+                                layer.unwrap_or(PLACEHOLDER_BLOCK_LAYER);
+                        }
+                    }
                 }
-                let layer = PACK_LAYER_BASE + slot as u8;
-                pack_layers.push(assets[&key].rgba.clone());
-                pack_layer_sources.push(LayerSource {
-                    folder: folder.to_string(),
-                    path: path.clone(),
-                });
-                layer_slots.insert(key, layer);
-                layer
-            };
-            blocks[def_index].faces[face] = layer;
+            }
         }
     }
 
@@ -693,6 +709,71 @@ pub fn build_catalog(
             diagnostics,
         },
     )
+}
+
+/// Mutable block-face layer allocation state for one pack-stack build.
+///
+/// Pack-defined block faces and loader-synthesized built-in faces share this
+/// state so `(folder, path)` deduplication, the `48 + i` slot order, the
+/// 160-layer budget and provenance all stay identical for both sources.
+struct FaceAllocation<'a> {
+    assets: &'a BTreeMap<(String, String), &'a PackAsset>,
+    pack_layers: &'a mut Vec<Vec<u8>>,
+    pack_layer_sources: &'a mut Vec<LayerSource>,
+    layer_slots: &'a mut BTreeMap<(String, String), u8>,
+    reported_paths: &'a mut BTreeSet<(String, String)>,
+    diagnostics: &'a mut Vec<ContentDiagnostic>,
+}
+
+impl FaceAllocation<'_> {
+    /// Allocate one block-face layer for an authored path.
+    ///
+    /// Returns `None` when the face must use [`PLACEHOLDER_BLOCK_LAYER`]: a
+    /// missing asset or an exhausted layer space records at most one
+    /// diagnostic per `(entry, path)` because `all` can feed six faces.
+    fn allocate(&mut self, folder: &str, path: &str, entry: &str) -> Option<u8> {
+        let key = (folder.to_string(), path.to_string());
+        if !self.assets.contains_key(&key) {
+            if self
+                .reported_paths
+                .insert((entry.to_string(), path.to_string()))
+            {
+                error(
+                    self.diagnostics,
+                    entry.to_string(),
+                    format!("texture `{path}` is not a loaded asset"),
+                );
+            }
+            return None;
+        }
+        if let Some(existing) = self.layer_slots.get(&key) {
+            return Some(*existing);
+        }
+        let slot = self.pack_layers.len();
+        if PACK_LAYER_BASE as usize + slot >= PACK_LAYER_CAP as usize {
+            if self
+                .reported_paths
+                .insert((entry.to_string(), path.to_string()))
+            {
+                error(
+                    self.diagnostics,
+                    entry.to_string(),
+                    format!(
+                        "pack layer space exhausted at {PACK_LAYER_CAP}; `{path}` falls back to layer {PLACEHOLDER_BLOCK_LAYER}"
+                    ),
+                );
+            }
+            return None;
+        }
+        let layer = PACK_LAYER_BASE + slot as u8;
+        self.pack_layers.push(self.assets[&key].rgba.clone());
+        self.pack_layer_sources.push(LayerSource {
+            folder: folder.to_string(),
+            path: path.to_string(),
+        });
+        self.layer_slots.insert(key, layer);
+        Some(layer)
+    }
 }
 
 /// Mutable icon-layer allocation state for one pack-stack build.
@@ -799,7 +880,9 @@ fn warning(
 mod tests {
     use super::super::EMPTY_DIGEST;
     use super::*;
-    use crate::spec::{BlockTextures, FoodSpec, ItemEntry, RecipeEntry, TierEntry, ToolEntry};
+    use crate::spec::{
+        BlockTextures, BuiltinFaceEntry, FoodSpec, ItemEntry, RecipeEntry, TierEntry, ToolEntry,
+    };
     use crate::vocabulary::RECIPE_ID_NAMES;
 
     fn identity(folder: &str) -> PackIdentity {
@@ -1049,6 +1132,141 @@ mod tests {
         assert_eq!(def.faces, [PACK_LAYER_BASE; 6]);
         assert_eq!(catalog.pack_layers()[0], vec![0x55u8; 1024]);
         assert_eq!(catalog.pack_layers().len(), 1);
+    }
+
+    #[test]
+    fn builtin_face_authored_top_allocates_48_and_records_its_source() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        spec.assets.insert("stone_top.png".to_string(), asset(0x77));
+
+        let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(report.entries, 1, "one authored face slot is one entry");
+        assert_eq!(
+            catalog
+                .block(3)
+                .expect("builtin stone stays registered")
+                .faces,
+            [0, 0, PACK_LAYER_BASE, 0, 0, 0],
+            "authored top allocates the first pack layer; other faces keep the default"
+        );
+        assert_eq!(catalog.pack_layers().len(), 1);
+        assert_eq!(catalog.pack_layers()[0], vec![0x77u8; 1024]);
+        assert_eq!(
+            catalog.pack_layer_sources(),
+            &[LayerSource {
+                folder: "p".to_string(),
+                path: "stone_top.png".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn builtin_authored_face_allocates_after_pack_block_faces() {
+        let mut spec = PackContentSpec::default();
+        spec.blocks.push(block_entry("mymod:alpha", "alpha.png"));
+        spec.assets.insert("alpha.png".to_string(), asset(0x11));
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        spec.assets.insert("stone_top.png".to_string(), asset(0x22));
+
+        let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(report.entries, 2, "pack block + authored built-in face");
+        assert_eq!(
+            catalog.block(24).expect("pack block").faces,
+            [PACK_LAYER_BASE; 6],
+            "pack-defined blocks still start at 48"
+        );
+        assert_eq!(
+            catalog.block(3).expect("builtin stone").faces[2],
+            PACK_LAYER_BASE + 1,
+            "a built-in authored face appends after pack-block layers"
+        );
+    }
+
+    #[test]
+    fn builtin_layer_face_assigns_without_allocating_or_counting() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                Some(FaceSource::Layer(20)),
+                None,
+                Some(FaceSource::Layer(21)),
+                Some(FaceSource::Layer(22)),
+                None,
+                Some(FaceSource::Layer(23)),
+            ],
+        });
+
+        let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+        assert_eq!(report.entries, 0, "Layer faces are not authored entries");
+        assert_eq!(catalog.pack_layers().len(), 0);
+        assert_eq!(
+            catalog.block(3).expect("builtin stone").faces,
+            [20, 0, 21, 22, 0, 23]
+        );
+    }
+
+    #[test]
+    fn builtin_face_unknown_block_records_one_error() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "not_a_block".to_string(),
+            faces: std::array::from_fn(|_| Some(FaceSource::Authored("x.png".to_string()))),
+        });
+
+        let (_catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
+        assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
+        assert_eq!(report.entries, 0, "a skipped entry allocates nothing");
+        assert_eq!(report.diagnostics[0].entry, "face not_a_block");
+    }
+
+    #[test]
+    fn builtin_face_missing_asset_uses_placeholder_and_reports_once_per_face_entry() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("missing.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+
+        let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);
+        assert_eq!(report.errors(), 1, "{:?}", report.diagnostics);
+        assert_eq!(report.diagnostics[0].entry, "face stone top");
+        assert_eq!(
+            catalog.block(3).expect("builtin stone").faces[2],
+            PLACEHOLDER_BLOCK_LAYER
+        );
+        assert_eq!(catalog.pack_layers().len(), 0);
     }
 
     #[test]

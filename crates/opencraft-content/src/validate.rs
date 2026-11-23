@@ -9,7 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::spec::{ContentDiagnostic, PackContentSpec, Severity, WorldgenEntry, WorldgenKind};
+use crate::spec::{
+    face_direction, ContentDiagnostic, FaceSource, PackContentSpec, Severity, WorldgenEntry,
+    WorldgenKind,
+};
 use crate::warning::PackWarning;
 
 /// Render stable output lines for one parsed pack.
@@ -129,6 +132,22 @@ fn content_entries(spec: &PackContentSpec) -> Vec<String> {
             .keys()
             .map(|name| format!("builtin_icon {name}")),
     );
+    // One entry per loader-synthesized authored built-in face. `Layer` faces
+    // reuse an existing base layer and are not authored content entries.
+    entries.extend(spec.builtin_faces.iter().flat_map(|entry| {
+        entry
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(face, source)| match source {
+                Some(FaceSource::Authored(_)) => Some(format!(
+                    "face {} {}",
+                    entry.block,
+                    face_direction(face).unwrap_or("unknown")
+                )),
+                Some(FaceSource::Layer(_)) | None => None,
+            })
+    }));
     entries
 }
 
@@ -145,7 +164,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::spec::{BlockEntry, BlockTextures, ItemEntry};
+    use crate::spec::{BlockEntry, BlockTextures, BuiltinFaceEntry, FaceSource, ItemEntry};
 
     fn block(id: &str) -> BlockEntry {
         BlockEntry {
@@ -298,6 +317,90 @@ mod tests {
         assert_eq!(
             last_line(&lines),
             "validate-pack: chain: 1 entries, 1 errors, 1 warnings"
+        );
+    }
+
+    #[test]
+    fn authored_builtin_face_renders_an_ok_entry() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+
+        let (lines, ok) = render_lines("faces", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(text.contains("ok: face stone top"), "{text}");
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: faces: 1 entries, 0 errors, 0 warnings",
+            "one authored face slot is one entry"
+        );
+    }
+
+    #[test]
+    fn layer_builtin_faces_add_no_entries() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: std::array::from_fn(|_| Some(FaceSource::Layer(20))),
+        });
+
+        let (lines, ok) = render_lines("layers", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(!text.contains("ok: face "), "{text}");
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: layers: 0 entries, 0 errors, 0 warnings"
+        );
+    }
+
+    #[test]
+    fn missing_authored_face_suppresses_its_ok_line() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("missing.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        // The registry build reports the failure under the same stable label
+        // the entry list uses, so the `ok:` line is suppressed.
+        let diagnostics = [diagnostic(
+            Severity::Error,
+            "face stone top",
+            "texture `missing.png` is not a loaded asset",
+        )];
+
+        let (lines, ok) = render_lines("faces", &spec, &diagnostics, &[]);
+        let text = lines.join("\n");
+        assert!(!ok, "{text}");
+        assert!(!text.contains("ok: face stone top"), "{text}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("error: face stone top:"))
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: faces: 1 entries, 1 errors, 0 warnings"
         );
     }
 
