@@ -12,47 +12,87 @@
 
 use std::sync::{Arc, OnceLock};
 
-use crate::content::{ContentRegistry, PLACEHOLDER_BLOCK_LAYER};
+use crate::content::{BlockAlpha, BlockModel, ContentRegistry, PLACEHOLDER_BLOCK_LAYER};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 
 /// One entry per face direction: +X, -X, +Y, -Y, +Z, -Z.
 const FACES_PER_BLOCK: usize = 6;
 
-/// Flat, immutable texture-array layer table for every registered block.
+/// Resolved per-block render class: which geometry to emit and how to blend it.
+///
+/// This mirrors the authored metadata on [`crate::content::BlockDef`] but is
+/// flattened per raw id so a mesher worker can classify a block without a
+/// registry borrow. The default is the historical cube/opaque pair.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RenderClass {
+    /// Geometry model to mesh for this block.
+    pub model: BlockModel,
+    /// Alpha mode the render pass must use for this block's faces.
+    pub alpha: BlockAlpha,
+}
+
+/// Flat, immutable texture-array layer and render-class table for every
+/// registered block.
 ///
 /// Entries are stored in raw-id order, so the lookup index is
-/// `block.to_raw() * 6 + face`. Unknown ids (raw past the table) and
-/// out-of-range face directions fall back to the reserved checker layer
-/// [`PLACEHOLDER_BLOCK_LAYER`] rather than indexing out of bounds or panicking
+/// `block.to_raw() * 6 + face` for layers and `block.to_raw()` for render
+/// classes. Unknown ids (raw past the table) and out-of-range face directions
+/// fall back to the reserved checker layer [`PLACEHOLDER_BLOCK_LAYER`] and the
+/// cube/opaque [`RenderClass`] rather than indexing out of bounds or panicking
 /// in a mesh worker.
 #[derive(Debug)]
 pub struct BlockFaces {
     layers: Box<[u8]>,
+    render: Box<[RenderClass]>,
 }
 
 impl BlockFaces {
     /// Flattens `registry`'s block definitions into a face-layer table.
     ///
     /// Every definition is included in raw-id order, placeholders included, so
-    /// the table length is exactly `registry.blocks().len() * 6` and a modded
-    /// id allocated by the registry resolves to its authored (or placeholder)
-    /// faces.
+    /// the layer table length is exactly `registry.blocks().len() * 6` and the
+    /// render table length is `registry.blocks().len()`. A modded id allocated
+    /// by the registry resolves to its authored (or placeholder) faces and its
+    /// authored render class.
     pub fn from_registry(registry: &ContentRegistry) -> BlockFaces {
-        let mut layers = vec![PLACEHOLDER_BLOCK_LAYER; registry.blocks().len() * FACES_PER_BLOCK];
+        let block_count = registry.blocks().len();
+        let mut layers = vec![PLACEHOLDER_BLOCK_LAYER; block_count * FACES_PER_BLOCK];
+        let mut render = vec![RenderClass::default(); block_count];
         for def in registry.blocks() {
             // Registry definitions are dense in raw-id order (built-ins first,
             // pack blocks and placeholders appended), so every start offset
             // lands inside the table. Placing by id rather than by iteration
             // index keeps the mapping correct even if that invariant ever
             // loosens, and a definition that does not fit simply cannot be
-            // addressed and falls back to the placeholder layer.
-            let start = usize::from(def.id.to_raw()) * FACES_PER_BLOCK;
+            // addressed and falls back to the placeholder layer / default
+            // render class.
+            let raw = usize::from(def.id.to_raw());
+            let start = raw * FACES_PER_BLOCK;
             if let Some(slot) = layers.get_mut(start..start + FACES_PER_BLOCK) {
                 slot.copy_from_slice(&def.faces);
+            }
+            if let Some(slot) = render.get_mut(raw) {
+                *slot = RenderClass {
+                    model: def.model,
+                    alpha: def.alpha,
+                };
             }
         }
         BlockFaces {
             layers: layers.into_boxed_slice(),
+            render: render.into_boxed_slice(),
+        }
+    }
+
+    /// Resolves a [`BlockId`] to its raw table index.
+    ///
+    /// A forged `Modded` payload below the built-in count is not a registry
+    /// index; `to_raw` also debug-asserts on it, so reject it first.
+    #[inline]
+    fn raw_index(block: BlockId) -> Option<usize> {
+        match block {
+            BlockId::Modded(raw) if raw < BUILTIN_BLOCK_COUNT => None,
+            other => Some(usize::from(other.to_raw())),
         }
     }
 
@@ -67,18 +107,37 @@ impl BlockFaces {
         if usize::from(face) >= FACES_PER_BLOCK {
             return PLACEHOLDER_BLOCK_LAYER;
         }
-        // A forged `Modded` payload below the built-in count is not a registry
-        // index; `to_raw` also debug-asserts on it, so reject it first.
-        let raw = match block {
-            BlockId::Modded(raw) if raw < BUILTIN_BLOCK_COUNT => {
-                return PLACEHOLDER_BLOCK_LAYER;
-            }
-            other => other.to_raw(),
+        let raw = match Self::raw_index(block) {
+            Some(raw) => raw,
+            None => return PLACEHOLDER_BLOCK_LAYER,
         };
         self.layers
-            .get(usize::from(raw) * FACES_PER_BLOCK + usize::from(face))
+            .get(raw * FACES_PER_BLOCK + usize::from(face))
             .copied()
             .unwrap_or(PLACEHOLDER_BLOCK_LAYER)
+    }
+
+    /// The render class (geometry model + alpha mode) for `block`.
+    ///
+    /// A forged raw id below the built-in count, or any raw id past the table,
+    /// returns the fail-closed default [`RenderClass`] (cube/opaque).
+    #[inline]
+    pub fn render(&self, block: BlockId) -> RenderClass {
+        Self::raw_index(block)
+            .and_then(|raw| self.render.get(raw).copied())
+            .unwrap_or_default()
+    }
+
+    /// The geometry model authored for `block`.
+    #[inline]
+    pub fn model(&self, block: BlockId) -> BlockModel {
+        self.render(block).model
+    }
+
+    /// The alpha mode authored for `block`.
+    #[inline]
+    pub fn alpha(&self, block: BlockId) -> BlockAlpha {
+        self.render(block).alpha
     }
 
     /// The number of face entries in the table (`blocks * 6`).
@@ -89,6 +148,19 @@ impl BlockFaces {
     /// Whether the table has no entries (a registry with no blocks).
     pub fn is_empty(&self) -> bool {
         self.layers.is_empty()
+    }
+
+    /// Builds a table directly from its flat parts.
+    ///
+    /// Test-only: mesher tests need a face/render table without standing up a
+    /// full [`ContentRegistry`]. Product code always goes through
+    /// [`BlockFaces::from_registry`].
+    #[cfg(test)]
+    pub(crate) fn from_parts(layers: Vec<u8>, render: Vec<RenderClass>) -> BlockFaces {
+        BlockFaces {
+            layers: layers.into_boxed_slice(),
+            render: render.into_boxed_slice(),
+        }
     }
 
     /// The built-in face table, built once per process and shared behind an
@@ -137,6 +209,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn builtin_render_classes_match_block_id_accessors_exhaustively() {
+        let faces = BlockFaces::builtin();
+        for raw in 0..BUILTIN_BLOCK_COUNT {
+            let block = BlockId::from_raw(raw);
+            assert_eq!(
+                faces.render(block),
+                RenderClass {
+                    model: block.model(),
+                    alpha: block.alpha(),
+                },
+                "render class drifted for {block:?}"
+            );
+            assert_eq!(faces.model(block), block.model(), "model for {block:?}");
+            assert_eq!(faces.alpha(block), block.alpha(), "alpha for {block:?}");
+        }
+        // The three non-default anchors the slice demo depends on.
+        assert_eq!(faces.model(BlockId::WheatStage0), BlockModel::Crop);
+        assert_eq!(faces.alpha(BlockId::WheatStage3), BlockAlpha::Cutout);
+        assert_eq!(faces.alpha(BlockId::OakLeaves), BlockAlpha::Cutout);
+        assert_eq!(faces.model(BlockId::OakLeaves), BlockModel::Cube);
+        assert_eq!(faces.alpha(BlockId::Glass), BlockAlpha::Blend);
+        assert_eq!(faces.model(BlockId::Glass), BlockModel::Cube);
     }
 
     #[test]
@@ -191,6 +288,98 @@ mod tests {
         assert_eq!(
             faces.layer(BlockId::OakLog, 2),
             BlockId::OakLog.face_tex_layer(2)
+        );
+    }
+
+    #[test]
+    fn pack_render_class_round_trips_through_the_table() {
+        let mut spec = PackContentSpec::default();
+        spec.assets.insert(
+            "fern.png".to_string(),
+            PackAsset {
+                rgba: vec![0x33; 1024],
+                source_side: 16,
+            },
+        );
+        spec.blocks.push(BlockEntry {
+            id: "mymod:fern".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("fern.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 0.2,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+            model: BlockModel::Cross,
+            alpha: BlockAlpha::Cutout,
+        });
+
+        let (registry, report) = build_registry(
+            ContentRegistry::builtin(),
+            &[(
+                PackIdentity {
+                    folder: "mymod".to_string(),
+                    version: None,
+                },
+                spec,
+            )],
+        );
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+
+        let id = BlockId::Modded(BUILTIN_BLOCK_COUNT);
+        let faces = BlockFaces::from_registry(&registry);
+        assert_eq!(
+            faces.render(id),
+            RenderClass {
+                model: BlockModel::Cross,
+                alpha: BlockAlpha::Cutout,
+            }
+        );
+        // Built-ins keep their authored classes in a mixed table.
+        assert_eq!(faces.model(BlockId::WheatStage1), BlockModel::Crop);
+        assert_eq!(faces.alpha(BlockId::Glass), BlockAlpha::Blend);
+    }
+
+    #[test]
+    fn unknown_ids_fall_back_to_cube_opaque_render_class() {
+        let faces = BlockFaces::builtin();
+        let default = RenderClass {
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
+        };
+        assert_eq!(faces.render(BlockId::Modded(BUILTIN_BLOCK_COUNT)), default);
+        assert_eq!(faces.render(BlockId::Modded(u16::MAX)), default);
+        // A forged modded payload aliasing a built-in must not borrow its class.
+        assert_eq!(faces.render(BlockId::Modded(0)), default);
+        assert_eq!(faces.model(BlockId::Modded(0)), BlockModel::Cube);
+        assert_eq!(faces.alpha(BlockId::Modded(0)), BlockAlpha::Opaque);
+    }
+
+    #[test]
+    fn from_parts_builds_a_lookup_table_without_a_registry() {
+        let class = RenderClass {
+            model: BlockModel::Cross,
+            alpha: BlockAlpha::Cutout,
+        };
+        let faces = BlockFaces::from_parts(
+            vec![7; 6 * usize::from(BUILTIN_BLOCK_COUNT)],
+            vec![class; usize::from(BUILTIN_BLOCK_COUNT)],
+        );
+        assert_eq!(faces.len(), 6 * usize::from(BUILTIN_BLOCK_COUNT));
+        assert!(!faces.is_empty());
+        for face in 0u8..6 {
+            assert_eq!(faces.layer(BlockId::Stone, face), 7);
+        }
+        // Every built-in slot resolves to the supplied class; a forged
+        // Modded(0) cannot read the built-in Stone slot.
+        assert_eq!(faces.render(BlockId::Stone), class);
+        assert_eq!(faces.render(BlockId::WheatStage0), class);
+        assert_eq!(faces.render(BlockId::Modded(0)), RenderClass::default());
+        assert_eq!(
+            faces.render(BlockId::Modded(BUILTIN_BLOCK_COUNT)),
+            RenderClass::default()
         );
     }
 

@@ -273,8 +273,8 @@ impl BlockDef {
             drop,
             tool_class: tools::block_tool_class(id),
             stack_limit,
-            model: BlockModel::Cube,
-            alpha: BlockAlpha::Opaque,
+            model: id.model(),
+            alpha: id.alpha(),
             placeholder: false,
         })
     }
