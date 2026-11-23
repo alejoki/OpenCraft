@@ -20,6 +20,7 @@ use crate::settings::SettingsWarning;
 
 pub mod asset;
 pub mod decode;
+pub mod faces;
 pub mod manifest;
 pub mod presentation;
 pub mod resample;
@@ -310,6 +311,7 @@ mod tests {
         read_pack_toml(
             &dir,
             r#"
+format_version = 3
 name = "Test Pack"
 description = "A pack authored in a headless test"
 unknown_key = "ignored"
@@ -409,7 +411,7 @@ whatever = true
     }
 
     #[test]
-    fn missing_manifest_warns_once_and_still_loads() {
+    fn missing_manifest_is_rejected_with_one_warning_naming_the_pack() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "manifestless");
 
@@ -417,7 +419,12 @@ whatever = true
         let procedural = procedural_layers();
 
         assert_eq!(pack.warnings.len(), 1);
-        assert_eq!(pack.warnings[0].field, "pack.toml");
+        assert_eq!(pack.warnings[0].field, "manifestless");
+        assert!(
+            pack.warnings[0].reason.contains("format_version 1"),
+            "the rejection names the missing version: {}",
+            pack.warnings[0].reason
+        );
         assert_eq!(pack.layers, procedural);
         assert_eq!(
             pack.layers.len(),
@@ -431,15 +438,17 @@ whatever = true
     }
 
     #[test]
-    fn syntax_corrupt_manifest_warns_once_and_uses_defaults() {
+    fn syntax_corrupt_manifest_is_rejected_and_never_loads_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "broken-manifest");
         read_pack_toml(&dir, "name = [unterminated\n[[menu");
+        write_png(&dir.join(LAYER_FILES[3]), 16);
 
         let pack = load_pack_from_dir(&dir);
 
         assert_eq!(pack.warnings.len(), 1);
-        assert_eq!(pack.warnings[0].field, "pack.toml");
+        assert_eq!(pack.warnings[0].field, "broken-manifest");
+        assert!(pack.warnings[0].reason.contains("format_version 1"));
         assert_eq!(pack.layers, procedural_layers());
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -475,7 +484,7 @@ whatever = true
     fn load_pack_by_name_delegates_to_from_dir_for_existing_packs() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "real");
-        read_pack_toml(&dir, "name = \"Real Pack\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Real Pack\"\n");
         write_png(&dir.join(LAYER_FILES[3]), 16);
 
         let by_name = load_pack_by_name(root.path(), "real");
@@ -490,7 +499,7 @@ whatever = true
     fn missing_logo_file_warns_and_keeps_none() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-logo");
-        read_pack_toml(&dir, "[menu]\nlogo = \"absent.png\"\n");
+        read_pack_toml(&dir, "format_version = 3\n[menu]\nlogo = \"absent.png\"\n");
 
         let pack = load_pack_from_dir(&dir);
 
@@ -502,7 +511,7 @@ whatever = true
     fn non_square_logo_keeps_native_size() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "wide-logo");
-        read_pack_toml(&dir, "[menu]\nlogo = \"wide.png\"\n");
+        read_pack_toml(&dir, "format_version = 3\n[menu]\nlogo = \"wide.png\"\n");
         write_png_sized(&dir.join("wide.png"), 32, 16);
 
         let pack = load_pack_from_dir(&dir);
@@ -592,7 +601,7 @@ whatever = true
     fn legacy_sixteen_file_pack_keeps_new_and_reserved_layers_built_in() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "legacy16");
-        read_pack_toml(&dir, "name = \"Legacy 16\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Legacy 16\"\n");
         for file in LAYER_FILES.iter().take(16) {
             write_png(&dir.join(file), 16);
         }
@@ -638,7 +647,7 @@ whatever = true
     fn authoring_all_twenty_five_names_overrides_every_authorable_layer() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "full25");
-        read_pack_toml(&dir, "name = \"Full 25\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Full 25\"\n");
         for file in LAYER_FILES.iter() {
             write_png(&dir.join(file), 32);
         }
@@ -677,7 +686,7 @@ whatever = true
     fn reserved_layer_file_names_are_ignored_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "reserved-names");
-        read_pack_toml(&dir, "name = \"Reserved\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Reserved\"\n");
         // Neither the first nor the last reserved layer can be overridden,
         // and the spare block range stays non-authorable too.
         for file in ["reserved_26.png", "reserved_31.png", "reserved_45.png"] {
@@ -698,7 +707,7 @@ whatever = true
     fn invalid_new_layer_warns_with_bare_file_name_and_falls_back() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-new-layer");
-        read_pack_toml(&dir, "name = \"Bad New Layer\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad New Layer\"\n");
         fs::write(dir.join(LAYER_FILES[16]), b"not a png").unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -720,7 +729,7 @@ whatever = true
     fn oversized_ihdr_layer_warns_and_falls_back() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "hostile");
-        read_pack_toml(&dir, "name = \"Hostile\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Hostile\"\n");
         fs::write(dir.join(LAYER_FILES[3]), png_bomb_bytes(30000, 30000)).unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -739,7 +748,7 @@ whatever = true
     fn crafting_table_files_override_only_their_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "crafting-table");
-        read_pack_toml(&dir, "name = \"Crafting Table\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Crafting Table\"\n");
         write_png(&dir.join("crafting_table_top.png"), 32);
         write_png(&dir.join("crafting_table_side.png"), 64);
 
@@ -771,7 +780,7 @@ whatever = true
     fn missing_crafting_table_files_keep_procedural_art_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-table-art");
-        read_pack_toml(&dir, "name = \"No Table Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"No Table Art\"\n");
 
         let pack = load_pack_from_dir(&dir);
         let procedural = procedural_layers();
@@ -789,7 +798,7 @@ whatever = true
     fn corrupt_crafting_table_files_warn_once_with_bare_name() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-table-art");
-        read_pack_toml(&dir, "name = \"Bad Table Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Table Art\"\n");
         fs::write(dir.join("crafting_table_top.png"), b"not a png").unwrap();
         fs::write(dir.join("crafting_table_side.png"), b"still not a png").unwrap();
 
@@ -843,7 +852,7 @@ whatever = true
     fn mob_pack_overrides_each_part_per_file() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "mob-parts");
-        read_pack_toml(&dir, "name = \"Mob Parts\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Mob Parts\"\n");
 
         // pig_body -> 32, cow_head -> 36, skeleton_leg -> 43.
         let overrides: [(usize, u32); 3] = [(0, 32), (4, 64), (11, 32)];
@@ -898,7 +907,7 @@ whatever = true
     fn missing_mob_file_falls_back_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-mob-art");
-        read_pack_toml(&dir, "name = \"No Mob Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"No Mob Art\"\n");
         // One block file proves the loader ran; every mob file is absent.
         write_png(&dir.join(LAYER_FILES[0]), 16);
 
@@ -919,7 +928,7 @@ whatever = true
     fn corrupt_mob_file_warns_with_bare_name() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-mob");
-        read_pack_toml(&dir, "name = \"Bad Mob\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Mob\"\n");
         fs::write(dir.join(MOB_LAYER_FILES[4]), b"not a png").unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -943,7 +952,7 @@ whatever = true
     fn layer_at_256_boundary_is_accepted() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "boundary");
-        read_pack_toml(&dir, "name = \"Boundary\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Boundary\"\n");
         write_png(&dir.join(LAYER_FILES[0]), 256);
 
         let pack = load_pack_from_dir(&dir);

@@ -20,9 +20,9 @@ use crate::pack::spec::load_spec_from_dir;
 /// Validate one pack folder under `packs_root` and render stable output lines.
 ///
 /// Returns `(lines, ok)` where `ok` is true only when no error diagnostics were
-/// found. Warning-level problems (manifest fallbacks, corrupt texture PNGs,
-/// v1 packs that declare content arrays) never fail validation; rejected
-/// entries and missing packs do.
+/// found. Warning-level problems (manifest fallbacks, corrupt texture PNGs)
+/// never fail validation; rejected formats, rejected entries and missing packs
+/// do.
 ///
 /// A missing or non-directory `packs_root/name` is always an error. An empty
 /// name is treated the same way so a `--validate-pack` typo fails closed
@@ -114,13 +114,13 @@ mod tests {
     }
 
     #[test]
-    fn clean_v2_pack_reports_ok_entries_and_summary() {
+    fn clean_v3_pack_reports_ok_entries_and_summary() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "ruby");
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 
 [[blocks]]
@@ -162,7 +162,7 @@ stack = 64
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 
 [[blocks]]
 id = "broken:missing_art"
@@ -220,7 +220,7 @@ stack = 16
     }
 
     #[test]
-    fn v1_manifest_only_pack_validates_cleanly() {
+    fn v1_manifest_is_rejected_by_name() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "classic");
         write_manifest(
@@ -230,15 +230,49 @@ stack = 16
 
         let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "classic");
         let text = lines_joined(&lines);
-        assert!(ok, "v1 packs keep validating: {text}");
+        assert!(!ok, "v1 is no longer accepted: {text}");
         assert!(
-            text.contains("validate-pack: classic: 0 entries, 0 errors, 0 warnings"),
+            lines
+                .iter()
+                .any(|line| line.starts_with("error: pack classic:")),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "format_version 1 is not supported; every pack must declare format_version = 3"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("validate-pack: classic: 0 entries, 1 errors, 0 warnings"),
             "{text}"
         );
     }
 
     #[test]
-    fn v1_pack_with_content_array_warns_but_still_succeeds() {
+    fn v2_manifest_is_rejected_by_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "old2");
+        write_manifest(&dir, "format_version = 2\nname = \"Old 2\"\n");
+
+        let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "old2");
+        let text = lines_joined(&lines);
+        assert!(!ok, "v2 is rejected: {text}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("error: pack old2:")),
+            "{text}"
+        );
+        assert!(text.contains("format_version 2 is not supported"), "{text}");
+        assert!(
+            text.contains("validate-pack: old2: 0 entries, 1 errors, 0 warnings"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn v1_pack_with_content_array_is_rejected_before_parsing() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "legacy");
         write_manifest(
@@ -255,13 +289,14 @@ hardness = 1.0
 
         let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "legacy");
         let text = lines_joined(&lines);
-        assert!(ok, "a warning must not fail validation: {text}");
+        assert!(!ok, "the format gate fails validation: {text}");
         assert!(
-            text.contains("warning: pack.toml: content arrays require format_version = 2"),
+            text.contains("error: pack legacy: format_version 1 is not supported"),
             "{text}"
         );
+        assert!(!text.contains("ok: block legacy:ore"), "{text}");
         assert!(
-            text.contains("validate-pack: legacy: 0 entries, 0 errors, 1 warnings"),
+            text.contains("validate-pack: legacy: 0 entries, 1 errors, 0 warnings"),
             "{text}"
         );
     }
@@ -273,7 +308,7 @@ hardness = 1.0
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 
 [[items]]
 id = "sorted:z_item"
@@ -315,7 +350,7 @@ hardness = 2.0
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 name = "Icons"
 
 [builtin_icons]
@@ -344,7 +379,7 @@ wood_pickaxe = "pickaxe.png"
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 
 [builtin_icons]
 apple = "missing.png"
@@ -370,7 +405,7 @@ apple = "missing.png"
     }
 
     #[test]
-    fn oversized_manifest_warns_but_exits_ok() {
+    fn oversized_manifest_is_rejected_with_its_read_warning() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "huge");
         fs::write(
@@ -381,17 +416,20 @@ apple = "missing.png"
 
         let (lines, ok) = validate_pack_lines(&root.path().join("packs"), "huge");
         let text = lines_joined(&lines);
-        assert!(ok, "an oversized manifest must not fail validation: {text}");
+        assert!(!ok, "an unreadable manifest cannot declare v3: {text}");
         assert!(
             lines
                 .iter()
                 .any(|line| line.starts_with("warning: pack.toml:")),
             "the manifest fallback is explained: {text}"
         );
-        assert!(!text.contains("error:"), "{text}");
+        assert!(
+            text.contains("error: pack huge: format_version 1 is not supported"),
+            "{text}"
+        );
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("validate-pack: huge: 0 entries, 0 errors, 1 warnings"),
+            Some("validate-pack: huge: 0 entries, 1 errors, 1 warnings"),
             "{text}"
         );
     }
@@ -403,7 +441,7 @@ apple = "missing.png"
         write_manifest(
             &dir,
             r#"
-format_version = 2
+format_version = 3
 
 [[blocks]]
 id = "broken:truncated"

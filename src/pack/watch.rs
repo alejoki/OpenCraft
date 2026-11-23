@@ -352,6 +352,7 @@ mod tests {
             content: PackContentSpec::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
+            rejected: None,
         }
     }
 
@@ -389,7 +390,7 @@ mod tests {
         }
 
         let mut spec = blank_spec(folder);
-        spec.format_version = manifest::PackFormat::V2;
+        spec.format_version = manifest::PackFormat::V3;
         spec.content = content.clone();
 
         let identity = PackIdentity {

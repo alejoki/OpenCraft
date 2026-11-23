@@ -592,7 +592,7 @@ mod tests {
     fn blank_spec(folder: &str) -> PackSpec {
         PackSpec {
             folder: folder.to_string(),
-            format_version: manifest::PackFormat::V1,
+            format_version: manifest::PackFormat::V3,
             version: None,
             manifest: manifest::PackManifest::default(),
             block_layers: vec![None; AUTHORABLE_TEX_LAYERS],
@@ -602,6 +602,7 @@ mod tests {
             content: PackContentSpec::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
+            rejected: None,
         }
     }
 
@@ -890,8 +891,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let earlier = pack_dir(&root, "earlier");
         let later = pack_dir(&root, "later");
-        fs::write(earlier.join("pack.toml"), "name = \"Earlier\"\n").unwrap();
-        fs::write(later.join("pack.toml"), "name = \"Later\"\n").unwrap();
+        fs::write(
+            earlier.join("pack.toml"),
+            "format_version = 3\nname = \"Earlier\"\n",
+        )
+        .unwrap();
+        fs::write(
+            later.join("pack.toml"),
+            "format_version = 3\nname = \"Later\"\n",
+        )
+        .unwrap();
 
         authored_layer(&earlier, LAYER_FILES[3], 32);
         authored_layer(&earlier, MOB_LAYER_FILES[0], 16);

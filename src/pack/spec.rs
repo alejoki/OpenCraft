@@ -15,11 +15,12 @@
 
 use std::path::Path;
 
-use crate::content::spec::{ContentDiagnostic, PackContentSpec};
+use crate::content::spec::{ContentDiagnostic, PackContentSpec, Severity};
 use crate::pack::asset;
 use crate::pack::decode;
+use crate::pack::faces;
 use crate::pack::manifest;
-use crate::pack::manifest::{PackFormat, PackWarning};
+use crate::pack::manifest::{format_gate_error, PackFormat, PackWarning};
 use crate::pack::sound;
 pub use crate::pack::sound::SoundSpec;
 use crate::pack::v3;
@@ -64,28 +65,35 @@ pub struct PackSpec {
     /// Parsed v1 manifest fields (`None` = unauthored).
     pub manifest: manifest::PackManifest,
     /// Authored block layers, index-aligned with [`LAYER_FILES`].
+    /// Empty for a rejected pack.
     pub block_layers: Vec<Option<Vec<u8>>>,
     /// Authored mob part layers, index-aligned with [`MOB_LAYER_FILES`].
+    /// Empty for a rejected pack.
     pub mob_layers: Vec<Option<Vec<u8>>>,
     /// Logo decoded at native size, when authored and valid.
     pub logo: Option<PackLogo>,
     /// Authored sound presence.
     pub sound: SoundSpec,
-    /// Accepted v2 content entries (empty for v1 packs).
+    /// Accepted v3 content entries (empty for rejected packs).
     pub content: PackContentSpec,
-    /// Rejected v2 entries and asset failures (empty for v1 packs).
+    /// Rejected v3 entries and asset failures (empty for accepted packs
+    /// without problems).
     pub diagnostics: Vec<ContentDiagnostic>,
     /// Manifest/layer/logo fallbacks, in the v1 warning order.
     pub warnings: Vec<PackWarning>,
+    /// One pack-level [format gate](format_gate_error) reason when this pack
+    /// is not v3. A rejected spec has no layers, assets, logo or sound and is
+    /// never applied to the session registry.
+    pub rejected: Option<String>,
 }
 
 /// Read one pack directory into authored presence only.
 ///
 /// Missing files stay `None` silently. A file that exists but fails to decode,
 /// is non-square, or is outside 16..=256 pixels stays `None` and emits exactly
-/// one warning whose `field` is the bare file name — byte-for-byte the v1
-/// [`crate::pack::load_pack_from_dir`] semantics. A missing or unreadable
+/// one warning whose `field` is the bare file name. A missing or unreadable
 /// `pack.toml` yields the default manifest plus one warning naming the path.
+/// A pack that is not v3 is returned rejected before any file is decoded.
 pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     let mut warnings = Vec::new();
 
@@ -102,10 +110,36 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     };
     warnings.append(&mut manifest_warnings);
 
-    // The v3 gate owns the format_version gate: every pack must declare 3, so
-    // V1, V2 and future versions yield one pack-level error and no content.
-    // A syntactically invalid manifest has no root and produced its own
-    // warning above.
+    let folder = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| "Unnamed Pack".to_string());
+
+    // The format gate runs before any decoding: V3 is the only accepted
+    // format, and every other declared/absent/corrupt version yields one
+    // pack-level error with no layers, assets, logo or sound applied.
+    if let Some(reason) = format_gate_error(manifest.format_version) {
+        return PackSpec {
+            folder,
+            format_version: manifest.format_version,
+            version: manifest.version.clone(),
+            manifest,
+            block_layers: Vec::new(),
+            mob_layers: Vec::new(),
+            logo: None,
+            sound: SoundSpec::default(),
+            content: PackContentSpec::default(),
+            diagnostics: vec![ContentDiagnostic {
+                severity: Severity::Error,
+                entry: "pack".to_string(),
+                reason: reason.clone(),
+            }],
+            warnings,
+            rejected: Some(reason),
+        };
+    }
+
     let (mut content, content_warnings, mut diagnostics) = match &root {
         Some(root) => v3::parse_content(root, manifest.format_version),
         None => (PackContentSpec::default(), Vec::new(), Vec::new()),
@@ -113,9 +147,7 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
     // The parser already speaks the neutral warning type, so the v3 gate's
     // warnings append unchanged and every authored fallback keeps one order.
     warnings.extend(content_warnings);
-    if manifest.format_version == PackFormat::V3 {
-        v3::load_content_assets(dir, &mut content, &mut diagnostics);
-    }
+    v3::load_content_assets(dir, &mut content, &mut diagnostics);
 
     // Warning order mirrors v1: manifest, then block layers, then mob layers,
     // then the logo. Missing files stay silent.
@@ -129,13 +161,7 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
         .collect();
     let logo = load_logo(dir, manifest.logo.as_deref(), &mut warnings);
 
-    let folder = dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| "Unnamed Pack".to_string());
-
-    PackSpec {
+    let mut spec = PackSpec {
         folder,
         format_version: manifest.format_version,
         version: manifest.version.clone(),
@@ -147,7 +173,15 @@ pub fn load_spec_from_dir(dir: &Path) -> PackSpec {
         content,
         diagnostics,
         warnings,
-    }
+        rejected: None,
+    };
+
+    // Loader-synthesized six-face overrides for built-in blocks. Only a live
+    // v3 pack reaches this point, and the plan is derived from the flat folder
+    // after the content assets have already been decoded.
+    faces::apply_builtin_faces(dir, &mut spec);
+
+    spec
 }
 
 /// Decode one optional layer file into resampled 16x16 RGBA bytes.
@@ -216,6 +250,18 @@ pub fn resolve_presentation(specs: &[PackSpec]) -> LoadedPack {
     let mut warnings = Vec::new();
 
     for spec in specs {
+        if let Some(reason) = &spec.rejected {
+            // A rejected pack never contributes layers, presentation fields or
+            // names. Its single warning names the folder for the menu/CLI;
+            // the manifest field warnings remain available for
+            // `--validate-pack`, which reads them from the spec directly.
+            warnings.push(SettingsWarning {
+                field: spec.folder.clone(),
+                reason: reason.clone(),
+            });
+            continue;
+        }
+
         debug_assert_eq!(spec.block_layers.len(), AUTHORABLE_TEX_LAYERS);
         debug_assert_eq!(spec.mob_layers.len(), MOB_AUTHORABLE_TEX_LAYERS);
 
@@ -245,6 +291,13 @@ pub fn resolve_presentation(specs: &[PackSpec]) -> LoadedPack {
     }
 
     let display_name = display_name
+        .or_else(|| {
+            specs
+                .iter()
+                .rev()
+                .find(|spec| spec.rejected.is_none())
+                .map(|spec| spec.folder.clone())
+        })
         .or_else(|| specs.last().map(|spec| spec.folder.clone()))
         .unwrap_or_else(|| "Unnamed Pack".to_string());
 
@@ -285,6 +338,15 @@ pub fn load_stack(
         }
 
         let spec = load_spec_from_dir(&dir);
+        if let Some(reason) = &spec.rejected {
+            // Rejected packs name themselves once and never reach the session
+            // registry.
+            warnings.push(SettingsWarning {
+                field: name.clone(),
+                reason: reason.clone(),
+            });
+            continue;
+        }
         warnings.extend(spec.warnings.iter().cloned().map(SettingsWarning::from));
         specs.push(spec);
     }
@@ -405,6 +467,7 @@ mod tests {
         fs::write(
             earlier.join("pack.toml"),
             r#"
+format_version = 3
 name = "Pack A"
 description = "earlier art"
 
@@ -420,7 +483,7 @@ overlay_tint = [10, 20, 30, 40]
         write_png_data(&earlier.join("logo.png"), 24, 24, &logo_data);
 
         // The later pack authors exactly one PNG and no presentation fields.
-        fs::write(later.join("pack.toml"), "").unwrap();
+        fs::write(later.join("pack.toml"), "format_version = 3\n").unwrap();
         let later_dirt = authored_layer(&later, "dirt.png", 64);
 
         let specs = vec![load_spec_from_dir(&earlier), load_spec_from_dir(&later)];
@@ -471,14 +534,14 @@ overlay_tint = [10, 20, 30, 40]
 
         fs::write(
             earlier.join("pack.toml"),
-            "name = \"Pack A\"\ndescription = \"from A\"\n",
+            "format_version = 3\nname = \"Pack A\"\ndescription = \"from A\"\n",
         )
         .unwrap();
         let earlier_stone = authored_layer(&earlier, "stone.png", 16);
 
         fs::write(
             later.join("pack.toml"),
-            "name = \"Pack B\"\n[menu]\noverlay_tint = [1, 2, 3, 4]\n",
+            "format_version = 3\nname = \"Pack B\"\n[menu]\noverlay_tint = [1, 2, 3, 4]\n",
         )
         .unwrap();
         let later_stone = authored_layer(&later, "stone.png", 32);
@@ -501,9 +564,9 @@ overlay_tint = [10, 20, 30, 40]
         let a = pack_dir(&root, "a");
         let b = pack_dir(&root, "b");
 
-        fs::write(a.join("pack.toml"), "name = \"A\"\n").unwrap();
+        fs::write(a.join("pack.toml"), "format_version = 3\nname = \"A\"\n").unwrap();
         let a_stone = authored_layer(&a, "stone.png", 16);
-        fs::write(b.join("pack.toml"), "name = \"B\"\n").unwrap();
+        fs::write(b.join("pack.toml"), "format_version = 3\nname = \"B\"\n").unwrap();
         let b_stone = authored_layer(&b, "stone.png", 32);
         assert_ne!(a_stone, b_stone, "fixtures must be distinguishable");
 
@@ -527,6 +590,7 @@ overlay_tint = [10, 20, 30, 40]
         fs::write(
             dir.join("pack.toml"),
             r#"
+format_version = 3
 name = "Mixed"
 description = "mixed fixture"
 
@@ -572,7 +636,11 @@ overlay_tint = [9, 8, 7, 6]
     fn missing_stack_member_warns_once_and_keeps_display_name() {
         let root = tempfile::tempdir().unwrap();
         let present = pack_dir(&root, "present");
-        fs::write(present.join("pack.toml"), "name = \"Present\"\n").unwrap();
+        fs::write(
+            present.join("pack.toml"),
+            "format_version = 3\nname = \"Present\"\n",
+        )
+        .unwrap();
         let stone = authored_layer(&present, "stone.png", 16);
 
         let stack = vec!["ghost".to_string(), "present".to_string()];
@@ -617,8 +685,8 @@ overlay_tint = [9, 8, 7, 6]
         let root = tempfile::tempdir().unwrap();
         let earlier = pack_dir(&root, "earlier");
         let later = pack_dir(&root, "later");
-        fs::write(earlier.join("pack.toml"), "").unwrap();
-        fs::write(later.join("pack.toml"), "").unwrap();
+        fs::write(earlier.join("pack.toml"), "format_version = 3\n").unwrap();
+        fs::write(later.join("pack.toml"), "format_version = 3\n").unwrap();
 
         let earlier_break = ramp(64);
         fs::write(
@@ -682,14 +750,14 @@ overlay_tint = [9, 8, 7, 6]
     }
 
     #[test]
-    fn v2_fixture_loads_content_assets_and_diagnostics() {
+    fn v3_fixture_loads_content_assets_and_diagnostics() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "ruby");
 
         fs::write(
             dir.join("pack.toml"),
             r#"
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -713,7 +781,8 @@ icon = "ruby_ore.png"
 
         let spec = load_spec_from_dir(&dir);
 
-        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V2);
+        assert!(spec.rejected.is_none());
+        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V3);
         assert_eq!(spec.version.as_deref(), Some("1.0.0"));
         assert_eq!(spec.content.blocks.len(), 1);
         assert_eq!(spec.content.blocks[0].id, "mymod:ruby_ore");
@@ -732,7 +801,7 @@ icon = "ruby_ore.png"
     }
 
     #[test]
-    fn v1_fixture_keeps_content_empty_and_adds_no_warnings() {
+    fn v1_fixture_is_rejected_without_reading_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "plain");
         fs::write(dir.join("pack.toml"), "name = \"Plain\"\n").unwrap();
@@ -742,16 +811,22 @@ icon = "ruby_ore.png"
 
         assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V1);
         assert_eq!(
+            spec.rejected.as_deref(),
+            Some("format_version 1 is not supported; every pack must declare format_version = 3")
+        );
+        assert_eq!(
             spec.content,
             crate::content::spec::PackContentSpec::default()
         );
-        assert!(spec.diagnostics.is_empty());
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert_eq!(spec.diagnostics[0].entry, "pack");
+        assert_eq!(spec.diagnostics[0].severity, Severity::Error);
         assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
-        assert!(spec.block_layers[3].is_some());
+        assert!(spec.block_layers.is_empty(), "no layer is decoded");
     }
 
     #[test]
-    fn v1_content_array_warns_once_and_keeps_textures() {
+    fn v1_content_array_is_rejected_before_parsing() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "legacy");
         fs::write(
@@ -771,18 +846,42 @@ hardness = 1.0
         let spec = load_spec_from_dir(&dir);
 
         assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V1);
+        assert!(spec.rejected.is_some());
         assert!(spec.content.blocks.is_empty());
-        assert!(spec.diagnostics.is_empty());
-        assert!(spec.block_layers[3].is_some());
-        assert_eq!(spec.warnings.len(), 1);
-        assert_eq!(spec.warnings[0].field, "pack.toml");
-        assert!(spec.warnings[0]
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert_eq!(spec.diagnostics[0].entry, "pack");
+        assert!(spec.diagnostics[0]
             .reason
-            .contains("content arrays require format_version = 2"));
+            .contains("format_version 1 is not supported"));
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+        assert!(spec.block_layers.is_empty());
     }
 
     #[test]
-    fn oversized_manifest_warns_once_and_uses_defaults() {
+    fn v2_fixture_is_rejected_by_the_format_gate() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "old2");
+        fs::write(
+            dir.join("pack.toml"),
+            "format_version = 2\nname = \"Old 2\"\n",
+        )
+        .unwrap();
+        write_png(&dir.join("stone.png"), 16);
+
+        let spec = load_spec_from_dir(&dir);
+
+        assert_eq!(spec.format_version, crate::pack::manifest::PackFormat::V2);
+        assert_eq!(
+            spec.rejected.as_deref(),
+            Some("format_version 2 is not supported; every pack must declare format_version = 3")
+        );
+        assert!(spec.block_layers.is_empty());
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert_eq!(spec.diagnostics[0].entry, "pack");
+    }
+
+    #[test]
+    fn oversized_manifest_is_rejected_with_its_read_warning() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "huge");
         fs::write(
@@ -814,19 +913,25 @@ hardness = 1.0
             crate::pack::manifest::PackFormat::V1,
             "an unreadable manifest falls back to defaults"
         );
+        assert!(spec.rejected.is_some());
         assert!(spec.content.blocks.is_empty());
         assert!(spec.content.items.is_empty());
         assert!(spec.content.builtin_icons.is_empty());
-        assert!(spec.diagnostics.is_empty());
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert_eq!(spec.diagnostics[0].entry, "pack");
         assert_eq!(spec.folder, "huge", "the folder name is the display name");
-        assert!(spec.block_layers.iter().all(Option::is_none));
+        assert!(spec.block_layers.is_empty());
     }
 
     #[test]
     fn logo_path_escape_warns_and_never_reads_outside() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "escape");
-        fs::write(dir.join("pack.toml"), "[menu]\nlogo = \"../outside.png\"\n").unwrap();
+        fs::write(
+            dir.join("pack.toml"),
+            "format_version = 3\n[menu]\nlogo = \"../outside.png\"\n",
+        )
+        .unwrap();
         write_png(&root.path().join("outside.png"), 16);
 
         let spec = load_spec_from_dir(&dir);
@@ -838,13 +943,13 @@ hardness = 1.0
     }
 
     #[test]
-    fn future_format_warns_once_and_still_loads_textures() {
+    fn future_format_is_rejected_without_loading_textures() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "future");
         fs::write(
             dir.join("pack.toml"),
             r#"
-format_version = 3
+format_version = 4
 name = "From The Future"
 
 [[blocks]]
@@ -860,16 +965,33 @@ hardness = 1.0
 
         assert_eq!(
             spec.format_version,
-            crate::pack::manifest::PackFormat::Future(3)
+            crate::pack::manifest::PackFormat::Future(4)
         );
+        assert!(spec.rejected.is_some());
         assert!(spec.content.blocks.is_empty());
-        assert!(spec.diagnostics.is_empty());
-        assert!(
-            spec.block_layers[3].is_some(),
-            "v1 texture loading continues"
-        );
-        assert_eq!(spec.warnings.len(), 1);
-        assert!(spec.warnings[0].reason.contains("newer than 2"));
+        assert_eq!(spec.diagnostics.len(), 1);
+        assert_eq!(spec.diagnostics[0].entry, "pack");
+        assert!(spec.diagnostics[0].reason.contains("newer than this build"));
+        assert!(spec.warnings.is_empty(), "{:?}", spec.warnings);
+        assert!(spec.block_layers.is_empty(), "no texture loading");
+    }
+
+    #[test]
+    fn rejected_stack_member_names_itself_once_and_is_not_applied() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "old");
+        fs::write(dir.join("pack.toml"), "name = \"old\"\n").unwrap();
+
+        let (pack, specs, warnings) =
+            load_stack(root.path(), &["old".to_string(), "ghost".to_string()]);
+
+        assert!(specs.is_empty());
+        assert_eq!(warning_fields(&warnings), vec!["old", "ghost"]);
+        assert!(warnings[0].reason.contains("format_version 1"));
+        assert!(warnings[1].reason.contains("missing"));
+        assert_eq!(pack.layers, generate_all_texture_layers_rgba());
+        assert_eq!(pack.display_name, "ghost");
+        assert_eq!(pack.warnings, warnings);
     }
 
     #[test]
