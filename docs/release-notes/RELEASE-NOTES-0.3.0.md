@@ -109,7 +109,7 @@ release.
 - Malformed, truncated, wrong-magic, unknown-codec, non-canonical-directory,
   unknown-kind and over-cap input fails closed with a named error.
 
-See [docs/SAVE-NOTES.md](SAVE-NOTES.md) for the full version 10 wire layout,
+See [docs/SAVE-NOTES.md](../SAVE-NOTES.md) for the full version 10 wire layout,
 the migration rules and the measured cold-load evidence.
 
 ## First run and file layout
@@ -136,10 +136,10 @@ use texture or content packs.
 
 ## Building from source and further reading
 
-The [README](../README.md) has the prerequisites and the `cargo build --release`
+The [README](../../README.md) has the prerequisites and the `cargo build --release`
 steps. For authoring:
 
-- [Texture and content packs](TEXTURE-PACKS.md)
-- [Worldgen prefabs and villages](WORLDGEN.md)
-- [Save format and release notes](SAVE-NOTES.md)
-- [Creator configuration](CONFIG.md)
+- [Texture and content packs](../TEXTURE-PACKS.md)
+- [Worldgen prefabs and villages](../WORLDGEN.md)
+- [Save format and release notes](../SAVE-NOTES.md)
+- [Creator configuration](../CONFIG.md)

@@ -85,3 +85,5 @@ REQUIREMENTS-REGISTRY.md
 # Local UAT scratch dirs and milestone UAT reports (not part of the game)
 /.uat-*/
 docs/UAT-M*.md
+# Local audit scratch reports (not part of the game)
+docs/AUDIT-*.md

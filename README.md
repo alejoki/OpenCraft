@@ -68,7 +68,7 @@ Spawn attempts are deterministic for a seed and continue while you play. A mob t
 
 ### Downloading a release
 
-Prebuilt archives for the next release, 0.3.0, are published at [github.com/alejoki/OpenCraft/releases](https://github.com/alejoki/OpenCraft/releases) when its tag is cut: `opencraft-0.3.0-x86_64-unknown-linux-gnu.tar.gz` for Linux, and for Windows either the per-user installer `opencraft-0.3.0-x86_64-pc-windows-msvc-setup.exe` or the portable `opencraft-0.3.0-x86_64-pc-windows-msvc.zip`. The installer adds Start Menu and Apps entries and needs no administrator approval; the portable archive is extracted and its `opencraft.exe` runs in place. The Linux build needs ALSA (`libasound2`), and the Windows build is unsigned, so SmartScreen asks for **More info** -> **Run anyway**. See the [0.3.0 release notes](docs/RELEASE-NOTES-0.3.0.md) for details.
+Prebuilt archives for the next release, 0.3.0, are published at [github.com/alejoki/OpenCraft/releases](https://github.com/alejoki/OpenCraft/releases) when its tag is cut: `opencraft-0.3.0-x86_64-unknown-linux-gnu.tar.gz` for Linux, and for Windows either the per-user installer `opencraft-0.3.0-x86_64-pc-windows-msvc-setup.exe` or the portable `opencraft-0.3.0-x86_64-pc-windows-msvc.zip`. The installer adds Start Menu and Apps entries and needs no administrator approval; the portable archive is extracted and its `opencraft.exe` runs in place. The Linux build needs ALSA (`libasound2`), and the Windows build is unsigned, so SmartScreen asks for **More info** -> **Run anyway**. See the [0.3.0 release notes](docs/release-notes/RELEASE-NOTES-0.3.0.md) for details.
 
 ### Building
 

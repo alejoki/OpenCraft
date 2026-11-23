@@ -44,8 +44,8 @@ never bumps them. Never give a member `version.workspace = true`: the release
 version guard reads the first `version` line in the root `Cargo.toml`, and
 workspace inheritance would make that line the wrong source of truth.
 
-Then write `docs/RELEASE-NOTES-<VERSION>.md`. The workflow looks up exactly
-`docs/RELEASE-NOTES-${VERSION}.md` and fails the run if it is missing. Keep the
+Then write `docs/release-notes/RELEASE-NOTES-<VERSION>.md`. The workflow looks up exactly
+`docs/release-notes/RELEASE-NOTES-${VERSION}.md` and fails the run if it is missing. Keep the
 three asset names in the download table in sync with what the workflow builds
 (they derive from the crate name and version): both portable archives plus
 `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe`. Document the Windows
@@ -157,7 +157,7 @@ Check by eye and by script:
   `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` (releases published
   before D290, including v0.2.2, carry only the two portable archives; verify
   those with the verifier from that tag);
-- the release body is the contents of `docs/RELEASE-NOTES-0.3.0.md`;
+- the release body is the contents of `docs/release-notes/RELEASE-NOTES-0.3.0.md`;
 - `verify_release_page.sh` finds the three asset names, `SmartScreen`, and
   `version 10` in the published body;
 - on Linux, extract the tarball and run `./opencraft --demo-ui` headlessly: it
@@ -210,7 +210,7 @@ After re-tagging, repeat section 7.
   the rehearsal never starts.
 - **Tag does not match the crate version:** the workflow's version guard fails
   before any packaging.
-- **Missing `docs/RELEASE-NOTES-<VERSION>.md`:** the release-notes step fails
+- **Missing `docs/release-notes/RELEASE-NOTES-<VERSION>.md`:** the release-notes step fails
   the run; no release is created.
 - **ISCC.exe missing or older than 6.3:** the Windows job's
   `scripts/build_windows_installer.sh` installs Inno Setup via Chocolatey and

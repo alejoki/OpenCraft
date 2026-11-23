@@ -82,7 +82,7 @@ converted:
 
 Make a copy of your world before the first load with a newer build anyway: an
 upgraded file cannot be opened by an older release. See
-[docs/SAVE-NOTES.md](SAVE-NOTES.md) for the full save reference.
+[docs/SAVE-NOTES.md](../SAVE-NOTES.md) for the full save reference.
 
 ## First run and file layout
 
@@ -107,9 +107,9 @@ use texture or content packs.
 
 ## Building from source and further reading
 
-The [README](../README.md) has the prerequisites and the `cargo build --release`
+The [README](../../README.md) has the prerequisites and the `cargo build --release`
 steps. For authoring:
 
-- [Texture and content packs](TEXTURE-PACKS.md)
-- [Worldgen prefabs and villages](WORLDGEN.md)
-- [Save format and release notes](SAVE-NOTES.md)
+- [Texture and content packs](../TEXTURE-PACKS.md)
+- [Worldgen prefabs and villages](../WORLDGEN.md)
+- [Save format and release notes](../SAVE-NOTES.md)

@@ -151,12 +151,12 @@ jobs:
           set -euo pipefail
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release edit "$TAG" --title "OpenCraft $TAG" \
-              --notes-file "docs/RELEASE-NOTES-$VERSION.md"
+              --notes-file "docs/release-notes/RELEASE-NOTES-$VERSION.md"
             gh release upload "$TAG" dist/opencraft-*.tar.gz dist/opencraft-*.zip \
               dist/opencraft-*-setup.exe --clobber
           else
             gh release create "$TAG" --verify-tag --title "OpenCraft $TAG" \
-              --notes-file "docs/RELEASE-NOTES-$VERSION.md" \
+              --notes-file "docs/release-notes/RELEASE-NOTES-$VERSION.md" \
               dist/opencraft-*.tar.gz dist/opencraft-*.zip dist/opencraft-*-setup.exe
           fi
 
