@@ -439,7 +439,7 @@ impl PackPresentation {
     }
 }
 
-/// Every authorable fixed-name base layer: 0..=24 and 32..=44.
+/// Every authorable fixed-name base layer: 0..=25 and 32..=44.
 fn authorable_base_layers() -> impl Iterator<Item = u8> {
     (0..AUTHORABLE_TEX_LAYERS as u8)
         .chain((MOB_LAYER_BASE as u8)..(MOB_LAYER_BASE as u8 + MOB_AUTHORABLE_TEX_LAYERS as u8))
@@ -736,15 +736,15 @@ mod tests {
     fn reserved_layers_have_no_source() {
         let presentation = presentation(vec![spec_with_layer("p", 3, &bytes(1))]);
 
-        // Layer 25 is built-in socket-marker art: no pack may override it.
-        assert_eq!(presentation.base_sources[25], None, "layer 25");
+        // Layer 26 is built-in socket-marker art: no pack may override it.
+        assert_eq!(presentation.base_sources[26], None, "layer 26");
         assert_eq!(
-            presentation.base.layers[25], presentation.procedural[25],
-            "layer 25 must stay the built-in marker art"
+            presentation.base.layers[26], presentation.procedural[26],
+            "layer 26 must stay the built-in marker art"
         );
 
         for layer in 0..presentation.base_sources.len() {
-            let reserved = (26..MOB_LAYER_BASE as usize).contains(&layer)
+            let reserved = (27..MOB_LAYER_BASE as usize).contains(&layer)
                 || layer >= MOB_LAYER_BASE as usize + MOB_AUTHORABLE_TEX_LAYERS;
             if reserved {
                 assert_eq!(presentation.base_sources[layer], None, "layer {layer}");

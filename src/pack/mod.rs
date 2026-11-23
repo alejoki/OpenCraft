@@ -7,7 +7,7 @@
 //! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
 //! RGBA layers plus optional presentation data. The first
 //! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layer
-//! 25 is built-in socket-marker art packs cannot override, layers 26..=31 are
+//! 26 is built-in socket-marker art packs cannot override, layers 27..=31 are
 //! reserved block placeholders, layers 32..=44 are mob part art
 //! from [`MOB_LAYER_FILES`], and layers 45..=47 are reserved spares. Loading
 //! never fails and never panics on bad input; every fallback is reported as a
@@ -38,14 +38,14 @@ pub use spec::load_stack;
 /// Number of block texture layers a pack may author.
 ///
 /// Index-aligned with the first [`AUTHORABLE_TEX_LAYERS`] entries of
-/// `BlockId::face_tex_layer`/the procedural layer set. Layer 25 is built-in
+/// `BlockId::face_tex_layer`/the procedural layer set. Layer 26 is built-in
 /// socket-marker art packs cannot override, and
-/// 26..[`crate::render::texture::MOB_LAYER_BASE`] are reserved block
+/// 27..[`crate::render::texture::MOB_LAYER_BASE`] are reserved block
 /// placeholders that cannot be overridden either.
-pub const AUTHORABLE_TEX_LAYERS: usize = 25;
+pub const AUTHORABLE_TEX_LAYERS: usize = 26;
 
-/// File names for the 25 authorable block texture layers, index-aligned with
-/// `BlockId::face_tex_layer` (layers 0..25). These names are the authoring
+/// File names for the 26 authorable block texture layers, index-aligned with
+/// `BlockId::face_tex_layer` (layers 0..26). These names are the authoring
 /// contract for packs; do not reorder.
 pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
     "grass_top.png",           // 0
@@ -73,6 +73,7 @@ pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
     "loot_chest.png",          // 22
     "crafting_table_top.png",  // 23
     "crafting_table_side.png", // 24
+    "glass.png",               // 25
 ];
 
 /// File names for the 13 authorable mob part layers, index-aligned with
@@ -112,8 +113,8 @@ pub struct PackLogo {
 /// entries of 16x16 RGBA bytes (1024 bytes each), the same format
 /// [`opencraft_gfx::texture::TextureArraySpec`] consumes (see
 /// [`crate::render::texture::BLOCK_ARRAY_SPEC`]). Layers
-/// 0..24 come from [`LAYER_FILES`], layer 25 is built-in socket-marker art
-/// that packs cannot override, 26..31 are reserved block placeholders,
+/// 0..25 come from [`LAYER_FILES`], layer 26 is built-in socket-marker art
+/// that packs cannot override, 27..31 are reserved block placeholders,
 /// 32..44 come from [`MOB_LAYER_FILES`], and 45..47 are reserved spares.
 /// Missing, invalid, and out-of-range files fall back per layer to the
 /// procedural texture and appear in `warnings`.
@@ -134,10 +135,10 @@ pub struct LoadedPack {
 /// layer file that does not exist is silently replaced by its procedural
 /// layer; a file that exists but fails to decode, is non-square, or is outside
 /// 16..=256 pixels falls back the same way and emits one warning naming the
-/// bare file. Layer 25 (built-in socket-marker art) and the reserved layers
-/// 26..=31 and 45..=47 have no file name and are never overridable, so a
+/// bare file. Layer 26 (built-in socket-marker art) and the reserved layers
+/// 27..=31 and 45..=47 have no file name and are never overridable, so a
 /// legacy pack that ships only the original 16 block files simply keeps the
-/// built-in art for layers 16..25 and all mob art. The
+/// built-in art for layers 16..=25 and all mob art. The
 /// optional logo is decoded at native size (failure -> `None` plus a warning).
 /// Unknown files and unknown manifest keys are ignored. Never panics, never
 /// returns `Err`.
@@ -581,9 +582,9 @@ whatever = true
 
     #[test]
     fn layer_file_names_cover_all_block_layers() {
-        assert_eq!(LAYER_FILES.len(), 25);
+        assert_eq!(LAYER_FILES.len(), 26);
         assert_eq!(LAYER_FILES.len(), AUTHORABLE_TEX_LAYERS);
-        assert_eq!(AUTHORABLE_TEX_LAYERS, 25);
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 26);
         assert_eq!(
             &LAYER_FILES[16..],
             &[
@@ -596,15 +597,17 @@ whatever = true
                 "loot_chest.png",
                 "crafting_table_top.png",
                 "crafting_table_side.png",
+                "glass.png",
             ]
         );
         // The original 16 names keep their indices.
         assert_eq!(LAYER_FILES[0], "grass_top.png");
         assert_eq!(LAYER_FILES[15], "iron_ore.png");
-        // The two table layers are the only appended names.
+        // The table layers and glass are the only appended names.
         assert_eq!(LAYER_FILES[22], "loot_chest.png");
         assert_eq!(LAYER_FILES[23], "crafting_table_top.png");
         assert_eq!(LAYER_FILES[24], "crafting_table_side.png");
+        assert_eq!(LAYER_FILES[25], "glass.png");
     }
 
     #[test]
@@ -631,7 +634,7 @@ whatever = true
             assert_ne!(*layer, procedural[index]);
         }
 
-        // Built-in marker art (25), the reserved ranges, and all mob art keep
+        // Built-in marker art (26), the reserved ranges, and all mob art keep
         // the built-in pixels: a legacy pack needs no changes.
         for index in 16..AUTHORABLE_TEX_LAYERS {
             assert_procedural_layer(&pack, &procedural, index);
@@ -654,10 +657,10 @@ whatever = true
     }
 
     #[test]
-    fn authoring_all_twenty_five_names_overrides_every_authorable_layer() {
+    fn authoring_all_twenty_six_names_overrides_every_authorable_layer() {
         let root = tempfile::tempdir().unwrap();
-        let dir = pack_dir(&root, "full25");
-        read_pack_toml(&dir, "format_version = 3\nname = \"Full 25\"\n");
+        let dir = pack_dir(&root, "full26");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Full 26\"\n");
         for file in LAYER_FILES.iter() {
             write_png(&dir.join(file), 32);
         }
@@ -777,10 +780,8 @@ whatever = true
         assert_ne!(pack.layers[24], procedural[24]);
         assert_ne!(pack.layers[23], pack.layers[24]);
 
-        // Only the two new names change: 0..=22 and 25..=47 stay built-in.
-        for index in (0..(AUTHORABLE_TEX_LAYERS - 2))
-            .chain(AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize)
-        {
+        // Only the two table names change: 0..=22 and 25..=47 stay built-in.
+        for index in (0..23usize).chain(25..crate::render::texture::NUM_TEX_LAYERS as usize) {
             assert_procedural_layer(&pack, &procedural, index);
         }
         assert!(pack.warnings.is_empty(), "{:?}", pack.warnings);
@@ -825,6 +826,22 @@ whatever = true
     }
 
     #[test]
+    fn corrupt_glass_file_warns_once_with_bare_name_and_keeps_procedural_art() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "bad-glass");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Glass\"\n");
+        fs::write(dir.join("glass.png"), b"not a png").unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        // Layer 25 is ordinary authorable art now, so a corrupt file falls
+        // back per-file exactly like every other layer name.
+        assert_procedural_layer(&pack, &procedural, 25);
+        assert_eq!(warning_fields(&pack), vec!["glass.png"]);
+    }
+
+    #[test]
     fn mob_layer_files_are_index_aligned() {
         use crate::render::texture::{
             MOB_ARROW_TEX_LAYER, MOB_LAYER_BASE, MOB_SPARE_LAYER_BASE, NUM_TEX_LAYERS,
@@ -841,20 +858,21 @@ whatever = true
         );
 
         // The first 23 block names stay byte-for-byte unchanged; the two
-        // table layers extend the contract at 23 and 24.
-        assert_eq!(AUTHORABLE_TEX_LAYERS, 25);
+        // table layers extend the contract at 23 and 24, and glass at 25.
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 26);
         assert_eq!(LAYER_FILES[0], "grass_top.png");
         assert_eq!(LAYER_FILES[22], "loot_chest.png");
         assert_eq!(LAYER_FILES[23], "crafting_table_top.png");
         assert_eq!(LAYER_FILES[24], "crafting_table_side.png");
+        assert_eq!(LAYER_FILES[25], "glass.png");
 
         assert_eq!(MOB_LAYER_FILES[0], "pig_body.png");
         assert_eq!(MOB_LAYER_FILES[12], "arrow.png");
 
-        // 25 block + 1 built-in marker + 6 reserved + 13 mob + 3 spare = 48.
+        // 26 block + 1 built-in marker + 5 reserved + 13 mob + 3 spare = 48.
         assert_eq!(
             NUM_TEX_LAYERS as usize,
-            AUTHORABLE_TEX_LAYERS + 1 + 6 + MOB_AUTHORABLE_TEX_LAYERS + 3
+            AUTHORABLE_TEX_LAYERS + 1 + 5 + MOB_AUTHORABLE_TEX_LAYERS + 3
         );
     }
 

@@ -29731,8 +29731,8 @@ selected_name_secs = 0.5
         let default_dir = packs_root.join(pack::defaults::DEFAULT_PACK_FOLDER);
         assert_eq!(
             count_files_recursive(&default_dir),
-            75,
-            "the shipped master restores exactly 75 files"
+            76,
+            "the shipped master restores exactly 76 files"
         );
         let pack = content
             .current_pack
@@ -29754,7 +29754,7 @@ selected_name_secs = 0.5
             .filter(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD)
             .collect();
         assert_eq!(restore_warnings.len(), 1);
-        assert!(restore_warnings[0].reason.contains("(75 files)"));
+        assert!(restore_warnings[0].reason.contains("(76 files)"));
         assert!(
             content.settings.pack_stack.is_empty(),
             "the implicit default never enters the persisted stack"

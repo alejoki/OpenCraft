@@ -1,6 +1,6 @@
 //! One-time exporter for the shipped `packs/default` pack.
 //!
-//! Generates the same 75 files the game uses at runtime from the built-in
+//! Generates the same 76 files the game uses at runtime from the built-in
 //! procedural art and synthesized sounds, then writes them to the requested
 //! folder (default: `packs/default`). Running it twice produces byte-identical
 //! output, so a committed folder plus this binary is the drift check between

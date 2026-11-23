@@ -1,12 +1,12 @@
-use crate::content::{PACK_LAYER_BASE, PACK_LAYER_CAP};
+use crate::content::{BlockAlpha, PACK_LAYER_BASE, PACK_LAYER_CAP};
 use opencraft_gfx::texture::TextureArraySpec;
 
 pub const TEX_SIZE: u32 = 16;
 /// Block texture array layers.
 ///
-/// Layers 0..=24 are authored block art (25 layers, see
-/// [`crate::pack::LAYER_FILES`]); 25 is built-in socket-marker art that packs
-/// cannot override; 26..=31 are reserved block placeholders no pack can
+/// Layers 0..=25 are authored block art (26 layers, see
+/// [`crate::pack::LAYER_FILES`]); 26 is built-in socket-marker art that packs
+/// cannot override; 27..=31 are reserved block placeholders no pack can
 /// override. Layers 32..=44 are the 13 authorable mob part layers
 /// (see [`crate::pack::MOB_LAYER_FILES`]) and 45..=47 are reserved spares.
 /// The WGSL `w1 & 255` wire format still holds because all 48 layers fit in
@@ -64,38 +64,63 @@ fn clamp_u8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-fn make_layer<F: Fn(u32, u32, i32) -> [u8; 3]>(seed: u32, f: F) -> Vec<u8> {
+/// Alpha-returning layer painter: the closure yields `[r, g, b, a]` per pixel.
+fn make_layer_rgba<F: Fn(u32, u32, i32) -> [u8; 4]>(seed: u32, f: F) -> Vec<u8> {
     let mut data = vec![0u8; (TEX_SIZE * TEX_SIZE * 4) as usize];
     for y in 0..TEX_SIZE {
         for x in 0..TEX_SIZE {
             let h = hash_pixel(x, y, seed);
             let jitter = (h & 0xF) as i32 - 8;
-            let [r, g, b] = f(x, y, jitter);
+            let rgba = f(x, y, jitter);
             let idx = ((y * TEX_SIZE + x) * 4) as usize;
-            data[idx] = r;
-            data[idx + 1] = g;
-            data[idx + 2] = b;
-            data[idx + 3] = 255;
+            data[idx..idx + 4].copy_from_slice(&rgba);
         }
     }
     data
 }
 
-/// Deterministic wheat art shared by stages 17..=20: a soil-toned backdrop
-/// with vertical stalks that grow taller and ripen from green to gold as
-/// `stalk_height` and `ripeness` (0..=3) increase.
+/// Opaque layer painter: forces alpha to 255 for every pixel.
+fn make_layer<F: Fn(u32, u32, i32) -> [u8; 3]>(seed: u32, f: F) -> Vec<u8> {
+    make_layer_rgba(seed, move |x, y, jitter| {
+        let [r, g, b] = f(x, y, jitter);
+        [r, g, b, 255]
+    })
+}
+
+/// Alpha class a fixed texture-array layer must be rendered with.
+///
+/// Leaves (layer 8) and the four wheat stages (17..=20) are binary cutout
+/// art; glass (layer 25) is a semi-transparent blend layer. Every other built-in
+/// and procedural layer — including the socket marker, reserved checkers, mob
+/// parts and spares — stays fully opaque, so the blanket "all art is opaque"
+/// invariant is replaced by this explicit per-layer policy.
+pub fn layer_alpha_policy(index: u32) -> BlockAlpha {
+    match index {
+        8 | 17..=20 => BlockAlpha::Cutout,
+        25 => BlockAlpha::Blend,
+        _ => BlockAlpha::Opaque,
+    }
+}
+
+/// Deterministic wheat art shared by stages 17..=20: vertical stalks that grow
+/// taller and ripen from green to gold as `stalk_height` and `ripeness`
+/// (0..=3) increase.
+///
+/// The background is fully transparent (alpha 0) so wheat renders as a staged
+/// cross plant and the cutout pass discards the gaps. This intentionally
+/// supersedes MEM323's opaque tilled-soil backdrop.
 fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
     let green = [80i32, 148, 46];
     let gold = [208i32, 172, 56];
     let mix =
         |channel: usize| green[channel] + (gold[channel] - green[channel]) * ripeness as i32 / 3;
-    make_layer(seed, move |x, y, j| {
+    make_layer_rgba(seed, move |x, y, j| {
         let stalk = x % 4 == 1;
         let jitter_top = hash_pixel(x, 0, seed) % 2;
         let top = 15u32.saturating_sub(stalk_height + jitter_top);
         let on_stalk = stalk && y >= top;
         let head = on_stalk && y + 3 > top;
-        if head {
+        let rgb = if head {
             [
                 clamp_u8(mix(0) + 20 + j / 2),
                 clamp_u8(mix(1) + 20 + j / 2),
@@ -108,14 +133,48 @@ fn wheat_layer_rgba(seed: u32, stalk_height: u32, ripeness: u32) -> Vec<u8> {
                 clamp_u8(mix(2) + j),
             ]
         } else {
-            // Tilled soil backdrop so every wheat layer stays fully opaque.
-            let d = if (x / 4 + y / 4) % 2 == 0 { 0 } else { -7 };
-            [
-                clamp_u8(92 + d + j),
-                clamp_u8(68 + d + j),
-                clamp_u8(46 + d + j),
-            ]
-        }
+            // Transparent gap between stalks: the cutout pass never draws it.
+            return [0, 0, 0, 0];
+        };
+        [rgb[0], rgb[1], rgb[2], 255]
+    })
+}
+
+/// Deterministic glass art for layer 25: a pale blue pane inside a lighter
+/// frame with a diagonal glint and a central mullion.
+///
+/// Every pixel is semi-transparent — alpha is clamped to `1..=254` — so the
+/// blend pass composites the pane over the scene instead of discarding it or
+/// masking what is behind it entirely.
+fn glass_layer_rgba(seed: u32) -> Vec<u8> {
+    make_layer_rgba(seed, |x, y, j| {
+        let frame = x == 0 || y == 0 || x == 15 || y == 15;
+        let mullion = x == 7 || x == 8 || y == 7 || y == 8;
+        let glint = (x + y) % 9 == 0 && !frame && !mullion;
+        let (r, g, b) = if frame {
+            (176 + j / 4, 214 + j / 4, 232 + j / 4)
+        } else if mullion {
+            (150 + j / 3, 196 + j / 3, 220 + j / 3)
+        } else if glint {
+            (214 + j / 4, 240 + j / 4, 252 + j / 4)
+        } else {
+            (120 + j / 2, 176 + j / 2, 212 + j / 2)
+        };
+        let alpha = if frame {
+            230
+        } else if mullion {
+            176
+        } else if glint {
+            132
+        } else {
+            96 + j / 2
+        };
+        [
+            clamp_u8(r),
+            clamp_u8(g),
+            clamp_u8(b),
+            alpha.clamp(1, 254) as u8,
+        ]
     })
 }
 
@@ -203,13 +262,16 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 clamp_u8(50 + stripe + j),
             ]
         }),
-        // 8: Oak Leaves
-        make_layer(9, |x, y, j| {
+        // 8: Oak Leaves - the established leaf RGB art with deterministic
+        // fully transparent holes so the cutout pass masks the gaps.
+        make_layer_rgba(9, |x, y, j| {
             let dark = if (x + y) % 3 == 0 { -16 } else { 8 };
+            let hole = hash_pixel(x, y, 4_873) % 4 == 0;
             [
                 clamp_u8(52 + dark + j),
                 clamp_u8(132 + dark + j * 2),
                 clamp_u8(38 + dark + j),
+                if hole { 0 } else { 255 },
             ]
         }),
         // 9: Oak Planks
@@ -448,10 +510,13 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
                 ]
             }
         }),
-        // 25: Socket Marker - dark slate frame around a cyan inset arrow, so an
+        // 25: Glass - pale blue pane: a blend layer whose alpha never reaches
+        // 0 or 255, so the sorted translucent pass composites it.
+        glass_layer_rgba(34),
+        // 26: Socket Marker - dark slate frame around a cyan inset arrow, so an
         // authoring socket reads as a scanning point instead of the magenta
         // checker. Built-in art only: no pack file name maps to this layer.
-        make_layer(34, |x, y, j| {
+        make_layer(35, |x, y, j| {
             let outer = x < 2 || y < 2 || x > 13 || y > 13;
             let inner = x == 3 || y == 3 || x == 12 || y == 12;
             let head = (y == 5 && (6..=9).contains(&x))
@@ -488,10 +553,10 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         }),
     ];
 
-    // 26..32: reserved block layers. They are not authorable (no pack file
+    // 27..32: reserved block layers. They are not authorable (no pack file
     // name maps to them). A deterministic magenta checker, offset per layer,
     // keeps each one opaque and visibly distinct from every authored layer.
-    layers.extend((26..MOB_LAYER_BASE).map(reserved_checker));
+    layers.extend((27..MOB_LAYER_BASE).map(reserved_checker));
 
     // 32..=44: the 13 authorable mob part layers, in `MOB_LAYER_FILES` order.
     // Each is deterministic, opaque (make_layer forces alpha 255), and
@@ -634,7 +699,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         }),
     ]);
 
-    // 45..48: reserved spare layers, same magenta checker rule as 26..32.
+    // 45..48: reserved spare layers, same magenta checker rule as 27..32.
     layers.extend((MOB_SPARE_LAYER_BASE..NUM_TEX_LAYERS).map(reserved_checker));
 
     debug_assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
@@ -712,11 +777,52 @@ mod tests {
         let layers = generate_all_texture_layers_rgba();
         assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
         assert_eq!(layers.len(), 48);
-        for layer in &layers {
+        for (index, layer) in layers.iter().enumerate() {
             assert_eq!(layer.len(), (TEX_SIZE * TEX_SIZE * 4) as usize);
             let (pixels, remainder) = layer.as_chunks::<4>();
             assert!(remainder.is_empty());
-            assert!(pixels.iter().all(|px| px[3] == 255));
+            let alpha: Vec<u8> = pixels.iter().map(|px| px[3]).collect();
+            match layer_alpha_policy(index as u32) {
+                BlockAlpha::Opaque => assert!(
+                    alpha.iter().all(|a| *a == 255),
+                    "layer {index} must be fully opaque"
+                ),
+                BlockAlpha::Cutout => {
+                    assert!(
+                        alpha.iter().any(|a| *a < 128),
+                        "cutout layer {index} needs transparent pixels"
+                    );
+                    assert!(
+                        alpha.iter().any(|a| *a >= 128),
+                        "cutout layer {index} needs opaque pixels"
+                    );
+                }
+                BlockAlpha::Blend => assert!(
+                    alpha.iter().all(|a| (1..=254).contains(a)),
+                    "blend layer {index} alpha must stay in 1..=254"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_layer_alpha_policy_names_the_cutout_and_blend_layers() {
+        assert_eq!(layer_alpha_policy(8), BlockAlpha::Cutout);
+        for index in 17..=20 {
+            assert_eq!(
+                layer_alpha_policy(index),
+                BlockAlpha::Cutout,
+                "wheat {index}"
+            );
+        }
+        assert_eq!(layer_alpha_policy(25), BlockAlpha::Blend, "glass");
+        // Socket marker, reserved ranges, mob layers and spares stay opaque.
+        for index in [0u32, 7, 9, 16, 21, 24, 26, 27, 31, 32, 44, 45, 47] {
+            assert_eq!(
+                layer_alpha_policy(index),
+                BlockAlpha::Opaque,
+                "layer {index}"
+            );
         }
     }
 
@@ -774,52 +880,71 @@ mod tests {
         assert_ne!(layers[23], layers[9], "table top must differ from planks");
         assert_ne!(layers[24], layers[9], "table side must differ from planks");
         assert_ne!(layers[23], layers[24], "table top and side must differ");
-        // Layer 25 is built-in socket-marker art, not reserved checker art.
-        for existing in 0..=24usize {
+        // Layer 26 is built-in socket-marker art, not reserved checker art.
+        for existing in 0..=25usize {
             assert_ne!(
-                layers[25], layers[existing],
+                layers[26], layers[existing],
                 "socket marker must differ from built-in layer {existing}"
             );
         }
-        assert_ne!(layers[25], layers[23], "socket marker vs table top");
-        assert_ne!(layers[25], layers[24], "socket marker vs table side");
+        assert_ne!(layers[26], layers[23], "socket marker vs table top");
+        assert_ne!(layers[26], layers[24], "socket marker vs table side");
         assert_ne!(
-            layers[25],
-            reserved_checker(25),
+            layers[26],
+            reserved_checker(26),
             "socket marker must not be the reserved checker"
         );
 
-        // Every new layer is real art, not a flat color.
+        // Every new layer is real art, not a flat color, and its alpha bytes
+        // must match the declared per-layer class.
         for index in authored_new {
             let (pixels, _) = layers[index].as_chunks::<4>();
-            assert!(
-                pixels.iter().all(|px| px[3] == 255),
-                "layer {index} must stay opaque"
-            );
             let first = &pixels[0];
             assert!(
                 pixels.iter().any(|px| px != first),
                 "layer {index} must not be a flat color"
             );
+            let alpha: Vec<u8> = pixels.iter().map(|px| px[3]).collect();
+            match layer_alpha_policy(index as u32) {
+                BlockAlpha::Opaque => assert!(
+                    alpha.iter().all(|a| *a == 255),
+                    "layer {index} must stay opaque"
+                ),
+                BlockAlpha::Cutout => {
+                    assert!(
+                        alpha.iter().any(|a| *a < 128),
+                        "cutout layer {index} needs transparent pixels"
+                    );
+                    assert!(
+                        alpha.iter().any(|a| *a >= 128),
+                        "cutout layer {index} needs opaque pixels"
+                    );
+                }
+                BlockAlpha::Blend => assert!(
+                    alpha.iter().all(|a| (1..=254).contains(a)),
+                    "blend layer {index} alpha must stay in 1..=254"
+                ),
+            }
         }
     }
 
     #[test]
     fn test_reserved_texture_layers_are_distinct_opaque_placeholders() {
         let layers = generate_all_texture_layers_rgba();
-        let builtin = 26usize;
+        let builtin = 27usize;
         assert_eq!(
-            builtin, 26,
-            "built-in procedural coverage is 26 layers (25 authored + marker)"
+            builtin, 27,
+            "built-in procedural coverage is 27 layers (26 authored + marker)"
         );
         assert_eq!(NUM_TEX_LAYERS as usize, 48);
 
-        // Block-reserved 26..32 and spare 45..48 both use the reserved rule;
-        // neither range may alias built-in art (including layer 25) or mob art.
+        // Block-reserved 27..32 and spare 45..48 both use the reserved rule;
+        // neither range may alias built-in art (including glass 25 and marker
+        // 26) or mob art.
         let reserved: Vec<usize> = (builtin..MOB_LAYER_BASE as usize)
             .chain(MOB_SPARE_LAYER_BASE as usize..NUM_TEX_LAYERS as usize)
             .collect();
-        assert_eq!(reserved.len(), 6 + 3);
+        assert_eq!(reserved.len(), 5 + 3);
 
         for &index in &reserved {
             for authored in 0..builtin {
@@ -886,7 +1011,7 @@ mod tests {
                 pixels.iter().any(|px| px != first),
                 "mob layer {index} must not be a flat color"
             );
-            for authored in 0..26usize {
+            for authored in 0..27usize {
                 assert_ne!(
                     layers[index], layers[authored],
                     "mob layer {index} must differ from authored layer {authored}"

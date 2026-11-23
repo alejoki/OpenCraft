@@ -8,7 +8,7 @@
 //! fallbacks can never drift silently.
 //!
 //! The generator is pure and byte-deterministic: two calls always produce the
-//! same 75 `(path, bytes)` entries in sorted path order, and
+//! same 76 `(path, bytes)` entries in sorted path order, and
 //! [`default_pack_digest`] pins that exact byte stream. Writing those entries
 //! to disk is [`export_default_pack`]'s only job.
 //!
@@ -38,9 +38,9 @@ pub const DEFAULT_PACK_NAME: &str = "Default";
 pub const DEFAULT_PACK_DESCRIPTION: &str =
     "The shipped reference presentation exported from the built-in procedural art.";
 
-/// Number of files the generator emits: `pack.toml`, 25 block layers, 13 mob
+/// Number of files the generator emits: `pack.toml`, 26 block layers, 13 mob
 /// layers, 27 built-in item icons and 9 sound files.
-pub const DEFAULT_PACK_FILE_COUNT: usize = 75;
+pub const DEFAULT_PACK_FILE_COUNT: usize = 76;
 
 /// FNV-1a offset basis for [`default_pack_digest`].
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn default_pack_file_set_is_exactly_75_unique_sorted_paths() {
+    fn default_pack_file_set_is_exactly_76_unique_sorted_paths() {
         let entries = build_default_pack();
         assert_eq!(entries.len(), DEFAULT_PACK_FILE_COUNT);
 
@@ -640,7 +640,7 @@ mod tests {
         // Pinned on the generator's first run; a change means the shipped pack
         // bytes (art, sounds or manifest) drifted. Re-pin only together with a
         // deliberate regeneration of `packs/default` and its embedded master.
-        const PINNED: u64 = 7_461_094_496_369_431_543;
+        const PINNED: u64 = 4_563_584_254_880_741_902;
         assert_eq!(
             default_pack_digest(),
             PINNED,
@@ -649,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_creates_all_75_files_in_a_missing_root() {
+    fn restore_creates_all_76_files_in_a_missing_root() {
         let root = temp_root();
         let outcome = ensure_default_pack(root.path());
 
@@ -841,8 +841,8 @@ mod tests {
             "non-icon files are restored"
         );
         assert_eq!(
-            outcome.restored_files, 48,
-            "74 non-manifest files minus 27 icons plus the manifest"
+            outcome.restored_files, 49,
+            "75 non-manifest files minus 27 icons plus the manifest"
         );
 
         let icon_failures: Vec<&SettingsWarning> = outcome
@@ -860,7 +860,7 @@ mod tests {
         assert!(outcome
             .warnings
             .iter()
-            .any(|warning| warning.reason == restore_success_reason(48)));
+            .any(|warning| warning.reason == restore_success_reason(49)));
     }
 
     #[test]

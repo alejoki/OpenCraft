@@ -373,7 +373,11 @@ fn digest_line(
         "table",
         art.top == 23 && art.side == 24 && art.bottom == 9,
     );
-    push_check(&mut failures, "authorable", art.authorable == 25);
+    push_check(
+        &mut failures,
+        "authorable",
+        art.authorable == AUTHORABLE_TEX_LAYERS,
+    );
     push_check(&mut failures, "table_distinct", art.distinct);
     push_check(&mut failures, "tooltip_lines", tooltip.len() == 2);
     push_check(&mut failures, "tooltip_flip", tooltip_flip);
@@ -476,9 +480,9 @@ mod tests {
     // Pinned in two places on purpose: `scripts/ui_smoke.sh` mirrors these
     // exact lines. Update both halves together when a fixture or count changes.
     const PINNED_LINES: [&str; 3] = [
-        "ui_demo: size=1280x720 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=14.577 vitals_row=162.169 vitals_gap=1.822 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
-        "ui_demo: size=1920x1080 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=21.865 vitals_row=243.253 vitals_gap=2.733 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
-        "ui_demo: size=3840x2160 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=25 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=43.731 vitals_row=486.507 vitals_gap=5.466 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=1280x720 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=26 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=14.577 vitals_row=162.169 vitals_gap=1.822 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=1920x1080 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=26 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=21.865 vitals_row=243.253 vitals_gap=2.733 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
+        "ui_demo: size=3840x2160 player_block=144 player_sprite=54 table_block=234 table_sprite=54 hotbar_block=54 hotbar_sprite=36 empty=25 empty_table=12 quads_player=43 quads_table=60 sep_gap=16.000 sep_h=2.000 panel=676.000x384.000 table=23/24/9 authorable=26 table_distinct=1 tooltip_lines=2 tooltip_flip=1 tooltip_inside=1 select_alpha0=1.000 select_alpha2=0.000 select_restart=1 empty_hidden=1 vitals_icon=43.731 vitals_row=486.507 vitals_gap=5.466 vitals_overlap=0 air_line=1 count_clear=1 failed=none ok=true",
     ];
 
     #[test]

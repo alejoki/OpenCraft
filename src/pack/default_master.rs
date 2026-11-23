@@ -78,6 +78,7 @@ pub static DEFAULT_PACK_FILES: &[(&str, &[u8])] = &[
         "farmland.png",
         include_bytes!("../../packs/default/farmland.png"),
     ),
+    ("glass.png", include_bytes!("../../packs/default/glass.png")),
     (
         "grass_side.png",
         include_bytes!("../../packs/default/grass_side.png"),
@@ -358,9 +359,9 @@ mod tests {
     }
 
     #[test]
-    fn default_master_has_75_unique_sorted_entries() {
+    fn default_master_has_76_unique_sorted_entries() {
         let paths: Vec<&str> = DEFAULT_PACK_FILES.iter().map(|(path, _)| *path).collect();
-        assert_eq!(paths.len(), 75, "the shipped pack exports exactly 75 files");
+        assert_eq!(paths.len(), 76, "the shipped pack exports exactly 76 files");
         assert_eq!(
             paths.len(),
             crate::pack::defaults::DEFAULT_PACK_FILE_COUNT,
