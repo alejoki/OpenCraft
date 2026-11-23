@@ -1029,6 +1029,7 @@ mod tests {
             top: Some("shared.png".to_string()),
             bottom: Some("shared.png".to_string()),
             side: Some("shared.png".to_string()),
+            ..BlockTextures::default()
         };
         spec.blocks.push(entry);
         spec.assets.insert("shared.png".to_string(), asset(0x55));

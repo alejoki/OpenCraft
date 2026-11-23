@@ -107,13 +107,19 @@ pub struct BlockEntry {
 
 /// Authored block face texture file names.
 ///
-/// `all` supplies every face; a specific face overrides `all` for that face.
+/// Resolution precedence is fixed per face: the four sides (`east`, `west`,
+/// `south`, `north`) fall back through `side` and then `all`; `top` and
+/// `bottom` fall back directly to `all` and never consult `side`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockTextures {
     pub all: Option<String>,
     pub top: Option<String>,
     pub bottom: Option<String>,
     pub side: Option<String>,
+    pub north: Option<String>,
+    pub south: Option<String>,
+    pub east: Option<String>,
+    pub west: Option<String>,
 }
 
 /// One authored generic item (also the carrier of pack food data).

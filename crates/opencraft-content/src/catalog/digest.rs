@@ -398,13 +398,27 @@ pub(super) fn compute_digest(input: &DigestInputs<'_>) -> u64 {
 /// into texture layers) so the digest and the allocation can never disagree
 /// about which face reads which path.
 pub(super) fn face_texture(textures: &crate::spec::BlockTextures, face: usize) -> Option<&String> {
-    let specific = match face {
-        0 | 1 | 4 | 5 => textures.side.as_ref(),
+    // Frozen face order: 0=+X/east, 1=-X/west, 2=+Y/top, 3=-Y/bottom,
+    // 4=+Z/south, 5=-Z/north.
+    let direction = match face {
+        0 => textures.east.as_ref(),
+        1 => textures.west.as_ref(),
         2 => textures.top.as_ref(),
         3 => textures.bottom.as_ref(),
+        4 => textures.south.as_ref(),
+        5 => textures.north.as_ref(),
         _ => None,
     };
-    specific.or(textures.all.as_ref())
+    if direction.is_some() {
+        return direction;
+    }
+    let side_fallback = matches!(face, 0 | 1 | 4 | 5);
+    if side_fallback {
+        if let Some(side) = textures.side.as_ref() {
+            return Some(side);
+        }
+    }
+    textures.all.as_ref()
 }
 
 #[cfg(test)]
@@ -912,6 +926,152 @@ mod tests {
         };
 
         assert_ne!(digest(None), digest(Some(&patch)));
+    }
+
+    #[test]
+    fn face_texture_resolves_direction_then_side_then_all() {
+        let textures = BlockTextures {
+            all: Some("all.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            side: Some("side.png".to_string()),
+            east: Some("east.png".to_string()),
+            west: Some("west.png".to_string()),
+            south: Some("south.png".to_string()),
+            north: Some("north.png".to_string()),
+        };
+        let face = |index: usize| face_texture(&textures, index).map(String::as_str);
+        assert_eq!(face(0), Some("east.png"), "0=+X/east");
+        assert_eq!(face(1), Some("west.png"), "1=-X/west");
+        assert_eq!(face(2), Some("top.png"), "2=+Y/top");
+        assert_eq!(face(3), Some("bottom.png"), "3=-Y/bottom");
+        assert_eq!(face(4), Some("south.png"), "4=+Z/south");
+        assert_eq!(face(5), Some("north.png"), "5=-Z/north");
+    }
+
+    #[test]
+    fn face_texture_falls_back_to_side_for_the_four_sides_and_all_elsewhere() {
+        let with_side = BlockTextures {
+            all: Some("all.png".to_string()),
+            side: Some("side.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in [0, 1, 4, 5] {
+            assert_eq!(
+                face_texture(&with_side, index).map(String::as_str),
+                Some("side.png"),
+                "face {index} falls back past direction to side"
+            );
+        }
+        for index in [2, 3] {
+            assert_eq!(
+                face_texture(&with_side, index).map(String::as_str),
+                Some("all.png"),
+                "face {index} ignores side and falls back to all"
+            );
+        }
+
+        let all_only = BlockTextures {
+            all: Some("all.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in 0..6 {
+            assert_eq!(
+                face_texture(&all_only, index).map(String::as_str),
+                Some("all.png"),
+                "all alone applies to face {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn face_texture_without_any_authored_key_is_none() {
+        let empty = BlockTextures::default();
+        for index in 0..6 {
+            assert_eq!(face_texture(&empty, index), None, "face {index}");
+        }
+    }
+
+    #[test]
+    fn legacy_four_key_textures_keep_the_historical_face_table() {
+        let textures = BlockTextures {
+            all: Some("all.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            side: Some("side.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in 0..6 {
+            let historical = match index {
+                0 | 1 | 4 | 5 => Some("side.png"),
+                2 => Some("top.png"),
+                3 => Some("bottom.png"),
+                _ => None,
+            }
+            .or(Some("all.png"));
+            assert_eq!(
+                face_texture(&textures, index).map(String::as_str),
+                historical,
+                "legacy face {index} resolution must not change"
+            );
+        }
+
+        // The digest only folds in the resolved per-face table, so a pack
+        // authored with the legacy four keys hashes identically to one whose
+        // faces are authored explicitly.
+        let mut legacy = PackContentSpec::default();
+        let mut legacy_entry = block_entry("mymod:legacy", "all.png");
+        legacy_entry.textures = textures;
+        legacy.blocks.push(legacy_entry);
+
+        let mut explicit = PackContentSpec::default();
+        let mut explicit_entry = block_entry("mymod:legacy", "side.png");
+        explicit_entry.textures = BlockTextures {
+            east: Some("side.png".to_string()),
+            west: Some("side.png".to_string()),
+            south: Some("side.png".to_string()),
+            north: Some("side.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            ..BlockTextures::default()
+        };
+        explicit.blocks.push(explicit_entry);
+
+        assert_eq!(
+            digest_for(&[(identity("p", None), legacy)]),
+            digest_for(&[(identity("p", None), explicit)]),
+            "legacy authoring keeps its historical digest"
+        );
+    }
+
+    #[test]
+    fn renaming_a_directional_face_moves_the_digest() {
+        let mut spec = PackContentSpec::default();
+        let mut entry = block_entry("mymod:cube", "a.png");
+        entry.textures.north = Some("n.png".to_string());
+        spec.blocks.push(entry);
+
+        // face 5 resolves to n.png; 0..=4 resolve to a.png.
+        assert_eq!(
+            face_texture(&spec.blocks[0].textures, 5).map(String::as_str),
+            Some("n.png")
+        );
+        for index in 0..5 {
+            assert_eq!(
+                face_texture(&spec.blocks[0].textures, index).map(String::as_str),
+                Some("a.png"),
+                "face {index}"
+            );
+        }
+
+        let base = digest_for(&[(identity("p", None), spec.clone())]);
+        let mut renamed = spec;
+        renamed.blocks[0].textures.north = Some("n2.png".to_string());
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), renamed)]),
+            "a directional face rename must move the digest"
+        );
     }
 
     #[test]

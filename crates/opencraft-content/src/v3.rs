@@ -238,6 +238,10 @@ fn collect_asset_paths(spec: &PackContentSpec) -> BTreeSet<&str> {
             &block.textures.top,
             &block.textures.bottom,
             &block.textures.side,
+            &block.textures.north,
+            &block.textures.south,
+            &block.textures.east,
+            &block.textures.west,
         ]
         .into_iter()
         .flatten()
@@ -821,17 +825,25 @@ fn parse_block_textures(
         top: optional_string(textures, "top", entry, diagnostics)?,
         bottom: optional_string(textures, "bottom", entry, diagnostics)?,
         side: optional_string(textures, "side", entry, diagnostics)?,
+        north: optional_string(textures, "north", entry, diagnostics)?,
+        south: optional_string(textures, "south", entry, diagnostics)?,
+        east: optional_string(textures, "east", entry, diagnostics)?,
+        west: optional_string(textures, "west", entry, diagnostics)?,
     };
 
     if block_textures.all.is_none()
         && block_textures.top.is_none()
         && block_textures.bottom.is_none()
         && block_textures.side.is_none()
+        && block_textures.north.is_none()
+        && block_textures.south.is_none()
+        && block_textures.east.is_none()
+        && block_textures.west.is_none()
     {
         err(
             diagnostics,
             entry,
-            "`textures` must set at least one of `all`, `top`, `bottom`, `side`",
+            "`textures` must set at least one of `all`, `top`, `bottom`, `side`, `north`, `south`, `east`, `west`",
         );
         return Err(());
     }
@@ -841,6 +853,10 @@ fn parse_block_textures(
         ("textures.top", &block_textures.top),
         ("textures.bottom", &block_textures.bottom),
         ("textures.side", &block_textures.side),
+        ("textures.north", &block_textures.north),
+        ("textures.south", &block_textures.south),
+        ("textures.east", &block_textures.east),
+        ("textures.west", &block_textures.west),
     ] {
         if let Some(path) = path {
             validate_asset_path(path, field, entry, diagnostics)?;
@@ -1925,6 +1941,103 @@ enabled = false
             assert_eq!(asset.source_side, 32);
             assert_eq!(asset.rgba.len(), 16 * 16 * 4);
             assert_eq!(asset.rgba, expected);
+        }
+    }
+
+    #[test]
+    fn directional_texture_keys_parse_into_their_own_fields() {
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = { all = "all.png", top = "top.png", bottom = "bottom.png", side = "side.png", north = "north.png", south = "south.png", east = "east.png", west = "west.png" }
+hardness = 1.0
+"#;
+        let (spec, warnings, diagnostics) = parse_v3(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let textures = &spec.blocks[0].textures;
+        assert_eq!(textures.all.as_deref(), Some("all.png"));
+        assert_eq!(textures.top.as_deref(), Some("top.png"));
+        assert_eq!(textures.bottom.as_deref(), Some("bottom.png"));
+        assert_eq!(textures.side.as_deref(), Some("side.png"));
+        assert_eq!(textures.north.as_deref(), Some("north.png"));
+        assert_eq!(textures.south.as_deref(), Some("south.png"));
+        assert_eq!(textures.east.as_deref(), Some("east.png"));
+        assert_eq!(textures.west.as_deref(), Some("west.png"));
+    }
+
+    #[test]
+    fn only_a_directional_texture_satisfies_the_required_textures_table() {
+        let text = r#"
+[[blocks]]
+id = "mymod:north_only"
+textures = { north = "n.png" }
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.blocks.len(), 1);
+        assert_eq!(spec.blocks[0].textures.north.as_deref(), Some("n.png"));
+        assert!(spec.blocks[0].textures.all.is_none());
+    }
+
+    #[test]
+    fn directional_texture_assets_are_collected_and_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+        write_png(&dir.join("a.png"), 16);
+        write_png(&dir.join("n.png"), 16);
+
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = { all = "a.png", north = "n.png" }
+hardness = 1.0
+"#;
+        let (spec, diagnostics) = load_assets(text, &dir);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.assets.len(), 2, "all and north both load once");
+        assert!(spec.assets.contains_key("a.png"));
+        assert!(spec.assets.contains_key("n.png"));
+    }
+
+    #[test]
+    fn directional_texture_path_escapes_are_rejected() {
+        for key in ["north", "south", "east", "west"] {
+            let text = format!(
+                "[[blocks]]\nid = \"mymod:cube\"\ntextures = {{ {key} = \"/etc/passwd\" }}\nhardness = 1.0\n"
+            );
+            let (spec, _, diagnostics) = parse_v3(&text);
+            assert!(spec.blocks.is_empty(), "{key} block should be rejected");
+            assert_eq!(diagnostics.len(), 1, "{key}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].reason.contains(&format!("textures.{key}")),
+                "{key}: {diagnostics:?}"
+            );
+            assert_has_reason(&diagnostics, "must be relative");
+        }
+    }
+
+    #[test]
+    fn empty_textures_table_names_every_accepted_key() {
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = {}
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(spec.blocks.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        for key in [
+            "all", "top", "bottom", "side", "north", "south", "east", "west",
+        ] {
+            assert!(
+                diagnostics[0].reason.contains(key),
+                "`{key}` missing from: {}",
+                diagnostics[0].reason
+            );
         }
     }
 
