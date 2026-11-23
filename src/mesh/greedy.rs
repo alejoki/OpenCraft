@@ -1,4 +1,5 @@
 use crate::content::faces::BlockFaces;
+use crate::content::{BlockAlpha, BlockModel};
 use crate::mesh::quad::{ChunkMesh, PackedQuad};
 use crate::world::block::BlockId;
 use crate::world::chunk::{Chunk, CHUNK_SIZE};
@@ -25,6 +26,11 @@ pub struct PaddedChunk {
     /// Kept separate from `has_any_solid` (water is not solid) so the mesher
     /// and the manager's fast skip still see water-bearing chunks.
     pub has_any_liquid: bool,
+    /// True when at least one non-Air cell was copied into the padded volume.
+    /// This is the mesher's real skip predicate: plants (non-solid, non-liquid
+    /// cross/crop geometry) and glass (solid blend geometry) must still be
+    /// meshed, so neither solidity nor liquidity can stand in for it.
+    pub has_any_render: bool,
 }
 
 impl PaddedChunk {
@@ -37,27 +43,26 @@ impl PaddedChunk {
             light: Box::new([15u8; PADDED_VOLUME]),
             has_any_solid: false,
             has_any_liquid: false,
+            has_any_render: false,
         }
     }
 
     pub fn from_center_only(chunk: &Chunk) -> Self {
         let mut padded = Self::new_empty();
         if let Some(b) = chunk.is_uniform() {
-            if b.is_liquid() {
+            // Uniform Air is the only volume with no geometry at all. Every
+            // other uniform block (stone, water, wheat, glass) must fill the
+            // padded voxels: a uniform wheat chunk that returned empty here
+            // would silently lose its two cross quads per cell.
+            if b == BlockId::Air {
+                return padded;
+            }
+            padded.has_any_render = true;
+            if b.is_solid() {
+                padded.has_any_solid = true;
+            } else if b.is_liquid() {
                 padded.has_any_liquid = true;
-                for py in 1..=CHUNK_SIZE {
-                    for pz in 1..=CHUNK_SIZE {
-                        for px in 1..=CHUNK_SIZE {
-                            padded.voxels[padded_index(px, py, pz)] = b.to_raw();
-                        }
-                    }
-                }
-                return padded;
             }
-            if !b.is_solid() {
-                return padded;
-            }
-            padded.has_any_solid = true;
             for py in 1..=CHUNK_SIZE {
                 for pz in 1..=CHUNK_SIZE {
                     for px in 1..=CHUNK_SIZE {
@@ -72,13 +77,16 @@ impl PaddedChunk {
             for lz in 0..CHUNK_SIZE {
                 for lx in 0..CHUNK_SIZE {
                     let b = chunk.get(lx, ly, lz);
+                    if b == BlockId::Air {
+                        continue;
+                    }
+                    padded.has_any_render = true;
                     if b.is_solid() {
                         padded.has_any_solid = true;
-                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b.to_raw();
                     } else if b.is_liquid() {
                         padded.has_any_liquid = true;
-                        padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b.to_raw();
                     }
+                    padded.voxels[padded_index(lx + 1, ly + 1, lz + 1)] = b.to_raw();
                 }
             }
         }
@@ -87,6 +95,9 @@ impl PaddedChunk {
 
     #[inline]
     pub fn set(&mut self, px: usize, py: usize, pz: usize, block: BlockId) {
+        if block != BlockId::Air {
+            self.has_any_render = true;
+        }
         if block.is_solid() {
             self.has_any_solid = true;
         } else if block.is_liquid() {
@@ -165,216 +176,343 @@ pub fn mesh_chunk(padded: &PaddedChunk) -> ChunkMesh {
 ///
 /// The session-owned table is built from the frozen [`crate::content::ContentRegistry`]
 /// so pack-authored blocks reach the world without threading the registry
-/// into rayon workers. The job shape and per-face cost stay unchanged: the
-/// inner loop performs one slice lookup.
+/// into rayon workers. Each block's authored `(model, alpha)` render class
+/// selects both the geometry and the destination container:
+///
+/// * `cube + opaque` and `cube + cutout` -> the six [`ChunkMesh::buckets`]
+///   (cutout is an alpha-test state of the same opaque draw, not a new buffer);
+/// * `cube + blend` -> [`ChunkMesh::blend_quads`] for the sorted translucent pass;
+/// * `cross | crop` -> [`ChunkMesh::cross_quads`], two quads per block and
+///   never a cube face.
+///
+/// The merge key is unchanged: `(tex_layer + 1) | (ao << 8) | (light << 16)`.
+/// Each class is swept separately, so quads from different classes can never
+/// merge across a class boundary.
 pub fn mesh_chunk_with(padded: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
     let mut mesh = ChunkMesh::new();
-    // Water-only chunks must still be meshed (open ocean surface); only a
-    // chunk with neither solid nor liquid geometry can produce no faces.
-    if !padded.has_any_solid && !padded.has_any_liquid {
+    // `has_any_render` covers every geometry class: solids, water, blend glass
+    // and non-solid cross plants. Only a volume with no non-Air cell at all
+    // can produce no faces.
+    if !padded.has_any_render {
         return mesh;
     }
 
-    // col_masks[axis][v][u] holds 64-bit solidity mask along d in 0..34
+    // col_masks[axis][v][u] holds 64-bit class masks along d in 0..34.
     // For each axis (0=X, 1=Y, 2=Z):
     for axis in 0..3 {
-        // Precompute 34x34 solidity masks along d (0..34) so AO and face culling are fast
-        let mut solid_masks = [[0u64; PADDED_SIZE]; PADDED_SIZE];
-        for (pv, mask_row) in solid_masks.iter_mut().enumerate() {
-            for (pu, cell) in mask_row.iter_mut().enumerate() {
-                let mut mask = 0u64;
+        let mut opaque_masks = [[0u64; PADDED_SIZE]; PADDED_SIZE];
+        let mut cutout_masks = [[0u64; PADDED_SIZE]; PADDED_SIZE];
+        let mut blend_masks = [[0u64; PADDED_SIZE]; PADDED_SIZE];
+
+        for (pv, mask_row) in opaque_masks.iter_mut().enumerate() {
+            for (pu, opaque_cell) in mask_row.iter_mut().enumerate() {
+                let mut opaque = 0u64;
+                let mut cutout = 0u64;
+                let mut blend = 0u64;
                 for pd in 0..PADDED_SIZE {
                     let (px, py, pz) = get_axis_coord(axis, pd, pu, pv);
-                    if padded.get(px, py, pz).is_solid() {
-                        mask |= 1u64 << pd;
+                    let block = padded.get(px, py, pz);
+                    // A cube-class mask holds only solid cube blocks: water is
+                    // its own pass, and cross/crop plants are swept later.
+                    if !block.is_solid() {
+                        continue;
+                    }
+                    let render = faces.render(block);
+                    if render.model != BlockModel::Cube {
+                        continue;
+                    }
+                    let bit = 1u64 << pd;
+                    match render.alpha {
+                        BlockAlpha::Opaque => opaque |= bit,
+                        BlockAlpha::Cutout => cutout |= bit,
+                        BlockAlpha::Blend => blend |= bit,
                     }
                 }
-                *cell = mask;
+                *opaque_cell = opaque;
+                cutout_masks[pv][pu] = cutout;
+                blend_masks[pv][pu] = blend;
             }
         }
 
-        // Process positive (is_pos = true -> face_dir = axis*2) and negative (is_pos = false -> face_dir = axis*2 + 1)
+        // Process positive (is_pos = true -> face_dir = axis*2) and negative
+        // (is_pos = false -> face_dir = axis*2 + 1).
         for is_pos in [true, false] {
-            let face_dir = (axis * 2 + usize::from(!is_pos)) as u8;
+            let face_dir = (axis * 2 + usize::from(!is_pos)) as usize;
 
-            // slice_keys[v][u][d] for d in 0..32, v in 0..32, u in 0..32
-            // 0 means no visible face; non-zero is
-            // ((tex_layer as u32 + 1) | ((ao_packed as u32) << 8) | ((light_packed as u32) << 16))
-            let mut slice_keys = [[[0u32; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE];
-            let mut slice_row_masks = [[0u32; CHUNK_SIZE]; CHUNK_SIZE];
+            // Opaque: every face culls against another opaque face.
+            emit_class_faces(
+                padded,
+                faces,
+                axis,
+                is_pos,
+                &opaque_masks,
+                &opaque_masks,
+                true,
+                &mut mesh.buckets[face_dir],
+            );
+            // Cutout: a leaf face is only hidden by an opaque neighbour. Two
+            // adjacent cutout cells keep their outward faces so alpha holes
+            // never expose a culled interior.
+            emit_class_faces(
+                padded,
+                faces,
+                axis,
+                is_pos,
+                &cutout_masks,
+                &opaque_masks,
+                false,
+                &mut mesh.buckets[face_dir],
+            );
+            // Blend: glass culls against glass and opaque, so a glass pane
+            // pressed to stone loses only the face touching the wall.
+            emit_class_faces(
+                padded,
+                faces,
+                axis,
+                is_pos,
+                &blend_masks,
+                &opaque_masks,
+                true,
+                &mut mesh.blend_quads,
+            );
+        }
+    }
 
-            for (v, keys_v) in slice_keys.iter_mut().enumerate() {
-                let pv = v + 1;
-                for (u, keys_v_u) in keys_v.iter_mut().enumerate() {
-                    let pu = u + 1;
-                    let col_mask = solid_masks[pv][pu];
-                    if col_mask == 0 {
-                        continue;
-                    }
-                    // Bits 1..=32 shifted down to 0..31
-                    let mut visible_mask = if is_pos {
-                        ((col_mask & !(col_mask >> 1)) >> 1) as u32
-                    } else {
-                        ((col_mask & !(col_mask << 1)) >> 1) as u32
-                    };
+    mesh_cross(padded, faces, &mut mesh);
+    mesh_water(padded, &mut mesh);
 
-                    while visible_mask != 0 {
-                        let d = visible_mask.trailing_zeros() as usize;
-                        visible_mask &= visible_mask - 1;
+    mesh
+}
 
-                        let pd = d + 1;
-                        let (px, py, pz) = get_axis_coord(axis, pd, pu, pv);
-                        let block = padded.get(px, py, pz);
-                        let tex_layer = faces.layer(block, face_dir);
+/// Emit greedy-merged cube faces for one render class in one axis direction.
+///
+/// `class_mask` holds the cells whose class is being emitted; `occluders` is
+/// the opaque mask, optionally OR-ed with `class_mask` itself when the class
+/// culls against its own members. The AO/light sampling deliberately uses the
+/// opaque mask only, so cutout leaves and blend glass never bake occlusion into
+/// neighbouring opaque quads.
+#[allow(clippy::too_many_arguments)]
+fn emit_class_faces(
+    padded: &PaddedChunk,
+    faces: &BlockFaces,
+    axis: usize,
+    is_pos: bool,
+    class_mask: &[[u64; PADDED_SIZE]; PADDED_SIZE],
+    opaque_masks: &[[u64; PADDED_SIZE]; PADDED_SIZE],
+    cull_with_class: bool,
+    target: &mut Vec<PackedQuad>,
+) {
+    let face_dir = (axis * 2 + usize::from(!is_pos)) as u8;
 
-                        let air_d = if is_pos { pd + 1 } else { pd - 1 };
-                        let air_bit = 1u64 << air_d;
+    // slice_keys[v][u][d] for d in 0..32, v in 0..32, u in 0..32
+    // 0 means no visible face; non-zero is
+    // ((tex_layer as u32 + 1) | ((ao_packed as u32) << 8) | ((light_packed as u32) << 16))
+    let mut slice_keys = [[[0u32; CHUNK_SIZE]; CHUNK_SIZE]; CHUNK_SIZE];
+    let mut slice_row_masks = [[0u32; CHUNK_SIZE]; CHUNK_SIZE];
 
-                        let s_um = (solid_masks[pv][pu - 1] & air_bit) != 0;
-                        let s_up = (solid_masks[pv][pu + 1] & air_bit) != 0;
-                        let s_vm = (solid_masks[pv - 1][pu] & air_bit) != 0;
-                        let s_vp = (solid_masks[pv + 1][pu] & air_bit) != 0;
-                        let c00 = (solid_masks[pv - 1][pu - 1] & air_bit) != 0;
-                        let c10 = (solid_masks[pv - 1][pu + 1] & air_bit) != 0;
-                        let c01 = (solid_masks[pv + 1][pu - 1] & air_bit) != 0;
-                        let c11 = (solid_masks[pv + 1][pu + 1] & air_bit) != 0;
-
-                        let ao00 = vertex_ao(s_um, s_vm, c00);
-                        let ao10 = vertex_ao(s_up, s_vm, c10);
-                        let ao01 = vertex_ao(s_um, s_vp, c01);
-                        let ao11 = vertex_ao(s_up, s_vp, c11);
-                        let ao_packed = ao00 | (ao10 << 2) | (ao01 << 4) | (ao11 << 6);
-
-                        // Corner light uses the same air-side neighbor geometry as AO:
-                        // the center air cell plus each corner's two edge neighbors and
-                        // diagonal, with solid samples excluded from the average.
-                        let center_light = neighbor_light(padded, axis, air_d, pu, pv);
-                        let light_um = if s_um {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu - 1, pv))
-                        };
-                        let light_up = if s_up {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu + 1, pv))
-                        };
-                        let light_vm = if s_vm {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu, pv - 1))
-                        };
-                        let light_vp = if s_vp {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu, pv + 1))
-                        };
-                        let light_c00 = if c00 {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu - 1, pv - 1))
-                        };
-                        let light_c10 = if c10 {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu + 1, pv - 1))
-                        };
-                        let light_c01 = if c01 {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu - 1, pv + 1))
-                        };
-                        let light_c11 = if c11 {
-                            None
-                        } else {
-                            Some(neighbor_light(padded, axis, air_d, pu + 1, pv + 1))
-                        };
-
-                        let l00 =
-                            average_light([Some(center_light), light_um, light_vm, light_c00]);
-                        let l10 =
-                            average_light([Some(center_light), light_up, light_vm, light_c10]);
-                        let l01 =
-                            average_light([Some(center_light), light_um, light_vp, light_c01]);
-                        let l11 =
-                            average_light([Some(center_light), light_up, light_vp, light_c11]);
-                        let light_packed = (l00 as u32)
-                            | ((l10 as u32) << 4)
-                            | ((l01 as u32) << 8)
-                            | ((l11 as u32) << 12);
-
-                        let key = (tex_layer as u32 + 1)
-                            | ((ao_packed as u32) << 8)
-                            | (light_packed << 16);
-                        keys_v_u[d] = key;
-                        slice_row_masks[d][v] |= 1u32 << u;
-                    }
-                }
+    for (v, keys_v) in slice_keys.iter_mut().enumerate() {
+        let pv = v + 1;
+        for (u, keys_v_u) in keys_v.iter_mut().enumerate() {
+            let pu = u + 1;
+            let class_col = class_mask[pv][pu];
+            if class_col == 0 {
+                continue;
             }
+            let mut occluders = opaque_masks[pv][pu];
+            if cull_with_class {
+                occluders |= class_col;
+            }
+            // Bits 1..=32 shifted down to 0..31
+            let mut visible_mask = if is_pos {
+                ((class_col & !(occluders >> 1)) >> 1) as u32
+            } else {
+                ((class_col & !(occluders << 1)) >> 1) as u32
+            };
 
-            // Greedy 2D merge per slice d in 0..32
-            let bucket = &mut mesh.buckets[face_dir as usize];
-            for d in 0..CHUNK_SIZE {
-                let mut row_masks = slice_row_masks[d];
-                for v in 0..CHUNK_SIZE {
-                    while row_masks[v] != 0 {
-                        let u = row_masks[v].trailing_zeros() as usize;
-                        let key = slice_keys[v][u][d];
+            while visible_mask != 0 {
+                let d = visible_mask.trailing_zeros() as usize;
+                visible_mask &= visible_mask - 1;
 
-                        // Expand width w along u
-                        let mut w = 1usize;
-                        while u + w < CHUNK_SIZE
-                            && (row_masks[v] & (1u32 << (u + w))) != 0
-                            && slice_keys[v][u + w][d] == key
-                        {
-                            w += 1;
-                        }
+                let pd = d + 1;
+                let (px, py, pz) = get_axis_coord(axis, pd, pu, pv);
+                let block = padded.get(px, py, pz);
+                let tex_layer = faces.layer(block, face_dir);
 
-                        // Mask for bits u..(u+w)
-                        let span_mask = if w == 32 {
-                            u32::MAX
-                        } else {
-                            ((1u32 << w) - 1) << u
-                        };
+                let air_d = if is_pos { pd + 1 } else { pd - 1 };
+                let air_bit = 1u64 << air_d;
 
-                        // Expand height h along v
-                        let mut h = 1usize;
-                        'height: while v + h < CHUNK_SIZE {
-                            if (row_masks[v + h] & span_mask) != span_mask {
-                                break;
-                            }
-                            if slice_keys[v + h][u..(u + w)].iter().any(|k| k[d] != key) {
-                                break 'height;
-                            }
-                            h += 1;
-                        }
+                // AO and corner light sample only opaque cells: cutout and
+                // blend geometry must not darken a neighbouring opaque face.
+                let s_um = (opaque_masks[pv][pu - 1] & air_bit) != 0;
+                let s_up = (opaque_masks[pv][pu + 1] & air_bit) != 0;
+                let s_vm = (opaque_masks[pv - 1][pu] & air_bit) != 0;
+                let s_vp = (opaque_masks[pv + 1][pu] & air_bit) != 0;
+                let c00 = (opaque_masks[pv - 1][pu - 1] & air_bit) != 0;
+                let c10 = (opaque_masks[pv - 1][pu + 1] & air_bit) != 0;
+                let c01 = (opaque_masks[pv + 1][pu - 1] & air_bit) != 0;
+                let c11 = (opaque_masks[pv + 1][pu + 1] & air_bit) != 0;
 
-                        // Clear merged bits from row_masks
-                        for mask in &mut row_masks[v..(v + h)] {
-                            *mask &= !span_mask;
-                        }
+                let ao00 = vertex_ao(s_um, s_vm, c00);
+                let ao10 = vertex_ao(s_up, s_vm, c10);
+                let ao01 = vertex_ao(s_um, s_vp, c01);
+                let ao11 = vertex_ao(s_up, s_vp, c11);
+                let ao_packed = ao00 | (ao10 << 2) | (ao01 << 4) | (ao11 << 6);
 
-                        let tex_layer = ((key & 0xFF) - 1) as u8;
-                        let ao_packed = (key >> 8) as u8;
-                        let light_packed = (key >> 16) as u16;
-                        let (qx, qy, qz) = get_axis_coord(axis, d, u, v);
-                        bucket.push(PackedQuad::new(
-                            [qx as u32, qy as u32, qz as u32],
-                            [w as u32, h as u32],
-                            face_dir as u32,
-                            tex_layer,
-                            ao_packed,
-                            light_packed,
-                        ));
-                    }
-                }
+                // Corner light uses the same air-side neighbor geometry as AO:
+                // the center air cell plus each corner's two edge neighbors and
+                // diagonal, with opaque samples excluded from the average.
+                let center_light = neighbor_light(padded, axis, air_d, pu, pv);
+                let light_um = if s_um {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu - 1, pv))
+                };
+                let light_up = if s_up {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu + 1, pv))
+                };
+                let light_vm = if s_vm {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu, pv - 1))
+                };
+                let light_vp = if s_vp {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu, pv + 1))
+                };
+                let light_c00 = if c00 {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu - 1, pv - 1))
+                };
+                let light_c10 = if c10 {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu + 1, pv - 1))
+                };
+                let light_c01 = if c01 {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu - 1, pv + 1))
+                };
+                let light_c11 = if c11 {
+                    None
+                } else {
+                    Some(neighbor_light(padded, axis, air_d, pu + 1, pv + 1))
+                };
+
+                let l00 = average_light([Some(center_light), light_um, light_vm, light_c00]);
+                let l10 = average_light([Some(center_light), light_up, light_vm, light_c10]);
+                let l01 = average_light([Some(center_light), light_um, light_vp, light_c01]);
+                let l11 = average_light([Some(center_light), light_up, light_vp, light_c11]);
+                let light_packed =
+                    (l00 as u32) | ((l10 as u32) << 4) | ((l01 as u32) << 8) | ((l11 as u32) << 12);
+
+                let key = (tex_layer as u32 + 1) | ((ao_packed as u32) << 8) | (light_packed << 16);
+                keys_v_u[d] = key;
+                slice_row_masks[d][v] |= 1u32 << u;
             }
         }
     }
 
-    mesh_water(padded, &mut mesh);
+    // Greedy 2D merge per slice d in 0..32
+    for d in 0..CHUNK_SIZE {
+        let mut row_masks = slice_row_masks[d];
+        for v in 0..CHUNK_SIZE {
+            while row_masks[v] != 0 {
+                let u = row_masks[v].trailing_zeros() as usize;
+                let key = slice_keys[v][u][d];
 
-    mesh
+                // Expand width w along u
+                let mut w = 1usize;
+                while u + w < CHUNK_SIZE
+                    && (row_masks[v] & (1u32 << (u + w))) != 0
+                    && slice_keys[v][u + w][d] == key
+                {
+                    w += 1;
+                }
+
+                // Mask for bits u..(u+w)
+                let span_mask = if w == 32 {
+                    u32::MAX
+                } else {
+                    ((1u32 << w) - 1) << u
+                };
+
+                // Expand height h along v
+                let mut h = 1usize;
+                'height: while v + h < CHUNK_SIZE {
+                    if (row_masks[v + h] & span_mask) != span_mask {
+                        break;
+                    }
+                    if slice_keys[v + h][u..(u + w)].iter().any(|k| k[d] != key) {
+                        break 'height;
+                    }
+                    h += 1;
+                }
+
+                // Clear merged bits from row_masks
+                for mask in &mut row_masks[v..(v + h)] {
+                    *mask &= !span_mask;
+                }
+
+                let tex_layer = ((key & 0xFF) - 1) as u8;
+                let ao_packed = (key >> 8) as u8;
+                let light_packed = (key >> 16) as u16;
+                let (qx, qy, qz) = get_axis_coord(axis, d, u, v);
+                target.push(PackedQuad::new(
+                    [qx as u32, qy as u32, qz as u32],
+                    [w as u32, h as u32],
+                    face_dir as u32,
+                    tex_layer,
+                    ao_packed,
+                    light_packed,
+                ));
+            }
+        }
+    }
+}
+
+/// Emit the crossed geometry for every `cross | crop` block.
+///
+/// Plants never enter a cube mask, so this 32x32x32 sweep is their only source
+/// of geometry: exactly two unit quads (`face_dir` 6 and 7) per block, sampled
+/// from the +X (`face = 0`) texture layer. Cross art is unshaded: every corner
+/// gets full AO (3) and the cell's light in all four nibbles.
+fn mesh_cross(padded: &PaddedChunk, faces: &BlockFaces, mesh: &mut ChunkMesh) {
+    for py in 1..=CHUNK_SIZE {
+        for pz in 1..=CHUNK_SIZE {
+            for px in 1..=CHUNK_SIZE {
+                let block = padded.get(px, py, pz);
+                if !matches!(faces.model(block), BlockModel::Cross | BlockModel::Crop) {
+                    continue;
+                }
+                // Crop stages select their art through the side/all (+X) face.
+                let tex_layer = faces.layer(block, 0);
+                let light = padded.light_at(px, py, pz) as u16;
+                let light_packed = light | (light << 4) | (light << 8) | (light << 12);
+                let pos = [(px - 1) as u32, (py - 1) as u32, (pz - 1) as u32];
+                mesh.cross_quads.push(PackedQuad::new(
+                    pos,
+                    [1, 1],
+                    6,
+                    tex_layer,
+                    0xFF,
+                    light_packed,
+                ));
+                mesh.cross_quads.push(PackedQuad::new(
+                    pos,
+                    [1, 1],
+                    7,
+                    tex_layer,
+                    0xFF,
+                    light_packed,
+                ));
+            }
+        }
+    }
 }
 
 /// Emit air-facing liquid faces into `ChunkMesh::water_quads` (D070).
@@ -834,16 +972,173 @@ mod tests {
         assert_eq!(wrapper.water_quads, explicit.water_quads);
     }
 
-    /// FNV-1a 64 over the mesh quad stream in a fixed order: bucket count,
-    /// each bucket's length, every opaque quad word (dir 0..6), then the water
-    /// quad count and every water quad word. Local to this test module so T02
-    /// only has to change the block-id encoding inside the generators.
-    fn fnv1a64_mesh_baseline(mesh: &ChunkMesh) -> ([usize; 6], usize, usize, u64) {
+    #[test]
+    fn wheat_chunk_emits_two_cross_quads_and_no_cube_faces() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::WheatStage3);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        assert!(padded.has_any_render, "the plant cell is renderable");
+        assert!(!padded.has_any_solid, "a plant is not solid");
+        assert!(!padded.has_any_liquid);
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 0, "plants never emit cube faces");
+        assert_eq!(mesh.blend_quad_count(), 0);
+        assert_eq!(mesh.cross_quad_count(), 2);
+        let mut dirs: Vec<u32> = mesh.cross_quads.iter().map(|q| q.unpack().5).collect();
+        dirs.sort_unstable();
+        assert_eq!(dirs, vec![6, 7], "exactly the two crossed planes");
+        for quad in &mesh.cross_quads {
+            let (x, y, z, w, h, _, layer, ao, light) = quad.unpack();
+            assert_eq!((x, y, z, w, h), (5, 6, 7, 1, 1));
+            assert_eq!(layer, BlockId::WheatStage3.face_tex_layer(0));
+            assert_eq!(ao, 0xFF, "cross art is unshaded: every corner AO = 3");
+            assert_eq!(light, 0xFFFF, "the cell's light fills all four nibbles");
+        }
+    }
+
+    #[test]
+    fn uniform_wheat_chunk_fills_its_voxels_instead_of_returning_empty() {
+        let padded = PaddedChunk::from_center_only(&Chunk::new_uniform(BlockId::WheatStage1));
+        assert!(padded.has_any_render, "a uniform plant chunk is renderable");
+        assert!(!padded.has_any_solid && !padded.has_any_liquid);
+        assert_eq!(padded.get(1, 1, 1), BlockId::WheatStage1);
+        assert_eq!(
+            padded.get(CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE),
+            BlockId::WheatStage1
+        );
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 0);
+        assert_eq!(
+            mesh.cross_quad_count(),
+            2 * CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE,
+            "every cell emits its two crossed planes"
+        );
+    }
+
+    #[test]
+    fn single_cutout_leaves_block_emits_six_cutout_faces_in_buckets() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::OakLeaves);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        assert!(padded.has_any_render && padded.has_any_solid);
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 6, "cutout shares the opaque draw");
+        assert_eq!(mesh.blend_quad_count(), 0);
+        assert_eq!(mesh.cross_quad_count(), 0);
+        for (dir, bucket) in mesh.buckets.iter().enumerate() {
+            assert_eq!(bucket.len(), 1, "bucket {dir} must hold the leaf face");
+            assert_eq!(
+                bucket[0].unpack().6,
+                BlockId::OakLeaves.face_tex_layer(dir as u8)
+            );
+        }
+    }
+
+    #[test]
+    fn single_glass_block_emits_only_blend_faces() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::Glass);
+        let padded = PaddedChunk::from_center_only(&chunk);
+        assert!(padded.has_any_render, "a glass-only chunk is renderable");
+        assert!(padded.has_any_solid, "glass still collides");
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(
+            mesh.total_quads(),
+            0,
+            "glass never enters the opaque upload"
+        );
+        assert_eq!(mesh.cross_quad_count(), 0);
+        assert_eq!(mesh.blend_quad_count(), 6);
+        let mut dirs: Vec<u32> = mesh.blend_quads.iter().map(|q| q.unpack().5).collect();
+        dirs.sort_unstable();
+        assert_eq!(dirs, vec![0, 1, 2, 3, 4, 5]);
+        for quad in &mesh.blend_quads {
+            assert_eq!(quad.unpack().6, BlockId::Glass.face_tex_layer(0));
+        }
+    }
+
+    #[test]
+    fn glass_against_stone_keeps_the_stone_face_and_culls_the_touching_glass_face() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::Glass);
+        chunk.set(6, 6, 7, BlockId::Stone);
+        let padded = PaddedChunk::from_center_only(&chunk);
+
+        let mesh = mesh_chunk(&padded);
+        // Stone culls only against opaque neighbours, so all six of its faces
+        // survive; the -X one looks through the glass.
+        assert_eq!(mesh.total_quads(), 6);
+        assert_eq!(mesh.buckets[1].len(), 1, "the stone's -X face survives");
+        // Glass culls against the opaque wall: its +X face is hidden.
+        assert_eq!(mesh.blend_quad_count(), 5);
+        assert!(
+            mesh.blend_quads.iter().all(|q| q.unpack().5 != 0),
+            "the glass face pressed to stone must be culled"
+        );
+    }
+
+    #[test]
+    fn glass_against_glass_culls_internal_faces() {
+        let mut chunk = Chunk::new_uniform(BlockId::Air);
+        chunk.set(5, 6, 7, BlockId::Glass);
+        chunk.set(6, 6, 7, BlockId::Glass);
+        let padded = PaddedChunk::from_center_only(&chunk);
+
+        let mesh = mesh_chunk(&padded);
+        assert_eq!(mesh.total_quads(), 0);
+        // Two adjacent cells expose 5 faces each. The four side directions
+        // greedy-merge the pair into one 2x1 quad each, leaving 6 quads that
+        // cover 10 cube faces (not the 12 an unculled pair would emit).
+        assert_eq!(mesh.blend_quad_count(), 6);
+        let area: u32 = mesh
+            .blend_quads
+            .iter()
+            .map(|q| {
+                let (_, _, _, w, h, _, _, _, _) = q.unpack();
+                w * h
+            })
+            .sum();
+        assert_eq!(area, 10, "glass-glass internal faces stay invisible");
+        assert!(
+            !mesh
+                .blend_quads
+                .iter()
+                .any(|q| matches!(q.unpack(), (5, _, _, _, _, 0, _, _, _))),
+            "no +X quad at the internal x=5 boundary"
+        );
+        assert!(
+            !mesh
+                .blend_quads
+                .iter()
+                .any(|q| matches!(q.unpack(), (6, _, _, _, _, 1, _, _, _))),
+            "no -X quad at the internal x=6 boundary"
+        );
+    }
+
+    /// FNV-1a 64 over every mesh quad stream in a fixed order: bucket count,
+    /// each bucket's length, every opaque/cutout quad word (dir 0..6), then
+    /// the water count and its words, then the blend count and its words, then
+    /// the cross count and its words. Folding every class keeps the pin honest:
+    /// a change to glass destinations or plant geometry fails here.
+    fn fnv1a64_mesh_baseline(mesh: &ChunkMesh) -> ([usize; 6], usize, usize, usize, usize, u64) {
         fn feed(hash: &mut u64, bytes: &[u8]) {
             for &byte in bytes {
                 *hash ^= byte as u64;
                 *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
             }
+        }
+
+        fn feed_quads(hash: &mut u64, quads: &[PackedQuad]) -> usize {
+            feed(hash, &(quads.len() as u64).to_le_bytes());
+            for quad in quads {
+                feed(hash, &quad.0[0].to_le_bytes());
+                feed(hash, &quad.0[1].to_le_bytes());
+            }
+            quads.len()
         }
 
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
@@ -862,14 +1157,18 @@ mod tests {
             }
         }
 
-        let water_count = mesh.water_quads.len();
-        feed(&mut hash, &(water_count as u64).to_le_bytes());
-        for quad in &mesh.water_quads {
-            feed(&mut hash, &quad.0[0].to_le_bytes());
-            feed(&mut hash, &quad.0[1].to_le_bytes());
-        }
+        let water_count = feed_quads(&mut hash, &mesh.water_quads);
+        let blend_count = feed_quads(&mut hash, &mesh.blend_quads);
+        let cross_count = feed_quads(&mut hash, &mesh.cross_quads);
 
-        (bucket_counts, opaque_count, water_count, hash)
+        (
+            bucket_counts,
+            opaque_count,
+            water_count,
+            blend_count,
+            cross_count,
+            hash,
+        )
     }
 
     #[test]
@@ -894,21 +1193,25 @@ mod tests {
         synthetic.set(25, 26, 27, BlockId::Brick);
         let mesh_b = mesh_chunk(&PaddedChunk::from_center_only(&synthetic));
 
-        // Captured from the unmodified pre-M010 mesher. Any greedy-merge,
-        // AO/light, quad packing or water-emission drift fails here.
+        // Captured from the pre-M010 mesher and re-pinned once per documented
+        // geometry change. Any greedy-merge, AO/light, quad packing or
+        // water/blend/cross-emission drift fails here.
         //
-        // S03 re-pin: wheat is now a non-solid `BlockKind::Plant`, so the
-        // synthetic wheat cell no longer emits cube faces and the chunk is
-        // four opaque cubes plus the water cell. The later model/alpha task
-        // (T04) adds cross quads and re-pins again.
-        let expected: [([usize; 6], usize, usize, u64); 2] = [
+        // S03-T02 re-pin: wheat became a non-solid `BlockKind::Plant`, so the
+        // synthetic wheat cell stopped emitting cube faces.
+        // S03-T04 re-pin: wheat is now `model = crop`, so the synthetic cell
+        // emits two cross quads and no cubes; the hash also folds the blend and
+        // cross buckets, which are empty in both cases except for that pair.
+        let expected: [([usize; 6], usize, usize, usize, usize, u64); 2] = [
             (
                 [370, 482, 402, 471, 274, 471],
                 2_470,
                 0,
-                7_499_183_456_375_510_007,
+                0,
+                0,
+                9_147_626_324_952_005_047,
             ),
-            ([4, 4, 4, 4, 4, 4], 24, 6, 7_729_742_243_065_713_213),
+            ([4, 4, 4, 4, 4, 4], 24, 6, 0, 2, 11_984_414_958_114_010_917),
         ];
         let actual = [
             fnv1a64_mesh_baseline(&mesh_a),

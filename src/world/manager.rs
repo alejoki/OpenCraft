@@ -1591,9 +1591,9 @@ impl WorldManager {
             let faces = Arc::clone(&self.block_faces);
             rayon::spawn(move || {
                 let padded = build_padded_from_snapshot(&snapshot);
-                // Water must be included so a water-bearing (or water-only)
-                // chunk is still meshed; only a fully empty volume skips.
-                let mesh = if !padded.has_any_solid && !padded.has_any_liquid {
+                // Every non-Air cell (solid, water, glass, cross plants) is
+                // renderable geometry; only a fully empty volume skips.
+                let mesh = if !padded.has_any_render {
                     None
                 } else {
                     Some(mesh_chunk_with(&padded, &faces))
@@ -3140,7 +3140,7 @@ mod tests {
     }
 
     /// A chunk whose only content is water must still be dispatched through
-    /// the mesher: the `!has_any_solid` fast skip used to drop it silently.
+    /// the mesher: a solidity-only fast skip used to drop it silently.
     #[test]
     fn test_water_only_chunk_is_dispatched_and_meshes_water_quads() {
         let _heavy = lock_heavy_streaming();
