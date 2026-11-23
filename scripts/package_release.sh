@@ -5,15 +5,17 @@
 #   e.g. bash scripts/package_release.sh 0.2.0 x86_64-unknown-linux-gnu
 #
 # Stages the portable folder required by D269 -- the release binary, the
-# tracked `config/` and `worldgen/` trees, and `LICENSE` -- then proves the
-# staged copy headlessly from a fresh temp CWD before archiving it:
+# tracked `config/` and `worldgen/` trees, `LICENSE`, and the shipped
+# `packs/default` pack -- then proves the staged copy headlessly from a fresh
+# temp CWD before archiving it:
 #   (a) --demo-ui         exits 0 with exactly 3 lines whose last ends ok=true
 #   (b) --demo-village    exits 0 with exactly 12 lines, last = village_demo: ok=true
 #   (c) --validate-pack   exits 0 with the exact 12-entry summary line
 #
-# Player state is never staged: no `packs/`, `saves/`, `settings.toml`,
-# `tests/`, `target/`, or the staged directory itself. The archive is written
-# to `dist/` (gitignored) and the staged directory is kept for inspection.
+# Player state is never staged: the shipped `packs/default` IS staged, while a
+# user's other packs, `saves/`, `settings.toml`, `tests/`, `target/`, and the
+# staged directory itself are not. The archive is written to `dist/`
+# (gitignored) and the staged directory is kept for inspection.
 #
 # Dependencies: bash, cp, mktemp, tar (Linux triple) or powershell.exe (Windows
 # triple under Git Bash); `timeout` is used when present.
@@ -47,7 +49,7 @@ fi
     fail "missing release binary $BIN (run cargo build --release --locked first)"
 BIN_NAME="$(basename "$BIN")"
 
-for input in config worldgen LICENSE; do
+for input in config worldgen LICENSE packs/default packs/default/pack.toml; do
     [[ -e "$CRATE_ROOT/$input" ]] || fail "missing tracked input $CRATE_ROOT/$input"
 done
 [[ -d "$CRATE_ROOT/tests/fixtures/packs/mymod-ruby" ]] ||
@@ -62,6 +64,8 @@ cp -a "$BIN" "$STAGE/$BIN_NAME"
 cp -a "$CRATE_ROOT/config" "$STAGE/config"
 cp -a "$CRATE_ROOT/worldgen" "$STAGE/worldgen"
 cp -a "$CRATE_ROOT/LICENSE" "$STAGE/LICENSE"
+mkdir -p "$STAGE/packs"
+cp -a "$CRATE_ROOT/packs/default" "$STAGE/packs/default"
 
 SMOKE="$(mktemp -d "${TMPDIR:-/tmp}/opencraft-package.XXXXXX")" ||
     fail "mktemp failed"
@@ -158,7 +162,7 @@ if [[ "$TRIPLE" == *windows* ]]; then
 else
     ARCHIVE="$DIST/opencraft-$VERSION-$TRIPLE.tar.gz"
     rm -f "$ARCHIVE"
-    tar -czf "$ARCHIVE" -C "$STAGE" "$BIN_NAME" config worldgen LICENSE ||
+    tar -czf "$ARCHIVE" -C "$STAGE" "$BIN_NAME" config worldgen packs LICENSE ||
         fail "tar failed for $ARCHIVE"
 fi
 

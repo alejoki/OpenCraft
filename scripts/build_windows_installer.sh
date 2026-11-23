@@ -45,6 +45,8 @@ STAGE="$CRATE_ROOT/dist/opencraft-$VERSION-x86_64-pc-windows-msvc"
 [[ -f "$STAGE/LICENSE" ]] || fail "missing $STAGE/LICENSE (run package_release.sh first)"
 [[ -d "$STAGE/config" ]] || fail "missing $STAGE/config (run package_release.sh first)"
 [[ -d "$STAGE/worldgen" ]] || fail "missing $STAGE/worldgen (run package_release.sh first)"
+[[ -f "$STAGE/packs/default/pack.toml" ]] ||
+    fail "missing $STAGE/packs/default/pack.toml (run package_release.sh first)"
 
 find_iscc() {
     if command -v iscc >/dev/null 2>&1; then

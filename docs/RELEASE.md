@@ -93,14 +93,24 @@ bash scripts/verify_release_artifacts.sh dist/rehearsal 0.3.0
 `opencraft-<VERSION>-x86_64-unknown-linux-gnu.tar.gz` contains an executable
 `opencraft`, that `opencraft-<VERSION>-x86_64-pc-windows-msvc.zip` contains
 `opencraft.exe`, and that both carry `config/combat.toml`,
-`worldgen/villages/plains.toml` and `LICENSE` at the archive root. It also
-rejects a Windows `opencraft.exe` that still imports `VCRUNTIME140.dll` (D290
-builds the release with a static CRT), and requires
+`worldgen/villages/plains.toml`, `packs/default/pack.toml` and `LICENSE` at the
+archive root. It also rejects a Windows `opencraft.exe` that still imports
+`VCRUNTIME140.dll` (D290 builds the release with a static CRT), and requires
 `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` to be a PE image whose
 version resource names OpenCraft and the release version. The script runs the
 Linux binary headlessly (`--demo-ui`, `--demo-village`, `--validate-pack`)
-from a scratch directory, and rejects any `packs/`, `saves/` or `settings.toml`
-entry in the Windows zip.
+from a scratch directory. In the Windows zip it rejects `saves/`,
+`settings.toml` and any `packs/` entry other than `packs/default/...`, so a
+user pack or real player state can never ship inside an archive.
+
+Both portable archives and the Windows installer ship `packs/default` — the
+editable master of the game's procedural art and synthesized sounds. Deleting
+or damaging that folder in a checkout is recoverable because the game restores
+it from its embedded copy and loads it as the implicit first pack. The
+archives still refuse `saves/`, `settings.toml` and any user pack outside
+`packs/default/`: those are player state, not shipped content. Installing or
+upgrading with the setup exe refreshes `packs/default` in place, while
+`saves/` and `settings.toml` stay untouched and persist across upgrades.
 
 If the rehearsal is red, fix forward and push again. Do not tag a red
 rehearsal.
