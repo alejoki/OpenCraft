@@ -5,7 +5,7 @@ A texture pack replaces the game's block textures and can also supply a custom t
 ## Quickstart
 
 1. Find the folder that contains the game's `settings.toml` (the game's working directory).
-2. Create a folder named `packs/` next to `settings.toml` — the game does not ship one and never creates it for you — and inside it a folder named `my-first-pack/`.
+2. Inside the game's `packs/` folder — created for you on first launch, already containing the shipped `default` pack — create a folder named `my-first-pack/`.
 3. Save the file below as `pack.toml` inside `packs/my-first-pack/`.
 4. Launch the game, open **Settings**, and cycle the **Texture Pack** row until it shows your pack.
 
@@ -24,15 +24,26 @@ That pack is valid on its own: with no image files it simply keeps every built-i
 
 Packs are folders under `packs/`, relative to the game's working directory — the same place the game keeps `saves/` and `settings.toml`.
 
-- The game does not ship a `packs/` folder and never creates one itself. If it does not exist yet, you create it in the game's working directory, and pack folders go directly inside it.
+- The game ships `packs/default` and restores it from an embedded master when the folder or its manifest is missing, unreadable, or not `format_version = 3`. That restore only fills files that are absent; it never overwrites an existing file, so edited or deliberately corrupt-but-present art survives a relaunch. This is the only pack folder the game creates.
 - The pack folder name is the pack's fallback display name in the Settings menu when `pack.toml` does not set `name`.
 - Every pack should include a `pack.toml`. A folder with no manifest still appears, but it loads with default values and shows a warning naming `pack.toml`.
-- The game only reads packs. It never writes files inside `packs/`.
-- The Default entry always exists and is the built-in procedural texture set.
+- Apart from restoring `packs/default`, the game only reads packs. It never rewrites a pack file you can see in the folder.
+- The shipped Default entry is always the implicit first presentation entry, underneath every selected pack; see [The shipped Default pack](#the-shipped-default-pack).
+
+## The shipped Default pack
+
+The game ships one pack, `packs/default`, so a fresh install has a working presentation without any setup. It is generated from the same procedural art and synthesized sounds the engine uses as its built-in fallback, and the generator is deterministic, so the shipped bytes never drift from the live defaults.
+
+- It contains 75 files: `pack.toml`, the 25 block layers, the 13 mob layers, 27 built-in item icons under `icons/`, and the 9 sound files.
+- It loads as the implicit first presentation entry on every launch, underneath whatever packs you select. It is not a row on the Packs screen and never appears in `settings.toml`; an explicit `default` entry in an old stack is folded into that implicit slot.
+- If the folder is missing, or its `pack.toml` is missing, unreadable, or not `format_version = 3`, the game restores it from the embedded master and shows one notice on the first Settings open. The restore only fills files that are absent; it never overwrites a file that is present, so an edited or corrupt-but-present image survives a relaunch.
+- Because it uses the ordinary pack format, you can copy `packs/default` to `packs/my-first-pack` as a starter pack and edit it like any other.
+- It ships no wordmark/logo asset (a documented exception): the menu keeps the built-in title art, and adding a `logo.png` to your own pack is the supported way to change it.
+- `--validate-pack default` is read-only and reports `27 entries, 0 errors, 0 warnings` (the 27 `[builtin_icons]` entries).
 
 Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
 
-The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v3 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; the game never creates `packs/`.
+The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v3 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; a normal install ships only the `packs/default` pack.
 
 ## pack.toml reference
 
@@ -418,7 +429,7 @@ corrupt.
 
 It is a test fixture, not part of a normal game install. To try it, copy the
 `tests/fixtures/packs/uat-sound/` folder into your game's working directory as `packs/uat-sound/` —
-creating the `packs/` folder yourself first if it does not exist — then open
+the game's `packs/` folder already exists and holds the restored `default` pack — then open
 **Settings → Packs** and enable `uat-sound`. Break and place a block and finish a
 mining sequence to hear the custom sounds; hit a mob and land an arrow to hear the
 pack's `mob_hurt` and `arrow_impact` files; open the settings menu to see the

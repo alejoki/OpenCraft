@@ -65,10 +65,11 @@
 #     digest; release rejects `--check-config` by design (Leg A).
 #
 #   Leg F release hygiene (release only): a bare bounded launch in an empty
-#     temp cwd exits 124, does not panic, and creates no packs/ or config/;
-#     no checked-in test pack leaked into the crate packs/ tree; a bounded
-#     launch with config + a real pack produces no `creator:` output and
-#     leaves config, pack, and settings bytes identical.
+#     temp cwd exits 124, does not panic, restores the shipped packs/default,
+#     creates no config/, and leaves no other pack folder; no checked-in test
+#     pack leaked into the crate packs/ tree; a bounded launch with config + a
+#     real pack produces no `creator:` output and leaves config, pack, and
+#     settings bytes identical.
 #
 # Every bounded live launch must be killed by `timeout` (exit 124); a clean
 # exit or panic is a FAILURE. Only exit 124 is accepted for those legs.
@@ -207,6 +208,20 @@ install_ruby_pack() {
         fail "cannot copy the checked-in mymod-ruby fixture into $dest"
     printf '[packs]\nstack = ["mymod-ruby"]\n' >"$dest/settings.toml" ||
         fail "cannot write $dest/settings.toml"
+    seed_shipped_default "$dest"
+}
+
+# Copy the complete shipped default pack into a launch cwd.
+#
+# Production startup always ensures `packs/default`, so a fixture that omits it
+# would gain 75 files during the first bounded launch. Seeding the same bytes
+# makes the restore a strict no-op and keeps the tree byte-identity assertions
+# below focused on present bytes (the restore policy itself is proven by
+# pack_smoke scenario 3 and the server/startup tests).
+seed_shipped_default() {
+    local dest="$1"
+    cp -R "$CRATE_ROOT/packs/default" "$dest/packs/default" ||
+        fail "cannot copy the shipped packs/default into $dest"
 }
 
 # The five distinct valid 16x16 RGBA PNGs (82 bytes each) reused by the other
@@ -241,6 +256,7 @@ EOF
     write_valid_png "$dest/packs/textures/apple.png" "$PNG_C"
     printf '[packs]\nstack = ["textures"]\n' >"$dest/settings.toml" ||
         fail "cannot write $dest/settings.toml"
+    seed_shipped_default "$dest"
 }
 
 # Run one headless leg (demo/rejection): both display variables are emptied so
@@ -802,10 +818,20 @@ if [[ "$PROFILE" == "release" ]]; then
         fail "mktemp failed for leg F empty cwd"
     start_live "$LEG_F_EMPTY" 5 "$LEG_F_EMPTY/live.log"
     finish_live "leg F empty-cwd launch" "$LEG_F_EMPTY/live.log"
-    assert_absent "leg F empty-cwd launch" "$LEG_F_EMPTY/packs"
+    # The shipped default is the one pack a bare launch restores. Nothing else
+    # may appear in the cwd's packs/ tree, and config/ is never created.
+    [[ -f "$LEG_F_EMPTY/packs/default/pack.toml" ]] ||
+        fail "leg F empty-cwd launch: the shipped packs/default/pack.toml was not restored"
+    for entry in "$LEG_F_EMPTY/packs"/*; do
+        [[ -e "$entry" ]] || continue
+        [[ "${entry##*/}" == "default" ]] ||
+            fail "leg F empty-cwd launch: unexpected pack folder $entry"
+    done
     assert_absent "leg F empty-cwd launch" "$LEG_F_EMPTY/config"
 
     if [[ -d "$CRATE_ROOT/packs" ]]; then
+        # Only the shipped `default` pack legitimately lives in the repo
+        # packs/ tree; a checked-in test fixture must never leak into it.
         for folder in mymod-ruby ruby-overlay uat-sound; do
             assert_absent "leg F crate pack leak" "$CRATE_ROOT/packs/$folder"
         done
@@ -832,4 +858,4 @@ if [[ "$PROFILE" == "release" ]]; then
     expect_regex_count "leg F config+pack launch" 0 "$LEG_F_PACK/live.log" '^creator: '
 fi
 
-echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, all-domain live config (six files), block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v10 migration with one-shot config mismatch, and profile-appropriate release hygiene all passed"
+echo "CREATOR SMOKE PASS [profile=$PROFILE]: doc gate, config audit/rejection, live config apply/reject, all-domain live config (six files), block/mob/builtin-item texture reload, restart-required recipe boundary, same-save two-run restart, v8-to-v10 migration with one-shot config mismatch, and profile-appropriate release hygiene (empty cwd restores only packs/default, no config) all passed"

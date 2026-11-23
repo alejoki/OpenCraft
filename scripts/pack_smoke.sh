@@ -23,15 +23,18 @@
 #      mob sound overrides are exercised on every launch. Two bounded launches
 #      must survive; settings.toml, pack.toml, the two table PNGs, and all four
 #      sound files must be byte-identical after each run (settings persist
-#      without rewrite, and the game is read-only on packs/).
+#      without rewrite; present pack bytes are never rewritten, and the shipped
+#      default may only be filled in alongside them).
 #   2. Corrupt pack: junk pack.toml plus junk stone.png and
 #      crafting_table_top.png, junk place.wav, and junk mob_death.wav under a
 #      selected "broken" pack degrade per file — launch survives and every file
 #      stays byte-identical.
 #   3. Missing pack: settings point at "ghost" with no packs/ directory —
-#      launch survives on the Default fallback and creates no packs/.
+#      the launch survives on Default and restores the shipped packs/default
+#      (pack.toml plus all 75 shipped files) without creating any other pack
+#      folder.
 #
-# Dependencies: bash, timeout, cmp, mktemp, grep, awk, base64. Missing layer
+# Dependencies: bash, timeout, cmp, mktemp, grep, awk, base64, find, wc. Missing layer
 # files are a legal silent fallback in the loader contract, so most of the
 # fixture is manifest-only. The two table PNGs are decoded from embedded
 # base64 blobs of valid 16x16 RGBA PNGs (distinct solid colours), so no PNG
@@ -71,7 +74,7 @@ if [[ ! -x "$BIN" ]]; then
     exit 1
 fi
 
-for tool in timeout cmp mktemp grep awk base64; do
+for tool in timeout cmp mktemp grep awk base64 find wc; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool '$tool' not found on PATH"
 done
 
@@ -158,6 +161,10 @@ grep -q 'format_version = 3' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart 
 grep -q 'name =' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart TOML block has no 'name =' line"
 grep -q 'overlay_tint' "$QUICKSTART_TOML" || fail "scenario 0: Quickstart TOML block has no 'overlay_tint' line"
 
+# The shipped default is an executable part of the contract, so the guide must
+# name its folder.
+grep -Fq 'packs/default' "$DOC" || fail "scenario 0: guide does not document the shipped packs/default folder"
+
 LAYERS=(
     grass_top.png
     grass_side.png
@@ -225,7 +232,7 @@ for sound in "${SOUNDS[@]}"; do
     grep -Fq "$sound" "$DOC" || fail "scenario 0: guide does not document sound stem '$sound'"
 done
 
-echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with format_version = 3, name/overlay_tint and all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
+echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with format_version = 3, name/overlay_tint, the shipped packs/default folder, all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: selected pack + persistence across relaunch.
@@ -321,7 +328,8 @@ echo "PACK SMOKE PASS: scenario 2 (corrupt pack) — junk pack.toml, junk stone.
 # ---------------------------------------------------------------------------
 # Scenario 3: missing pack. The selection names a folder that does not exist
 # and there is no packs/ root at all; launch must fall back to Default and
-# must not create a packs/ directory.
+# restore the shipped packs/default from the embedded master. Nothing else may
+# appear under packs/ — the selected "ghost" folder is not created.
 # ---------------------------------------------------------------------------
 cat > "$TEMP_DIR_C/settings.toml" <<'EOF'
 [packs]
@@ -330,9 +338,18 @@ EOF
 
 run_bounded_launch "$TEMP_DIR_C" "$TEMP_DIR_C/output.log" "scenario 3" || exit 1
 
-[[ ! -e "$TEMP_DIR_C/packs" ]] || fail "scenario 3: packs/ directory was created during a run with no packs root"
+[[ -f "$TEMP_DIR_C/packs/default/pack.toml" ]] \
+    || fail "scenario 3: the shipped packs/default/pack.toml was not restored"
+SHIPPED_COUNT="$(find "$TEMP_DIR_C/packs/default" -type f | wc -l | tr -d '[:space:]')"
+[[ "$SHIPPED_COUNT" == "75" ]] \
+    || fail "scenario 3: restored packs/default has $SHIPPED_COUNT files (expected all 75 shipped files)"
+for entry in "$TEMP_DIR_C/packs"/*; do
+    [[ -e "$entry" ]] || continue
+    [[ "${entry##*/}" == "default" ]] \
+        || fail "scenario 3: unexpected pack folder created at $entry"
+done
 
-echo "PACK SMOKE PASS: scenario 3 (missing pack) — texture_pack = \"ghost\" with no packs/ root fell back to Default, exit 124, no panic, no packs/ created"
+echo "PACK SMOKE PASS: scenario 3 (missing pack) — texture_pack = \"ghost\" with no packs/ root restored the shipped packs/default (pack.toml plus 75 files), created no other pack folder, exit 124, no panic"
 
 echo "PACK SMOKE: all scenarios passed"
 exit 0

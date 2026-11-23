@@ -32,8 +32,10 @@
 #   panic) — the renderer opens the placeholder world with the reserved
 #   checker faces and the built-in defaults.
 #
-#   Throughout: every pack file and the settings file must stay byte-identical
-#   (the game is read-only on packs/ and settings.toml here).
+#   Throughout: every present pack file and the settings file must stay
+#   byte-identical. The shipped default is restored from embedded bytes, so a
+#   launch may only add absent `packs/default` files here; it never rewrites
+#   an existing pack byte or settings.toml.
 #
 # The pinned digest lines live in two places on purpose: here and in
 # `src/main.rs::presentation_demo_pins_the_authored_line_set`. Update both
@@ -322,5 +324,5 @@ echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed al
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PRESENTATION SMOKE EVIDENCE: $line"
 done
-echo "PRESENTATION SMOKE EVIDENCE: authored launch exit=124 placeholder launch exit=124 panic=none pack+settings byte-identical"
+echo "PRESENTATION SMOKE EVIDENCE: authored launch exit=124 placeholder launch exit=124 panic=none present pack+settings byte-identical (shipped-default restore only fills absent files)"
 exit 0

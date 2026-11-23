@@ -28,10 +28,14 @@
 #   Scenario 4 (bounded launches): with both good packs selected,
 #   `timeout 10 "$BIN"` exits 124 with no panic; after adding the broken pack
 #   to the stack the game still launches the same way. Throughout both legs the
-#   copied pack tree and settings.toml stay byte-identical.
+#   copied pack tree and settings.toml stay byte-identical. The fixture also
+#   seeds a complete `packs/default`, so the startup restore is a strict no-op
+#   and the tree comparison covers present bytes only.
 #
 # Everything runs in a mktemp working directory. The crate root's packs/,
-# settings.toml and saves/ are never touched. Judge every scenario by this
+# settings.toml and saves/ are never touched. Only the shipped `default` pack
+# legitimately lives in the repository packs/ tree; checked-in test packs must
+# never leak into it. Judge every scenario by this
 # script's own exit code; a child 124 is expected only for the bounded
 # launches (MEM377). This script is self-contained on purpose: it must not
 # delegate to validate_pack_smoke.sh, and it must never run `cargo test`.
@@ -127,6 +131,10 @@ fail() {
 mkdir -p "$TEMP_DIR/packs" || fail "cannot create packs/ in the temp dir"
 cp -R "$CRATE_PACK" "$TEMP_DIR/packs/mymod-ruby" || fail "cannot copy the checked-in reference pack"
 cp -R "$CRATE_OVERLAY" "$TEMP_DIR/packs/ruby-overlay" || fail "cannot copy the texture-only overlay"
+# Seed the complete shipped default so production startup's restore is a strict
+# no-op; the tree comparison below then describes present bytes only.
+cp -R "$CRATE_ROOT/packs/default" "$TEMP_DIR/packs/default" ||
+    fail "cannot seed the shipped packs/default"
 
 mkdir -p "$TEMP_DIR/packs/broken" || fail "cannot create packs/broken"
 cat >"$TEMP_DIR/packs/broken/pack.toml" <<'EOF'
@@ -151,7 +159,8 @@ stack = ["mymod-ruby", "ruby-overlay"]
 EOF
 
 # Snapshot the authored pack tree and both settings variants so the launch legs
-# can prove the game is read-only on packs/ and settings.toml.
+# can prove the game never rewrites present pack bytes (the shipped default is
+# already complete, so the restore writes nothing) or settings.toml.
 EXPECTED="$TEMP_DIR/expected"
 mkdir -p "$EXPECTED" || fail "cannot create expected/ dir"
 cp "$TEMP_DIR/settings.toml" "$EXPECTED/settings-good.toml" ||
@@ -362,5 +371,5 @@ echo "MODDING SMOKE EVIDENCE: clean mymod-ruby exit=$CLEAN_RC summary=12-entries
 echo "MODDING SMOKE EVIDENCE: clean ruby-overlay exit=$OVERLAY_RC summary=0-entries-0-errors-0-warnings"
 echo "MODDING SMOKE EVIDENCE: broken exit=$BROKEN_RC error=block-broken:missing_art valid-sibling=ok non-zero-errors=true"
 echo "MODDING SMOKE EVIDENCE: missing exit=$MISSING_RC error=pack-ghost"
-echo "MODDING SMOKE EVIDENCE: launches good-stack=$LAUNCH_GOOD_RC broken-pack=$LAUNCH_BROKEN_RC panic=none pack-and-settings-byte-identical"
+echo "MODDING SMOKE EVIDENCE: launches good-stack=$LAUNCH_GOOD_RC broken-pack=$LAUNCH_BROKEN_RC panic=none present-pack-and-settings-byte-identical (shipped-default restore is a no-op)"
 exit 0

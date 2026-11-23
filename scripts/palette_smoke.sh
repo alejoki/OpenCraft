@@ -30,9 +30,10 @@
 #   the palette stock degrades without blocking startup.
 #
 #   Throughout: every copied pack file and the settings file must stay
-#   byte-identical while the pack is present (the game is read-only on packs/
-#   and settings.toml here), and the cleared settings must stay byte-identical
-#   during leg B.
+#   byte-identical while the pack is present. The shipped default is restored
+#   from embedded bytes, so a launch may only add absent `packs/default` files
+#   here; it never rewrites an existing pack byte or settings.toml. The cleared
+#   settings must stay byte-identical during leg B.
 #
 # The pinned digest lines live in two places on purpose: here and in
 # `src/main.rs::palette_demo_pins_the_checked_in_reference_pack_line_set`.
@@ -265,5 +266,5 @@ echo "PALETTE SMOKE PASS [profile=$PROFILE]: --demo-palette listed 47 non-placeh
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PALETTE SMOKE EVIDENCE: $line"
 done
-echo "PALETTE SMOKE EVIDENCE: authored launch exit=124 removed-pack launch exit=124 panic=none pack+settings byte-identical while present cleared-settings byte-identical"
+echo "PALETTE SMOKE EVIDENCE: authored launch exit=124 removed-pack launch exit=124 panic=none present pack+settings byte-identical (shipped-default restore only fills absent files) cleared-settings byte-identical"
 exit 0

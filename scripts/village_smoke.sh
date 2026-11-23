@@ -40,7 +40,8 @@
 #
 #   Isolation: the repository's tracked worldgen/ tree, packs/ and config/ are
 #     byte-identical after every leg, and no launch cwd gains settings.toml,
-#     saves/ or packs/. Only target/ (git-ignored) is written inside the repo.
+#     saves/, or any pack folder except the restored packs/default. Only target/
+#     (git-ignored) is written inside the repo.
 #
 # The whole-line pinned digests are mirrored in src/main.rs's demo tests. They
 # must be re-pinned from a measured run of this binary; never relax a pin or
@@ -584,7 +585,18 @@ fi
 for dir in "${LAUNCH_DIRS[@]}"; do
     [[ ! -e "$dir/settings.toml" ]] || fail "launch cwd $dir gained a settings.toml"
     [[ ! -e "$dir/saves" ]] || fail "launch cwd $dir gained a saves/ directory"
-    [[ ! -e "$dir/packs" ]] || fail "launch cwd $dir gained a packs/ directory"
+    # The only pack folder a bare launch may create is the restored shipped
+    # default. A headless leg leaves packs/ absent entirely.
+    if [[ -e "$dir/packs" ]]; then
+        [[ -d "$dir/packs" ]] || fail "launch cwd $dir gained a non-directory packs path"
+        for entry in "$dir/packs"/*; do
+            [[ -e "$entry" ]] || continue
+            [[ "${entry##*/}" == "default" ]] \
+                || fail "launch cwd $dir gained a packs/ entry other than the restored default: $entry"
+        done
+        [[ -f "$dir/packs/default/pack.toml" ]] \
+            || fail "launch cwd $dir has a packs/ directory without the restored default manifest"
+    fi
 done
 
 # --- Leg 14: PASS + one evidence line per pinned digest group -------------
@@ -594,5 +606,5 @@ echo "VILLAGE SMOKE EVIDENCE: capture success bytes=423 sockets=1 markers=0 ambi
 echo "VILLAGE SMOKE EVIDENCE: capture idempotence capture.toml byte-identical second path=prefabs/capture_2.toml bytes=425"
 echo "VILLAGE SMOKE EVIDENCE: generate digest=0x79663be18a213bab session chunks=6 cells=2962 deterministic across two temp cwds"
 echo "VILLAGE SMOKE EVIDENCE: degradation prefabs=2 diagnostics=2 digest=0xe6bdd6a9da365441 session cells=2850; missing tree exit=1 failed=site"
-echo "VILLAGE SMOKE EVIDENCE: worldgen/packs/config byte-identical; launch cwds free of settings.toml, saves/ and packs/"
+echo "VILLAGE SMOKE EVIDENCE: worldgen/packs/config byte-identical; launch cwds free of settings.toml and saves/; any created packs/ holds only the restored default"
 exit 0
