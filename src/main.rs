@@ -111,7 +111,8 @@ use opencraft::settings::{
 #[cfg(test)]
 use opencraft::startup::startup_session;
 use opencraft::startup::{
-    build_session_registry, load_startup_stack, reload_village_catalog, startup_session_with,
+    build_session_registry, content_specs, effective_pack_stack, load_startup_stack,
+    reload_village_catalog, startup_session_with,
 };
 use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
@@ -1449,6 +1450,11 @@ struct StartupContent {
     /// this bundle keeps one source of truth for production and tests.
     settings_path: PathBuf,
     packs_root: PathBuf,
+    /// Whether production startup owns the implicit shipped default pack.
+    /// When true, `GameApp::effective_stack` resolves the restore-aware
+    /// `["default", ..raw]` stack on every live apply; when false (headless
+    /// tests and demos) the raw persisted stack is used verbatim.
+    default_pack_enabled: bool,
     /// The launch pack-stack registry: the immutable base every loaded session
     /// and every newly created world is resolved against. It is replaced only
     /// by a pack-stack change, and then only for the NEXT load (MEM512).
@@ -1476,6 +1482,7 @@ impl StartupContent {
         packs_root: PathBuf,
         config_dir: Option<&Path>,
         worldgen_root: Option<&Path>,
+        restore_default: bool,
     ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
@@ -1491,14 +1498,32 @@ impl StartupContent {
             None => ConfigRuntime::defaults(),
         };
         startup_warnings.extend(opencraft::config::startup_warnings(&config));
+        // Shipped default restore (M019/S02): production startup fills only
+        // absent files under `packs/default` and repairs only an unusable
+        // manifest, then resolves the implicit first presentation entry. The
+        // restore never overwrites present bytes, so an edited pack survives.
+        // Its notices join the same one-time first-Settings-open path as every
+        // other startup warning (MEM009). Headless tests and demos pass
+        // `false`, keeping their temp roots untouched and reading no
+        // repository pack tree beyond what they already inject.
+        if restore_default {
+            let restore = pack::defaults::ensure_default_pack(&packs_root);
+            startup_warnings.extend(restore.warnings);
+        }
         // Pack discovery and startup apply (M004/S03): the persisted choice
         // is re-applied on every launch. A missing/deleted pack folder still
         // yields a fully usable procedural pack plus one warning naming it,
         // surfaced through the existing first-Settings-open message path
-        // (D031/MEM121, MEM009: warnings are data, never logs).
+        // (D031/MEM121, MEM009: warnings are data, never logs). Discovery runs
+        // after the restore so the shipped default is never listed as a row.
         let available_packs = pack::available_pack_names(&packs_root);
+        let startup_stack = if restore_default {
+            effective_pack_stack(&packs_root, &settings.pack_stack)
+        } else {
+            settings.pack_stack.clone()
+        };
         let (current_pack, pack_specs, pack_warnings) =
-            load_startup_stack(&packs_root, &settings.pack_stack);
+            load_startup_stack(&packs_root, &startup_stack);
         startup_warnings.extend(pack_warnings);
         // Startup sound overrides (M005/S05): resolved independently of the
         // texture result, so a pack whose layers partially failed still
@@ -1512,8 +1537,11 @@ impl StartupContent {
         startup_warnings.extend(sound_warnings);
         // Session content registry (M010/S02): built once from the ordered
         // stack over the built-in table, then frozen for the whole session.
-        // Registry diagnostics join the same one-time warning path.
-        let (base_registry, registry_report) = build_session_registry(&pack_specs);
+        // The implicit shipped default is presentation-only and is excluded
+        // from save/registry identity (D340-D342), so `digest()` and `packs()`
+        // stay byte-identical to the built-in registry. Registry diagnostics
+        // join the same one-time warning path.
+        let (base_registry, registry_report) = build_session_registry(&content_specs(&pack_specs));
         startup_warnings.extend(registry_warnings(&registry_report));
         // Authored village/prefab catalog (M015/S03): fail-soft behind an
         // explicit opt-in root. A missing or broken tree degrades to an empty
@@ -1539,6 +1567,7 @@ impl StartupContent {
             audio,
             settings_path: settings_path.to_path_buf(),
             packs_root,
+            default_pack_enabled: restore_default,
             base_registry,
             village_catalog,
             worldgen_root: worldgen_root.map(Path::to_path_buf),
@@ -1728,6 +1757,11 @@ struct GameApp {
     /// `saves/` and `settings.toml`. Injected by tests like
     /// `settings_path`.
     packs_root: PathBuf,
+    /// Whether production startup owns the implicit shipped default pack.
+    /// Enabled resolves `["default", ..raw]` on every live stack apply, so a
+    /// texture-only default edit can never make the presentation vanish;
+    /// disabled (headless tests and demos) uses the raw persisted stack.
+    default_pack_enabled: bool,
     /// Sorted pack names discovered under `packs_root` at startup. Cycling
     /// walks this list; a pack authored while the game is running appears
     /// on the next launch (no filesystem polling in the menu).
@@ -1909,6 +1943,7 @@ impl GameApp {
             Path::new(pack::PACKS_DIR).to_path_buf(),
             None,
             None,
+            false,
         );
         Self::new_with_content(cli, session, content, background_path)
     }
@@ -1935,6 +1970,7 @@ impl GameApp {
             audio,
             settings_path,
             packs_root,
+            default_pack_enabled,
             base_registry,
             village_catalog,
             worldgen_root,
@@ -2113,10 +2149,15 @@ impl GameApp {
         // this instant so a launch-time edit is never re-applied.
         let pack_presentation =
             current_pack.map(|pack| PackPresentation::build(pack, pack_specs, &base_registry));
+        let startup_stack = if default_pack_enabled {
+            effective_pack_stack(&packs_root, &settings.pack_stack)
+        } else {
+            settings.pack_stack.clone()
+        };
         let pack_watch = build_pack_watch(
             pack_presentation.as_ref(),
             &packs_root,
-            &settings.pack_stack,
+            &startup_stack,
             Instant::now(),
         );
         let selection_seconds = config.rules().selection.selected_name_secs;
@@ -2173,6 +2214,7 @@ impl GameApp {
             message_tick_timer: Instant::now(),
             settings_path,
             packs_root,
+            default_pack_enabled,
             available_packs,
             pack_presentation,
             pack_watch,
@@ -2571,9 +2613,10 @@ impl GameApp {
         // installed spec so a folder that was missing at install cannot start
         // contributing content just because it exists now. Order is the
         // frozen stack order, which is what the registry digest encodes.
-        let mut candidate_specs = Vec::with_capacity(self.settings.pack_stack.len());
+        let effective_stack = self.effective_stack();
+        let mut candidate_specs = Vec::with_capacity(effective_stack.len());
         let mut found_target = false;
-        for folder in &self.settings.pack_stack {
+        for folder in &effective_stack {
             if folder == &entry.folder {
                 candidate_specs.push(pack::spec::load_spec_from_dir(
                     &self.packs_root.join(folder),
@@ -2588,7 +2631,7 @@ impl GameApp {
             return;
         }
 
-        let (candidate, _report) = build_session_registry(&candidate_specs);
+        let (candidate, _report) = build_session_registry(&content_specs(&candidate_specs));
         let candidate_fingerprint = ContentFingerprint::from_registry(&candidate);
         let changed = candidate_fingerprint != installed_fingerprint;
         if changed {
@@ -2671,10 +2714,11 @@ impl GameApp {
         // poll clock: the table update already consumed the current bytes, so
         // the next real edit — not this manifest write — settles.
         if paths_changed {
+            let effective_stack = self.effective_stack();
             self.pack_watch = build_pack_watch(
                 self.pack_presentation.as_ref(),
                 &self.packs_root,
-                &self.settings.pack_stack,
+                &effective_stack,
                 now,
             );
         }
@@ -2963,21 +3007,39 @@ impl GameApp {
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
+    /// The resolved stack this app presents and watches.
+    ///
+    /// Production startup owns the shipped default (implicit, first, never in
+    /// `settings.pack_stack`); tests and demos that opted out use the raw
+    /// persisted stack verbatim. Readiness is re-checked on every call so a
+    /// deleted default folder stops contributing without leaving a phantom
+    /// entry behind.
+    fn effective_stack(&self) -> Vec<String> {
+        if self.default_pack_enabled {
+            effective_pack_stack(&self.packs_root, &self.settings.pack_stack)
+        } else {
+            self.settings.pack_stack.clone()
+        }
+    }
+
     /// Reload the ordered stack and apply every live surface: merged layers,
     /// logo, tunes, and the Packs screen's warning message. The session's
     /// content registry is deliberately NOT replaced (MEM512); the candidate
     /// becomes the new `base_registry` for the NEXT load, and a changed
     /// definition digest only warns that content applies on the next load.
     fn apply_pack_stack(&mut self) {
-        let (loaded, specs, mut warnings) =
-            load_startup_stack(&self.packs_root, &self.settings.pack_stack);
+        let stack = self.effective_stack();
+        let (loaded, specs, mut warnings) = load_startup_stack(&self.packs_root, &stack);
         // Sound resolution is independent of the texture result and applies
         // live: the never-fail resolver starts from the synthesized set and
         // overlays only authored slots in stack order.
         let (sounds, sound_warnings) = pack::sound::resolve_sounds(&specs);
         self.audio.set_buffers(sounds);
         warnings.extend(sound_warnings);
-        let (candidate, report) = build_session_registry(&specs);
+        // The implicit default is presentation-only: identity uses the
+        // remaining specs, so its digest and `packs()` never enter save or
+        // registry identity (D340-D342).
+        let (candidate, report) = build_session_registry(&content_specs(&specs));
         warnings.extend(registry_warnings(&report));
         let changed = candidate.digest() != self.base_registry.digest();
 
@@ -2994,7 +3056,7 @@ impl GameApp {
         self.pack_watch = build_pack_watch(
             self.pack_presentation.as_ref(),
             &self.packs_root,
-            &self.settings.pack_stack,
+            &stack,
             Instant::now(),
         );
         self.creator.pack_status = None;
@@ -7475,6 +7537,8 @@ fn main() {
         // Production is the one opt-in `worldgen/` reader: keep this literal
         // shape (several source pins locate `StartupContent::load(` here).
         Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        // Only production restores and presents the shipped default pack.
+        true,
     );
     let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
@@ -16612,6 +16676,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -16714,6 +16779,7 @@ stack = 64
             dir.join("packs"),
             None,
             Some(root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -16942,6 +17008,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -17012,6 +17079,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -17076,6 +17144,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -27320,6 +27389,7 @@ stack = 64
             dir.join("packs"),
             Some(&config_dir),
             None,
+            false,
         )
     }
 
@@ -27435,6 +27505,7 @@ stack = 64
             dir.path().join("packs"),
             Some(&dir.path().join("absent-config")),
             None,
+            false,
         );
 
         assert_eq!(content.config.rules(), RulesBundle::default());
@@ -27462,6 +27533,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             None,
+            false,
         );
 
         assert!(
@@ -27490,6 +27562,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(root),
+            false,
         );
 
         assert_eq!(content.village_catalog.len(), 1);
@@ -27529,6 +27602,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+            false,
         );
         let cli = CliConfig::parse_args([
             "--new",
@@ -27569,6 +27643,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+            false,
         );
         let cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
         let startup = WorldSession::new_session(3, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
@@ -29335,6 +29410,7 @@ selected_name_secs = 0.5
             dir.path().join("packs"),
             Some(&config_dir),
             None,
+            false,
         );
         let session = startup_session_with(&cli, &content.base_registry, &content.config);
         let traced =
@@ -29576,8 +29652,13 @@ selected_name_secs = 0.5
     /// `settings.toml`.
     fn pack_app(dir: &Path) -> GameApp {
         std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
-        let content =
-            StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None, None);
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            None,
+            None,
+            false,
+        );
         let save_path = dir.join("pack-app.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
@@ -29597,6 +29678,194 @@ selected_name_secs = 0.5
         app.available_packs = pack::available_pack_names(&app.packs_root);
         app.settings.pack_stack = stack.iter().map(|name| (*name).to_string()).collect();
         app.apply_pack_stack();
+    }
+
+    /// Recursively count regular files under `root`.
+    fn count_files_recursive(root: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read restore dir") {
+                let path = entry.expect("restore dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Startup with `restore_default` and no config/worldgen roots, so the
+    /// only possible warnings are pack/restore notices.
+    fn default_pack_content(dir: &Path, restore_default: bool) -> (PathBuf, StartupContent) {
+        let packs_root = dir.join("packs");
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            packs_root.clone(),
+            None,
+            None,
+            restore_default,
+        );
+        (packs_root, content)
+    }
+
+    #[test]
+    fn default_pack_startup_restores_presents_and_stays_out_of_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+
+        let default_dir = packs_root.join(pack::defaults::DEFAULT_PACK_FOLDER);
+        assert_eq!(
+            count_files_recursive(&default_dir),
+            75,
+            "the shipped master restores exactly 75 files"
+        );
+        let pack = content
+            .current_pack
+            .as_ref()
+            .expect("the restored default is the first presentation entry");
+        assert_eq!(pack.display_name, "Default");
+        assert_eq!(content.pack_specs.len(), 1);
+        assert!(
+            content.base_registry.digest() == ContentRegistry::builtin().digest(),
+            "the implicit default must not change registry identity"
+        );
+        assert!(
+            content.base_registry.packs().is_empty(),
+            "the implicit default must never appear in packs()"
+        );
+        let restore_warnings: Vec<_> = content
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD)
+            .collect();
+        assert_eq!(restore_warnings.len(), 1);
+        assert!(restore_warnings[0].reason.contains("(75 files)"));
+        assert!(
+            content.settings.pack_stack.is_empty(),
+            "the implicit default never enters the persisted stack"
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_keeps_edits_and_restores_only_absent_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, first) = default_pack_content(dir.path(), true);
+        let original_dirt = first.pack_specs[0].block_layers[2]
+            .clone()
+            .expect("dirt art is authored");
+
+        // One edited file (present bytes must survive) and one deleted file
+        // (the only thing the second restore may write).
+        let edited = [250u8, 10, 20, 255];
+        write_solid_png(
+            &packs_root
+                .join(pack::defaults::DEFAULT_PACK_FOLDER)
+                .join("grass_top.png"),
+            edited,
+        );
+        std::fs::remove_file(
+            packs_root
+                .join(pack::defaults::DEFAULT_PACK_FOLDER)
+                .join("dirt.png"),
+        )
+        .expect("delete one shipped file");
+
+        let (_, second) = default_pack_content(dir.path(), true);
+        let layers = &second.pack_specs[0].block_layers;
+        let grass = layers[0].as_ref().expect("edited grass art loads");
+        assert_eq!(&grass[..4], &edited, "the edited layer bytes are applied");
+        assert_eq!(
+            layers[2].as_deref(),
+            Some(original_dirt.as_slice()),
+            "the deleted file is restored byte-for-byte"
+        );
+        assert!(packs_root
+            .join(pack::defaults::DEFAULT_PACK_FOLDER)
+            .join("dirt.png")
+            .is_file());
+
+        let restore_warnings: Vec<_> = second
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD)
+            .collect();
+        assert_eq!(restore_warnings.len(), 1, "one notice per restore call");
+        assert!(
+            restore_warnings[0].reason.contains("(1 files)"),
+            "only the deleted file is written: {:?}",
+            restore_warnings[0].reason
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_disabled_leaves_the_root_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), false);
+
+        assert!(
+            !packs_root.exists(),
+            "disabled startup creates no packs dir"
+        );
+        assert!(content.current_pack.is_none());
+        assert!(content.pack_specs.is_empty());
+        assert!(
+            !content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD),
+            "a disabled restore reports no pack warning"
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_survives_pack_toggles_and_never_enters_the_stack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+
+        let save_path = dir.path().join("default-pack.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+
+        app.toggle_pack_row("alpha");
+        assert_eq!(app.settings.pack_stack, vec!["alpha".to_string()]);
+        assert!(
+            app.pack_presentation.is_some(),
+            "enabling a user pack keeps the implicit default visible"
+        );
+
+        app.toggle_pack_row("alpha");
+        assert!(app.settings.pack_stack.is_empty());
+        assert!(
+            app.pack_presentation.is_some(),
+            "disabling the last user pack must not remove the default"
+        );
+        assert!(!app
+            .settings
+            .pack_stack
+            .iter()
+            .any(|folder| folder == pack::defaults::DEFAULT_PACK_FOLDER));
+    }
+
+    #[test]
+    fn default_pack_startup_hides_the_implicit_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+
+        assert!(content.available_packs.is_empty());
+        assert!(
+            !pack::available_pack_names(&packs_root)
+                .iter()
+                .any(|name| name == pack::defaults::DEFAULT_PACK_FOLDER),
+            "the shipped default is implicit, never a Packs row"
+        );
     }
 
     /// First poll records the edit as pending; the second crosses the 250 ms
@@ -31156,6 +31425,7 @@ selected_name_secs = 0.5
             dir.path().join("packs"),
             None,
             None,
+            false,
         );
         assert_eq!(
             content

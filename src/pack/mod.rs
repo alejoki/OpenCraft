@@ -145,13 +145,18 @@ pub fn load_pack_from_dir(dir: &Path) -> LoadedPack {
     spec::resolve_presentation(&[spec::load_spec_from_dir(dir)])
 }
 
-/// Sorted names of the pack directories directly under `packs_root`.
+/// Sorted names of the togglable pack directories directly under `packs_root`.
 ///
 /// Only subdirectories count as packs; regular files (and symlinks that do
 /// not resolve to a directory) are skipped. A missing or unreadable root is
 /// not an error: a fresh install simply has no packs, so the result is empty.
 /// Names that are not valid UTF-8 cannot be addressed as a setting and are
 /// skipped as well.
+///
+/// The shipped [`defaults::DEFAULT_PACK_FOLDER`] is deliberately absent: it is
+/// the implicit first presentation entry restored at production startup, never
+/// a user-togglable Packs row. Hiding it here keeps both the settings stack and
+/// the Packs table free of an entry the player never chose.
 pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(packs_root) else {
         return Vec::new();
@@ -161,6 +166,7 @@ pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != defaults::DEFAULT_PACK_FOLDER)
         .collect();
     names.sort();
     names
@@ -531,6 +537,8 @@ whatever = true
         for name in ["zeta", "alpha", "middle"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }
+        // The shipped default folder is always implicit and never a row.
+        fs::create_dir(root.path().join(defaults::DEFAULT_PACK_FOLDER)).unwrap();
         // Regular files are not packs.
         fs::write(root.path().join("notes.txt"), b"not a dir").unwrap();
         // A symlink to a file is not a pack either.

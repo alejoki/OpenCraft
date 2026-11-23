@@ -10,6 +10,7 @@ use crate::content::{ContentRegistry, PackContentSpec};
 use crate::demo::combat::COMBAT_DUSK_TICK;
 use crate::demo::swim::{arm_swim_route, swim_route};
 use crate::demo::watch::demo_owns_world_witness;
+use crate::pack::defaults::{self, DEFAULT_PACK_FOLDER};
 use crate::pack::spec::PackSpec;
 use crate::pack::{self, LoadedPack};
 use crate::player::survival::GameMode;
@@ -36,6 +37,52 @@ pub fn load_startup_stack(
     }
     let (loaded, specs, warnings) = pack::load_stack(packs_root, stack);
     (Some(loaded), specs, warnings)
+}
+
+/// The effective presentation stack for one launch.
+///
+/// The shipped [`DEFAULT_PACK_FOLDER`] is implicit and always first: when
+/// [`defaults::default_pack_ready`] accepts the restored manifest, this
+/// returns `"default"` followed by the raw persisted stack with any explicit
+/// `"default"` removed and duplicates dropped in first-seen order. When the
+/// folder is not ready (unwritable root, failed restore) the raw stack is
+/// returned unchanged, so a failed restore can never inject a phantom pack
+/// entry or a second "folder missing" warning. `settings.pack_stack` is never
+/// mutated: the implicit entry exists only in the resolved stack.
+///
+/// Readiness is checked here (rather than trusting the caller's restore
+/// result) because the same helper runs on every live stack apply, where the
+/// folder may have appeared or disappeared since startup.
+pub fn effective_pack_stack(packs_root: &Path, stack: &[String]) -> Vec<String> {
+    if !defaults::default_pack_ready(packs_root) {
+        return stack.to_vec();
+    }
+    let mut effective = Vec::with_capacity(stack.len() + 1);
+    effective.push(DEFAULT_PACK_FOLDER.to_string());
+    for folder in stack {
+        if folder == DEFAULT_PACK_FOLDER || effective.iter().any(|seen| seen == folder) {
+            continue;
+        }
+        effective.push(folder.clone());
+    }
+    effective
+}
+
+/// The specs that define save/registry identity: every loaded spec except the
+/// implicit shipped default (D340-D342).
+///
+/// The default pack is presentation-only (block/mob art, builtin icon
+/// overrides, menu tint and sounds), so excluding it keeps
+/// [`ContentRegistry::digest`](crate::content::ContentRegistry::digest) and
+/// [`ContentRegistry::packs`](crate::content::ContentRegistry::packs)
+/// byte-identical to the built-in registry whether or not the folder is
+/// present. Presentation callers still receive the full spec list.
+pub fn content_specs(specs: &[PackSpec]) -> Vec<PackSpec> {
+    specs
+        .iter()
+        .filter(|spec| spec.folder != DEFAULT_PACK_FOLDER)
+        .cloned()
+        .collect()
 }
 
 /// Build the session's immutable content registry from the ordered pack specs.
@@ -180,4 +227,91 @@ pub fn startup_session_with(
     }
     session.apply_config(&rules, meta);
     session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_v3_pack(root: &Path, folder: &str) {
+        let dir = root.join(folder);
+        fs::create_dir_all(&dir).expect("create pack dir");
+        fs::write(dir.join("pack.toml"), "format_version = 3\n").expect("write pack.toml");
+    }
+
+    fn default_spec(root: &Path) -> PackSpec {
+        let dir = root.join(DEFAULT_PACK_FOLDER);
+        defaults::export_default_pack(&dir).expect("export the shipped default pack");
+        pack::spec::load_spec_from_dir(&dir)
+    }
+
+    #[test]
+    fn effective_pack_stack_prepends_default_only_when_ready() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let raw = vec![
+            "alpha".to_string(),
+            DEFAULT_PACK_FOLDER.to_string(),
+            "beta".to_string(),
+            "alpha".to_string(),
+        ];
+
+        // No usable manifest yet: the raw stack is untouched, including the
+        // explicit `default` entry and the duplicate.
+        assert_eq!(effective_pack_stack(root.path(), &raw), raw);
+
+        let outcome = defaults::ensure_default_pack(root.path());
+        assert!(outcome.ready, "restore must leave a ready manifest");
+
+        assert_eq!(
+            effective_pack_stack(root.path(), &raw),
+            vec![
+                DEFAULT_PACK_FOLDER.to_string(),
+                "alpha".to_string(),
+                "beta".to_string(),
+            ],
+            "default is hoisted first, deduplicated in first-seen order"
+        );
+        // A stack that already names default first keeps one copy.
+        assert_eq!(
+            effective_pack_stack(
+                root.path(),
+                &[DEFAULT_PACK_FOLDER.to_string(), "alpha".to_string()]
+            ),
+            vec![DEFAULT_PACK_FOLDER.to_string(), "alpha".to_string()]
+        );
+    }
+
+    #[test]
+    fn content_specs_excludes_only_the_default_folder() {
+        let root = tempfile::tempdir().expect("tempdir");
+        for folder in [DEFAULT_PACK_FOLDER, "alpha", "beta"] {
+            write_v3_pack(root.path(), folder);
+        }
+        let specs: Vec<PackSpec> = [DEFAULT_PACK_FOLDER, "alpha", "beta"]
+            .iter()
+            .map(|folder| pack::spec::load_spec_from_dir(&root.path().join(folder)))
+            .collect();
+
+        let filtered = content_specs(&specs);
+        let folders: Vec<&str> = filtered.iter().map(|spec| spec.folder.as_str()).collect();
+        assert_eq!(folders, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn content_specs_keeps_registry_identity_stable() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let default = default_spec(root.path());
+        write_v3_pack(root.path(), "alpha");
+        let alpha = pack::spec::load_spec_from_dir(&root.path().join("alpha"));
+
+        let with_default: Vec<PackSpec> = vec![default.clone(), alpha.clone()];
+        let (full, _) = build_session_registry(&content_specs(&with_default));
+        let (alpha_only, _) = build_session_registry(&content_specs(&[alpha]));
+
+        assert_eq!(full.digest(), alpha_only.digest());
+        assert_eq!(full.packs(), alpha_only.packs());
+        assert_eq!(full.packs().len(), 1, "only alpha defines identity");
+        assert_eq!(full.packs()[0].folder, "alpha");
+    }
 }
