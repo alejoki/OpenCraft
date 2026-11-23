@@ -293,6 +293,12 @@ pub fn build_catalog(
         if let Some(limit) = patch.stack_limit {
             def.stack_limit = limit;
         }
+        if let Some(model) = patch.model {
+            def.model = model;
+        }
+        if let Some(alpha) = patch.alpha {
+            def.alpha = alpha;
+        }
         if let Some(drop) = &patch.drop {
             match resolver.item_ref(drop) {
                 Some(reference) => def.drop = Some(reference),
@@ -337,6 +343,8 @@ pub fn build_catalog(
             drop,
             tool_class: entry.tool,
             stack_limit: entry.stack_limit,
+            model: entry.model,
+            alpha: entry.alpha,
             placeholder: false,
         });
     }
@@ -911,6 +919,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: crate::spec::BlockModel::Cube,
+            alpha: crate::spec::BlockAlpha::Opaque,
         }
     }
 
@@ -964,6 +974,8 @@ mod tests {
                 drop: None,
                 tool_class: None,
                 stack_limit: 64,
+                model: crate::spec::BlockModel::Cube,
+                alpha: crate::spec::BlockAlpha::Opaque,
                 placeholder: false,
             })
             .collect();
@@ -1010,6 +1022,8 @@ mod tests {
             drop: Some("cobblestone".to_string()),
             tool: Some(ToolKind::Shovel),
             stack_limit: Some(32),
+            model: None,
+            alpha: None,
         });
 
         let (catalog, report) = build_catalog(&builtin_base(), &[(identity("p"), spec)]);

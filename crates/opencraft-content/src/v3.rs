@@ -22,9 +22,9 @@ use crate::decode::{self, MAX_LAYER_SIDE, MIN_LAYER_SIDE};
 use crate::manifest::PackFormat;
 use crate::resample;
 use crate::spec::{
-    BlockEntry, BlockPatch, BlockTextures, ContentDiagnostic, FoodSpec, ItemEntry, PackAsset,
-    PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry, ToolEntry, ToolKind,
-    WorldgenEntry, WorldgenKind,
+    BlockAlpha, BlockEntry, BlockModel, BlockPatch, BlockTextures, ContentDiagnostic, FoodSpec,
+    ItemEntry, PackAsset, PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry,
+    ToolEntry, ToolKind, WorldgenEntry, WorldgenKind,
 };
 use crate::vocabulary as names;
 use crate::warning::PackWarning;
@@ -775,6 +775,8 @@ fn parse_block(
     let drop = optional_string(table, "drop", &entry, diagnostics).ok()?;
     let tool = parse_block_tool(table, &entry, diagnostics).ok()?;
     let stack_limit = integer_in(table, "stack", 1, 999, 999, &entry, diagnostics).ok()? as u16;
+    let model = parse_block_model(table, &entry, diagnostics).ok()?;
+    let alpha = parse_block_alpha(table, &entry, diagnostics).ok()?;
     if !content_ids.insert(id.clone()) {
         err(
             diagnostics,
@@ -792,7 +794,100 @@ fn parse_block(
         drop,
         tool,
         stack_limit,
+        model,
+        alpha,
     })
+}
+
+/// Parse the optional `model` field, defaulting to `Cube` when absent.
+///
+/// Only the exact lowercase tokens are accepted; an unknown value names the
+/// entry and rejects just that entry.
+fn parse_block_model(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<BlockModel> {
+    let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
+        return Ok(BlockModel::default());
+    };
+    match BlockModel::from_str(&name) {
+        Some(model) => Ok(model),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown model `{name}`; expected cube, cross, crop"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `alpha` field, defaulting to `Opaque` when absent.
+fn parse_block_alpha(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<BlockAlpha> {
+    let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
+        return Ok(BlockAlpha::default());
+    };
+    match BlockAlpha::from_str(&name) {
+        Some(alpha) => Ok(alpha),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown alpha `{name}`; expected opaque, cutout, blend"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `model` patch field.
+fn parse_block_model_patch(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<Option<BlockModel>> {
+    let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
+        return Ok(None);
+    };
+    match BlockModel::from_str(&name) {
+        Some(model) => Ok(Some(model)),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown model `{name}`; expected cube, cross, crop"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `alpha` patch field.
+fn parse_block_alpha_patch(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<Option<BlockAlpha>> {
+    let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
+        return Ok(None);
+    };
+    match BlockAlpha::from_str(&name) {
+        Some(alpha) => Ok(Some(alpha)),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown alpha `{name}`; expected opaque, cutout, blend"),
+            );
+            Err(())
+        }
+    }
 }
 
 fn parse_block_textures(
@@ -1393,14 +1488,16 @@ fn parse_block_patch(
         err(diagnostics, entry, format!("unknown built-in block `{id}`"));
         return None;
     }
-    let has_field = ["name", "hardness", "drop", "tool", "stack"]
-        .iter()
-        .any(|key| table.contains_key(*key));
+    let has_field = [
+        "name", "hardness", "drop", "tool", "stack", "model", "alpha",
+    ]
+    .iter()
+    .any(|key| table.contains_key(*key));
     if !has_field {
         err(
             diagnostics,
             entry,
-            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`",
+            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`, `model`, `alpha`",
         );
         return None;
     }
@@ -1422,6 +1519,8 @@ fn parse_block_patch(
     };
     let drop = optional_string(table, "drop", &entry, diagnostics).ok()?;
     let tool = parse_block_tool(table, &entry, diagnostics).ok()?;
+    let model = parse_block_model_patch(table, &entry, diagnostics).ok()?;
+    let alpha = parse_block_alpha_patch(table, &entry, diagnostics).ok()?;
     let stack_limit = match optional_integer(table, "stack", &entry, diagnostics).ok()? {
         Some(stack) => {
             if !(1..=999).contains(&stack) {
@@ -1453,6 +1552,8 @@ fn parse_block_patch(
         drop,
         tool,
         stack_limit,
+        model,
+        alpha,
     })
 }
 
@@ -2897,5 +2998,112 @@ apple = "apple.png"
         assert_eq!(entries(&diagnostics), vec!["asset missing.png"]);
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_has_reason(&diagnostics, "missing.png");
+    }
+
+    #[test]
+    fn block_model_and_alpha_default_and_parse_exact_tokens() {
+        let text = r#"
+[[blocks]]
+id = "mymod:wheat"
+textures = { all = "wheat.png" }
+hardness = 0.5
+model = "cross"
+alpha = "cutout"
+
+[[blocks]]
+id = "mymod:glass"
+textures = { all = "glass.png" }
+hardness = 0.3
+alpha = "blend"
+
+[[blocks]]
+id = "mymod:plain"
+textures = { all = "plain.png" }
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.blocks.len(), 3);
+        assert_eq!(spec.blocks[0].model, BlockModel::Cross);
+        assert_eq!(spec.blocks[0].alpha, BlockAlpha::Cutout);
+        assert_eq!(spec.blocks[1].model, BlockModel::Cube);
+        assert_eq!(spec.blocks[1].alpha, BlockAlpha::Blend);
+        assert_eq!(spec.blocks[2].model, BlockModel::Cube);
+        assert_eq!(spec.blocks[2].alpha, BlockAlpha::Opaque);
+    }
+
+    #[test]
+    fn unknown_model_and_alpha_name_the_entry_and_keep_the_sibling() {
+        let text = r#"
+[[blocks]]
+id = "mymod:bad_model"
+textures = { all = "bad.png" }
+hardness = 1.0
+model = "column"
+
+[[blocks]]
+id = "mymod:bad_alpha"
+textures = { all = "bad.png" }
+hardness = 1.0
+alpha = "translucent"
+
+[[blocks]]
+id = "mymod:good"
+textures = { all = "good.png" }
+hardness = 1.0
+model = "crop"
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert_eq!(spec.blocks.len(), 1, "only the valid sibling survives");
+        assert_eq!(spec.blocks[0].id, "mymod:good");
+        assert_eq!(spec.blocks[0].model, BlockModel::Crop);
+        assert_eq!(spec.blocks[0].alpha, BlockAlpha::Opaque);
+        assert_eq!(
+            entries(&diagnostics),
+            vec!["block mymod:bad_model", "block mymod:bad_alpha"]
+        );
+        assert_has_reason(
+            &diagnostics,
+            "unknown model `column`; expected cube, cross, crop",
+        );
+        assert_has_reason(
+            &diagnostics,
+            "unknown alpha `translucent`; expected opaque, cutout, blend",
+        );
+    }
+
+    #[test]
+    fn block_patch_accepts_model_and_alpha_only_fields() {
+        let text = r#"
+[[block_patches]]
+id = "grass"
+model = "cross"
+
+[[block_patches]]
+id = "water"
+alpha = "blend"
+
+[[block_patches]]
+id = "oak_leaves"
+model = "cube"
+
+alpha = "bad"
+
+[[block_patches]]
+id = "stone"
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert_eq!(spec.block_patches.len(), 2);
+        assert_eq!(spec.block_patches[0].id, "grass");
+        assert_eq!(spec.block_patches[0].model, Some(BlockModel::Cross));
+        assert_eq!(spec.block_patches[0].alpha, None);
+        assert_eq!(spec.block_patches[1].id, "water");
+        assert_eq!(spec.block_patches[1].model, None);
+        assert_eq!(spec.block_patches[1].alpha, Some(BlockAlpha::Blend));
+        assert_has_reason(&diagnostics, "unknown alpha `bad`");
+        assert_has_reason(
+            &diagnostics,
+            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`, `model`, `alpha`",
+        );
     }
 }

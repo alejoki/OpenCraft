@@ -27110,7 +27110,9 @@ stack = 64
     /// A two-entry pack registry (one block, one item) with real, non-placeholder
     /// definitions, built from an inline spec rather than the crate's `packs/`.
     fn main_ruby_registry() -> Arc<ContentRegistry> {
-        use opencraft::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+        use opencraft::content::spec::{
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset,
+        };
 
         let mut spec = PackContentSpec::default();
         spec.blocks.push(BlockEntry {
@@ -27124,6 +27126,9 @@ stack = 64
             drop: Some("mymod:ruby".to_string()),
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),
@@ -27159,7 +27164,8 @@ stack = 64
     /// and an altar block whose authored drop is the pack pickaxe itself.
     fn pack_tool_registry() -> Arc<ContentRegistry> {
         use opencraft::content::spec::{
-            BlockEntry, BlockTextures, ItemEntry, PackAsset, TierEntry, ToolEntry,
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset, TierEntry,
+            ToolEntry,
         };
 
         let mut spec = PackContentSpec::default();
@@ -27174,6 +27180,9 @@ stack = 64
             drop: Some("mymod:ruby".to_string()),
             tool: Some(ToolKind::Pickaxe),
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.blocks.push(BlockEntry {
             id: "mymod:tool_altar".to_string(),
@@ -27186,6 +27195,9 @@ stack = 64
             drop: Some("mymod:ruby_pickaxe".to_string()),
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),

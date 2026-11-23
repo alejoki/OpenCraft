@@ -7657,7 +7657,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     use crate::content::build_registry;
-    use crate::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset, PackContentSpec};
+    use crate::content::spec::{
+        BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset, PackContentSpec,
+    };
 
     fn ruby_pack() -> (PackIdentity, PackContentSpec) {
         let mut spec = PackContentSpec::default();
@@ -7672,6 +7674,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),

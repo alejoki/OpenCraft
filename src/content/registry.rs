@@ -121,6 +121,8 @@ pub(crate) fn block_from_catalog(row: NeutralBlockDef) -> BlockDef {
         drop: row.drop.map(item_ref_from_catalog),
         tool_class: row.tool_class,
         stack_limit: row.stack_limit,
+        model: row.model,
+        alpha: row.alpha,
         placeholder: row.placeholder,
     }
 }
@@ -272,6 +274,8 @@ fn block_to_catalog(def: &BlockDef) -> NeutralBlockDef {
         drop: def.drop.map(item_ref_to_catalog),
         tool_class: def.tool_class,
         stack_limit: def.stack_limit,
+        model: def.model,
+        alpha: def.alpha,
         placeholder: def.placeholder,
     }
 }
@@ -380,8 +384,8 @@ fn biome_from_tag(tag: opencraft_content::catalog::BiomeTag) -> Biome {
 mod tests {
     use super::*;
     use crate::content::spec::{
-        BlockEntry, BlockPatch, BlockTextures, ItemEntry, RecipeEntry, TierEntry, ToolEntry,
-        WorldgenEntry, WorldgenKind,
+        BlockAlpha, BlockEntry, BlockModel, BlockPatch, BlockTextures, ItemEntry, RecipeEntry,
+        TierEntry, ToolEntry, WorldgenEntry, WorldgenKind,
     };
     use crate::content::EMPTY_DIGEST;
     use crate::player::inventory::{Material, ToolKind};
@@ -413,6 +417,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 
@@ -468,6 +474,8 @@ mod tests {
             drop: Some("mymod:ruby".to_string()),
             tool: Some(ToolKind::Pickaxe),
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert("ruby_ore.png".to_string(), asset(0x11));
         spec.items.push(item_entry("mymod:ruby", "ruby.png"));
@@ -497,6 +505,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: None,
+            model: None,
+            alpha: None,
         });
         spec.worldgen.push(WorldgenEntry {
             kind: WorldgenKind::Ore {
@@ -595,6 +605,8 @@ mod tests {
             drop: Some("mymod:missing".to_string()),
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert("ore.png".to_string(), asset(0x11));
         spec.recipe_patches.push(crate::content::spec::RecipePatch {

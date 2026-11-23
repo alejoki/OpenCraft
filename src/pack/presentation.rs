@@ -577,7 +577,9 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use crate::content::registry::{build_registry, PackIdentity};
-    use crate::content::spec::{BlockEntry, BlockTextures, PackAsset, PackContentSpec};
+    use crate::content::spec::{
+        BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset, PackContentSpec,
+    };
     use crate::pack::manifest;
     use crate::pack::resample;
     use crate::pack::sound::SoundSpec;
@@ -692,6 +694,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert(
             path.to_string(),

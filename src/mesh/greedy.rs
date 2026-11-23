@@ -747,7 +747,7 @@ mod tests {
     /// A face table built from a one-block pack stack: `mymod:ruby_block`
     /// occupies raw id [`BUILTIN_BLOCK_COUNT`] and every face is layer 48.
     fn pack_faces() -> crate::content::faces::BlockFaces {
-        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::spec::{BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset};
         use crate::content::{build_registry, ContentRegistry, PackContentSpec, PackIdentity};
 
         let mut spec = PackContentSpec::default();
@@ -769,6 +769,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         let (registry, report) = build_registry(
             ContentRegistry::builtin(),

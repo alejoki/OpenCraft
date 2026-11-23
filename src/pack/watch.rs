@@ -328,7 +328,8 @@ mod tests {
 
     use crate::content::registry::{build_registry, PackIdentity};
     use crate::content::spec::{
-        BlockEntry, BlockTextures, PackAsset, PackContentSpec, RecipeEntry, RecipePatch,
+        BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset, PackContentSpec, RecipeEntry,
+        RecipePatch,
     };
     use crate::content::ContentRegistry;
     use crate::pack::manifest;
@@ -377,6 +378,8 @@ mod tests {
                 drop: None,
                 tool: None,
                 stack_limit: 64,
+                model: BlockModel::Cube,
+                alpha: BlockAlpha::Opaque,
             });
         }
         for (index, path) in used.iter().chain(unused.iter()).enumerate() {
@@ -789,6 +792,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 

@@ -15,7 +15,7 @@ use opencraft_content::catalog::{
 use opencraft_content::decode::decode_png_rgba_bytes;
 use opencraft_content::manifest::parse_pack_file;
 use opencraft_content::resample::resample_to_16;
-use opencraft_content::spec::PackAsset;
+use opencraft_content::spec::{BlockAlpha, BlockModel, PackAsset};
 use opencraft_content::v3::parse_content;
 
 /// A minimal valid v3 manifest: one block and one item.
@@ -123,6 +123,8 @@ pub fn run() -> ContentProof {
             drop: None,
             tool_class: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
             placeholder: false,
         }],
         Vec::new(),

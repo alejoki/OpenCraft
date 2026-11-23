@@ -868,7 +868,9 @@ mod tests {
     #[test]
     fn load_row_loaded_resolves_pack_content_and_names() {
         use crate::content::registry::build_registry;
-        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset, PackContentSpec};
+        use crate::content::spec::{
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset, PackContentSpec,
+        };
         use crate::content::ContentRegistry;
         use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 
@@ -884,6 +886,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert(
             "ruby_ore.png".to_string(),

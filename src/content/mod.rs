@@ -35,6 +35,8 @@ use crate::player::tools::{self, ToolRules};
 use crate::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
 use crate::world::terrain::Biome;
 
+pub use spec::{BlockAlpha, BlockModel};
+
 /// A reference to an item identity before `ItemId`/`RecipeId` widening.
 ///
 /// Built-in identities reuse the frozen [`ItemId`] vocabulary; pack identities
@@ -237,6 +239,10 @@ pub struct BlockDef {
     pub tool_class: Option<ToolKind>,
     /// Maximum stack size of the block item (0 when there is no drop).
     pub stack_limit: u16,
+    /// Authored render model; built-ins use `Cube`.
+    pub model: BlockModel,
+    /// Authored alpha mode; built-ins use `Opaque`.
+    pub alpha: BlockAlpha,
     /// Whether this definition is placeholder art awaiting pack content.
     pub placeholder: bool,
 }
@@ -267,6 +273,8 @@ impl BlockDef {
             drop,
             tool_class: tools::block_tool_class(id),
             stack_limit,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
             placeholder: false,
         })
     }
@@ -1053,6 +1061,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: None,
+
+            model: None,
+            alpha: None,
         });
         spec
     }
@@ -1312,6 +1323,8 @@ mod tests {
                 drop: Some(drop),
                 tool_class: None,
                 stack_limit,
+                model: BlockModel::Cube,
+                alpha: BlockAlpha::Opaque,
                 placeholder: false,
             });
         };
@@ -1369,6 +1382,8 @@ mod tests {
             drop: Some(ItemRef::Tool(9)),
             tool_class: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
             placeholder: false,
         });
         assert_eq!(unknown_tool.drop_entry(unknown_tool_block), None);

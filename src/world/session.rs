@@ -8606,7 +8606,7 @@ mod tests {
     /// registry-aware constructor, so mesh jobs resolve authored layers.
     #[test]
     fn registry_constructors_install_the_registry_face_table() {
-        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::spec::{BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset};
         use crate::content::{build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE};
         use crate::world::block::BUILTIN_BLOCK_COUNT;
 
@@ -8629,6 +8629,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         let (registry, report) = build_registry(
             ContentRegistry::builtin(),

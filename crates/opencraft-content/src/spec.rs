@@ -42,6 +42,79 @@ impl ToolKind {
     }
 }
 
+/// Render model authored for a block.
+///
+/// The neutral authored model owns the enum so a pack never names a render
+/// type; the game maps it onto its own render class. The lowercase token is
+/// the only spelling a pack may author.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlockModel {
+    /// Full solid cube; the default for every block that omits `model`.
+    #[default]
+    Cube,
+    /// Two crossed quads, used for plants such as tall grass and wheat.
+    Cross,
+    /// A cross plant whose growth stage selects the quad, for crops.
+    Crop,
+}
+
+impl BlockModel {
+    /// Exact lowercase token authored in `model =`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BlockModel::Cube => "cube",
+            BlockModel::Cross => "cross",
+            BlockModel::Crop => "crop",
+        }
+    }
+
+    /// Parse the exact lowercase token, or `None` for any other spelling.
+    pub fn from_str(value: &str) -> Option<BlockModel> {
+        match value {
+            "cube" => Some(BlockModel::Cube),
+            "cross" => Some(BlockModel::Cross),
+            "crop" => Some(BlockModel::Crop),
+            _ => None,
+        }
+    }
+}
+
+/// Alpha mode authored for a block's faces.
+///
+/// The neutral authored model owns the enum so the parser is the single place
+/// an unknown token is rejected; the game maps it onto its own alpha class.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlockAlpha {
+    /// Fully opaque faces; the default for every block that omits `alpha`.
+    #[default]
+    Opaque,
+    /// Binary transparency: alpha below the cutout threshold is discarded.
+    Cutout,
+    /// Sorted translucency blended over the opaque scene.
+    Blend,
+}
+
+impl BlockAlpha {
+    /// Exact lowercase token authored in `alpha =`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BlockAlpha::Opaque => "opaque",
+            BlockAlpha::Cutout => "cutout",
+            BlockAlpha::Blend => "blend",
+        }
+    }
+
+    /// Parse the exact lowercase token, or `None` for any other spelling.
+    pub fn from_str(value: &str) -> Option<BlockAlpha> {
+        match value {
+            "opaque" => Some(BlockAlpha::Opaque),
+            "cutout" => Some(BlockAlpha::Cutout),
+            "blend" => Some(BlockAlpha::Blend),
+            _ => None,
+        }
+    }
+}
+
 /// Severity of a pack-content diagnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -146,6 +219,10 @@ pub struct BlockEntry {
     pub tool: Option<ToolKind>,
     /// Maximum stack size of the block item.
     pub stack_limit: u16,
+    /// Authored render model; `Cube` when the pack omits `model`.
+    pub model: BlockModel,
+    /// Authored alpha mode; `Opaque` when the pack omits `alpha`.
+    pub alpha: BlockAlpha,
 }
 
 /// Authored block face texture file names.
@@ -258,6 +335,10 @@ pub struct BlockPatch {
     pub drop: Option<String>,
     pub tool: Option<ToolKind>,
     pub stack_limit: Option<u16>,
+    /// Patch over the built-in render model; `None` leaves it untouched.
+    pub model: Option<BlockModel>,
+    /// Patch over the built-in alpha mode; `None` leaves it untouched.
+    pub alpha: Option<BlockAlpha>,
 }
 
 /// Enable/disable a built-in recipe.
@@ -275,4 +356,39 @@ pub struct PackAsset {
     pub rgba: Vec<u8>,
     /// Authored side length before resampling.
     pub source_side: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_model_tokens_round_trip_and_reject_other_spellings() {
+        for model in [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop] {
+            assert_eq!(BlockModel::from_str(model.as_str()), Some(model));
+        }
+        assert_eq!(
+            [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop].map(BlockModel::as_str),
+            ["cube", "cross", "crop"]
+        );
+        for unknown in ["", "Cube", "CUBE", "column", "cross "] {
+            assert_eq!(BlockModel::from_str(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(BlockModel::default(), BlockModel::Cube);
+    }
+
+    #[test]
+    fn block_alpha_tokens_round_trip_and_reject_other_spellings() {
+        for alpha in [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend] {
+            assert_eq!(BlockAlpha::from_str(alpha.as_str()), Some(alpha));
+        }
+        assert_eq!(
+            [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend].map(BlockAlpha::as_str),
+            ["opaque", "cutout", "blend"]
+        );
+        for unknown in ["", "Opaque", "translucent", "blend ", "cut_out"] {
+            assert_eq!(BlockAlpha::from_str(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(BlockAlpha::default(), BlockAlpha::Opaque);
+    }
 }

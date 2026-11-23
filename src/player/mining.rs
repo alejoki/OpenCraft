@@ -282,7 +282,9 @@ mod tests {
 
     /// A one-block pack registry with authored hardness and a ruby item drop.
     fn ruby_registry() -> ContentRegistry {
-        use crate::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+        use crate::content::spec::{
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset,
+        };
         use crate::content::{build_registry, PackContentSpec, PackIdentity};
 
         let mut spec = PackContentSpec::default();
@@ -297,6 +299,9 @@ mod tests {
             drop: Some("mymod:ruby".to_string()),
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),

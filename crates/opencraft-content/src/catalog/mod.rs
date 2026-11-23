@@ -21,7 +21,7 @@ pub use build::build_catalog;
 
 use std::collections::BTreeMap;
 
-use crate::spec::{ContentDiagnostic, FoodSpec, Severity, ToolKind};
+use crate::spec::{BlockAlpha, BlockModel, ContentDiagnostic, FoodSpec, Severity, ToolKind};
 
 /// First texture-array layer reserved for pack-authored block faces.
 pub const PACK_LAYER_BASE: u8 = 48;
@@ -295,6 +295,10 @@ pub struct BlockDef {
     pub tool_class: Option<ToolKind>,
     /// Maximum stack size of the block item (0 when there is no drop).
     pub stack_limit: u16,
+    /// Authored render model (`Cube` for built-ins and placeholders).
+    pub model: BlockModel,
+    /// Authored alpha mode (`Opaque` for built-ins and placeholders).
+    pub alpha: BlockAlpha,
     /// Whether this definition is placeholder art awaiting pack content.
     pub placeholder: bool,
 }
@@ -514,6 +518,8 @@ pub fn placeholder_block(index: u16, name: &str, stack_limit: u16) -> BlockDef {
         drop: None,
         tool_class: None,
         stack_limit,
+        model: BlockModel::Cube,
+        alpha: BlockAlpha::Opaque,
         placeholder: true,
     }
 }
@@ -647,6 +653,8 @@ mod tests {
                     drop: None,
                     tool_class: None,
                     stack_limit: 0,
+                    model: BlockModel::Cube,
+                    alpha: BlockAlpha::Opaque,
                     placeholder: false,
                 },
                 BlockDef {
@@ -658,6 +666,8 @@ mod tests {
                     drop: Some(ItemRef::Block(1)),
                     tool_class: Some(ToolKind::Pickaxe),
                     stack_limit: 64,
+                    model: BlockModel::Cube,
+                    alpha: BlockAlpha::Opaque,
                     placeholder: false,
                 },
             ],
@@ -800,6 +810,8 @@ mod tests {
             drop: None,
             tool_class: None,
             stack_limit: 999,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
             placeholder: true,
         }
     }

@@ -104,7 +104,7 @@ impl BlockFaces {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+    use crate::content::spec::{BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset};
     use crate::content::{build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE};
     use std::collections::BTreeMap;
 
@@ -160,6 +160,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
 
         let (registry, report) = build_registry(

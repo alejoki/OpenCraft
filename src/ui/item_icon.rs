@@ -3182,7 +3182,9 @@ mod tests {
     // Registry-aware icons and the 256-layer sprite atlas (M010/S04-T03)
     // -----------------------------------------------------------------------
 
-    use crate::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+    use crate::content::spec::{
+        BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset,
+    };
     use crate::content::{
         build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE, PLACEHOLDER_BLOCK_LAYER,
         PLACEHOLDER_ICON_LAYER,
@@ -3220,6 +3222,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),
