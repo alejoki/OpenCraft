@@ -232,10 +232,12 @@ With that stack selected, these headless commands exercise the same code paths a
 ./target/debug/opencraft --demo-palette
 ./target/debug/opencraft --validate-pack mymod-ruby
 ./target/debug/opencraft --validate-pack ruby-overlay
+./target/debug/opencraft --demo-external-pack tests/fixtures/packs/external-v3
 bash scripts/modding_smoke.sh
+bash scripts/external_pack_smoke.sh
 ```
 
-`--demo-presentation` prints composed layer/icon counts, the authored block names, a production mesh, a production break, and the placeholder policy. `--demo-crafting` crafts the ruby pickaxe at a table and the stew in the 2x2 grid, breaks ruby ore with ruby and iron pickaxes, eats the stew, exercises the disabled shortbow, and saves/reloads the pickaxe. `--demo-worldgen` prints rule counts and authored ore/patch cells for a pinned seed. `--demo-palette` prints the entry stock, layout, filter, grant, use, placeholder and key-leg results. The four demo digests read the selected stack from `settings.toml`; with `mymod-ruby` missing they fail closed instead of printing a misleading success. `--validate-pack` checks one named folder. `scripts/modding_smoke.sh` is the real-binary proof of the validation exit codes, a bounded launch with a broken pack, and the docs reader-test.
+`--demo-presentation` prints composed layer/icon counts, the authored block names, a production mesh, a production break, and the placeholder policy. `--demo-crafting` crafts the ruby pickaxe at a table and the stew in the 2x2 grid, breaks ruby ore with ruby and iron pickaxes, eats the stew, exercises the disabled shortbow, and saves/reloads the pickaxe. `--demo-worldgen` prints rule counts and authored ore/patch cells for a pinned seed. `--demo-palette` prints the entry stock, layout, filter, grant, use, placeholder and key-leg results. The four demo digests read the selected stack from `settings.toml`; with `mymod-ruby` missing they fail closed instead of printing a misleading success. `--validate-pack` checks one named folder. `scripts/modding_smoke.sh` is the real-binary proof of the validation exit codes, a bounded launch with a broken pack, and the docs reader-test. `--demo-external-pack` loads the external fixture through the real loader and registry and prints the six-face, model, crop, blend, icon, save and reload legs without a window or GPU; `scripts/external_pack_smoke.sh` is the standing gate that also pins the deterministic atlas artifact.
 
 ## Content packs and saves
 

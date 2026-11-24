@@ -993,6 +993,56 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M018/S08
 - Validation: `bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu; WORKFLOW=ci.yml bash scripts/ci_gate.sh; git diff --exit-code -- tests/fixtures/packs worldgen tests/fixtures/saves`
 
+### R099 — External doc-authored v3 fixture validates clean and drives the headless demo
+- Class: integration
+- Status: active
+- Description: `tests/fixtures/packs/external-v3` is a complete v3 pack authored from docs/TEXTURE-PACKS.md alone (14 files, 11 validated entries): six distinct `stone` faces through the documented flat direction overrides, a cross/cutout plant, a crop/cutout wheat, a cube/blend glass and a `[builtin_icons]` apple override. `--validate-pack external-v3` run from a tree that contains only the copied fixture prints exactly `validate-pack: external-v3: 11 entries, 0 errors, 0 warnings`, and `--demo-external-pack` loads the out-of-tree directory through the real loader and registry without touching `settings.pack_stack`.
+- Why it matters: A doc-only author reproducing the shipped surface is the M019 differentiator; a validator summary alone would not prove the pack reaches the game.
+- Source: M019 / S05 external fixture
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S05
+- Validation: bash scripts/external_pack_smoke.sh; bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --bin opencraft -- external_pack; cargo run -p opencraft --locked -- --demo-external-pack tests/fixtures/packs/external-v3
+
+### R100 — Six-face plus cross/crop/blend material surface proven from an out-of-tree pack
+- Class: core-capability
+- Status: active
+- Description: One block resolves six distinct faces by resolved layer index (not filename), the cross and crop entries carry cutout alpha with crop stage count taken from the loaded stage table, the cube blend entry reaches the sorted translucent draw path, and a `[builtin_icons]` override matches its built-in sprite; every leg is proven through the production loader/registry/mesher from a pack installed outside `packs/`.
+- Why it matters: Six faces and the model/alpha surface are M019's visible payoff, so they must survive a real out-of-tree pack rather than only in-repo fixtures.
+- Source: M019 / S05 material surface proof
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S03
+- Validation: cargo test -p opencraft --locked --bin opencraft -- external_pack; cargo test -p opencraft --locked --lib -- render::texture; bash scripts/external_pack_smoke.sh; bash scripts/presentation_smoke.sh
+
+### R101 — Deterministic GPU-free atlas artifact with pinned RGBA and PNG digests
+- Class: quality-attribute
+- Status: active
+- Description: `--demo-atlas <dir>` composes the 48 built-in base layers row-major into a 128x96 8-column sheet, encodes a timestamp-free `atlas.png` (32,465 bytes) and prints the pinned FNV-1a composed-RGBA digest `0xaa212bc3f53ce34c` and PNG digest `0x4a89e7b5ab337a8a`; two runs into separate directories are byte-identical, and unit tests fail by name (`composed atlas pixels drifted from the pinned digest`, `atlas.png bytes drifted from the pinned digest`) on any drift. The artifact depends on no GPU, window, settings file or pack stack.
+- Why it matters: A pinned byte hash is the only falsifiable proof that composed block-face layers stay stable without a GPU.
+- Source: M019 / S05 atlas artifact
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S02, M019/S03, M019/S05
+- Validation: cargo test -p opencraft --locked --lib -- atlas; cargo test -p opencraft --locked --bin opencraft -- atlas; bash scripts/external_pack_smoke.sh
+
+### R102 — M019 closure surface: standing external smoke, local gate, Linux package rehearsal and honest Windows/CI gaps
+- Class: launchability
+- Status: active
+- Description: Closeout requires `bash scripts/external_pack_smoke.sh` as the standing gate, the existing pack/modding smokes tracking the fixture, `cargo fmt --all -- --check`, the engine boundary gate, `cargo clippy --workspace --locked --all-targets -- -D warnings`, `cargo test --workspace --locked`, `cargo test -p engine-reuse-proof --locked`, the requirements checker plus selftest at R001-R103, `cargo build --release --locked` and `bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu` with `packs/default` staged. Windows installer smoke and the three-asset release verifier are recorded as documented environment gaps and are never claimed as observed; any digest re-pin happens once with explanatory evidence.
+- Why it matters: M019 must close on a reproducible Linux gate while stating plainly which CI/Windows limbs were not observed locally.
+- Source: M019 / S05 closeout
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S02, M019/S03, M019/S04, M019/S05
+- Validation: bash scripts/external_pack_smoke.sh; bash scripts/check_engine_boundaries.sh; bash scripts/pack_smoke.sh; bash scripts/modding_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu
+
+### R103 — M019 scope guardrail
+- Class: constraint
+- Status: active
+- Description: M019 changes only the documented v3 pack surface, model/alpha materials, prefab-backed trees/ruins with decay markers, the shipped default pack and the external fixture/atlas artifacts. v1/v2 packs remain rejected with a named format error and every fixture, demo and doc is v3; `.mcvx` stays v10 with no added field; A* stays unwired; no new dependency is added; no digest, atlas hash, budget threshold or prior pin is re-pinned without a decision and recorded evidence; no Windows or CI leg is claimed from a local run.
+- Why it matters: The deliberate v3 surface must not smuggle in an unplanned format, gameplay or threshold change.
+- Source: M019 / S05 scope guardrail
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S02, M019/S03, M019/S04, M019/S05
+- Validation: bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --lib -- pack::; cargo test -p opencraft --locked --test save_v10_cli; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -1157,3 +1207,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 8 | R098 | S08 | 23 debug smoke scripts and nine release-profile legs recorded in docs/RELEASE.md |
 | 9 | R098 | S08 | cargo fmt --all -- --check && cargo clippy --workspace --locked --all-targets -- -D warnings && cargo build --release --locked && bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu |
 | 10 | R089, R090, R093, R094, R095, R096, R097, R098 | S08 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && WORKFLOW=ci.yml bash scripts/ci_gate.sh |
+
+## M019 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R102 | S02 | cargo test -p opencraft --locked --lib -- pack::defaults; bash scripts/pack_smoke.sh |
+| 2 | R099, R100 | S01, S03, S05 | bash scripts/external_pack_smoke.sh |
+| 3 | R100 | S03 | cargo test -p opencraft --locked --lib -- render::texture; bash scripts/presentation_smoke.sh |
+| 4 | R103 | S01, S02, S05 | bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --lib -- pack:: |
+| 5 | R102 | S04 | cargo test -p opencraft --locked --test worldgen_cli; bash scripts/worldgen_smoke.sh; bash scripts/village_smoke.sh |
+| 6 | R099, R100, R101 | S05 | bash scripts/external_pack_smoke.sh |
+| 7 | R102, R103 | S05 | cargo fmt --all -- --check; bash scripts/check_engine_boundaries.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu |

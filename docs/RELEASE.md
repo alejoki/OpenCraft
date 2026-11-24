@@ -140,6 +140,45 @@ SMOKE_PROFILE=release bash scripts/worldgen_smoke.sh
 All nine must exit 0. This is the last chance to notice a release-only
 regression (the release build drops the creator watcher, overlay, and trace).
 
+### M019 closeout rehearsal (external pack, atlas, package)
+
+The M019 surface ships three extra headless seams and one standing smoke.
+Run them on the same commit before tagging:
+
+```bash
+bash scripts/external_pack_smoke.sh
+bash scripts/validate_pack_smoke.sh
+bash scripts/requirements_check.sh
+bash scripts/requirements_check_selftest.sh
+```
+
+`external_pack_smoke.sh` copies only `tests/fixtures/packs/external-v3` into a
+temp `packs/` tree, asserts `--validate-pack external-v3` prints
+`11 entries, 0 errors, 0 warnings`, runs `--demo-external-pack` and checks
+every proof leg plus `external_pack_demo: ok=true`, then writes `--demo-atlas`
+twice and requires the two `atlas.png` files to be byte-identical. It needs no
+window, GPU, `settings.toml` or `saves/`.
+
+The M019 Linux package rehearsal is:
+
+```bash
+cargo build --release --locked
+bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu
+```
+
+It must leave `dist/opencraft-0.3.0-x86_64-unknown-linux-gnu/packs/default/pack.toml`
+in the staged tree, proving the shipped default pack travels with the archive.
+The registry must carry R001-R103, with R099-R103 owned by M019/S05 and the
+seven-row M019 criterion trace printed by both the checker and the selftest.
+
+**Recorded environment gaps for M019.** This Linux host cannot run the Windows
+installer smoke (`scripts/smoke_windows_installer.sh`), the Inno Setup compile,
+or the full three-asset `scripts/verify_release_artifacts.sh` leg, and no CI run
+was observed during the closeout. Those limbs are proven only by the
+tag-triggered `release.yml` workflow on `ubuntu-latest` and `windows-latest`;
+confirm that run (section 4) before publishing. They are gaps in the local
+record, not claims of observed success.
+
 ## 6. Tag
 
 ```bash
