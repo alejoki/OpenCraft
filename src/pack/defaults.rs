@@ -47,13 +47,46 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a prime for [`default_pack_digest`].
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Encode an arbitrary RGBA8 image as a PNG with the pack writer's defaults.
+///
+/// This is the shared core of [`encode_rgba_png`] and the `--demo-atlas`
+/// artifact writer. The `png` crate is used with its defaults (RGBA8, no
+/// palette, no timestamps, no ancillary text chunks), so the same `rgba`
+/// bytes always yield the same PNG bytes. Panics when `rgba` is not exactly
+/// `width * height * 4` bytes; that is a generator bug, not an input error,
+/// because every caller supplies a composed image of a known shape.
+pub fn encode_rgba_png_dims(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+    let expected = width as usize * height as usize * 4;
+    assert_eq!(
+        rgba.len(),
+        expected,
+        "encode_rgba_png_dims expects a {width}x{height} RGBA image ({expected} bytes), got {}",
+        rgba.len()
+    );
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .expect("PNG header encoding into memory cannot fail");
+        writer
+            .write_image_data(rgba)
+            .expect("PNG data encoding for an RGBA image cannot fail");
+        writer
+            .finish()
+            .expect("PNG stream finalization into memory cannot fail");
+    }
+    out
+}
+
 /// Encode one 16x16 RGBA layer as an 8-bit RGBA PNG.
 ///
-/// The `png` crate is used with its defaults (no palette, no timestamps, no
-/// ancillary text chunks), so the same `rgba` bytes always yield the same PNG
-/// bytes. Panics when `rgba` is not exactly
-/// [`TEX_SIZE`]x[`TEX_SIZE`] RGBA (`1024`) bytes; that is a generator bug, not
-/// an input error, because the procedural sources always produce that shape.
+/// Thin wrapper over [`encode_rgba_png_dims`] that keeps the fixed 16x16
+/// layer contract and its existing panic message. See that function for the
+/// encoder defaults that make the bytes deterministic.
 pub fn encode_rgba_png(rgba: &[u8]) -> Vec<u8> {
     let expected = (TEX_SIZE * TEX_SIZE * 4) as usize;
     assert_eq!(
@@ -62,23 +95,7 @@ pub fn encode_rgba_png(rgba: &[u8]) -> Vec<u8> {
         "encode_rgba_png expects a {TEX_SIZE}x{TEX_SIZE} RGBA layer ({expected} bytes), got {}",
         rgba.len()
     );
-
-    let mut out = Vec::new();
-    {
-        let mut encoder = png::Encoder::new(&mut out, TEX_SIZE, TEX_SIZE);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder
-            .write_header()
-            .expect("PNG header encoding into memory cannot fail");
-        writer
-            .write_image_data(rgba)
-            .expect("PNG data encoding for a 16x16 RGBA layer cannot fail");
-        writer
-            .finish()
-            .expect("PNG stream finalization into memory cannot fail");
-    }
-    out
+    encode_rgba_png_dims(TEX_SIZE, TEX_SIZE, rgba)
 }
 
 /// The 27 built-in item sprite names mapped to their `icons/` pack paths,
@@ -232,6 +249,31 @@ where
         fnv1a_update(&mut hash, bytes);
     }
     hash
+}
+
+/// Fold one named byte stream into the [`pack_digest`] framing.
+///
+/// `label` plays the role of the entry path, so an artifact that is not a
+/// pack file still uses exactly one hashing convention:
+/// `label.as_bytes() || 0x00 || (len as u32).to_le_bytes() || bytes`.
+pub fn byte_stream_digest(label: &str, bytes: &[u8]) -> u64 {
+    pack_digest(std::iter::once((label, bytes)))
+}
+
+/// Digest of the composed block-face atlas RGBA sheet.
+///
+/// This is the pinned "composed layers are stable" value; it covers the
+/// pixel bytes exactly as composed, before PNG encoding.
+pub fn atlas_digest(bytes: &[u8]) -> u64 {
+    byte_stream_digest("atlas.rgba", bytes)
+}
+
+/// Digest of the encoded `atlas.png` file bytes.
+///
+/// Pinned separately from [`atlas_digest`] so PNG-encoder drift fails by name
+/// instead of hiding behind a stable pixel digest.
+pub fn atlas_png_digest(bytes: &[u8]) -> u64 {
+    byte_stream_digest("atlas.png", bytes)
 }
 
 /// Write every generated file under `dir`, creating parents as needed.

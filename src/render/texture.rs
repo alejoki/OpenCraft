@@ -1,3 +1,16 @@
+//! Block-face texture identity and the CPU composers behind the GPU block
+//! texture array.
+//!
+//! Everything here is GPU-free: [`generate_all_texture_layers_rgba`] owns the
+//! authored/procedural base art and [`compose_block_array_layers`] folds pack
+//! layers into the 256-layer upload contract. [`compose_atlas_rgba`] and
+//! [`pinned_atlas_layers`] turn that composed data into the deterministic
+//! `--demo-atlas` contact sheet. The atlas deliberately stops at the last
+//! authored base layer plus the pack slots and **excludes the reserved
+//! placeholder band** (`PACK_LAYER_BASE + pack_slot_count ..=
+//! BLOCK_ARRAY_LAYERS`), so the artifact pins authored pixels rather than the
+//! checker filler that exists only to satisfy the fixed GPU array shape.
+
 use crate::content::{BlockAlpha, PACK_LAYER_BASE, PACK_LAYER_CAP};
 use opencraft_gfx::texture::TextureArraySpec;
 
@@ -768,6 +781,84 @@ pub fn compose_block_array_layers(base: &[Vec<u8>], pack_layers: &[Vec<u8>]) -> 
     layers
 }
 
+/// Tiles per row in the `--demo-atlas` contact sheet.
+pub const ATLAS_COLUMNS: usize = 8;
+
+/// One deterministic, GPU-free contact sheet of 16x16 RGBA tiles.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtlasSheet {
+    /// Sheet width in pixels (`columns * TEX_SIZE`).
+    pub width: u32,
+    /// Sheet height in pixels (`ceil(tiles / columns) * TEX_SIZE`).
+    pub height: u32,
+    /// Row-major RGBA8 pixels, `width * height * 4` bytes.
+    pub rgba: Vec<u8>,
+    /// Number of 16x16 tiles copied into the sheet.
+    pub tiles: usize,
+}
+
+/// Tile `layers` row-major into a `columns`-wide grid of 16x16 RGBA tiles.
+///
+/// Pure integer arithmetic over caller-supplied bytes: no GPU state, no
+/// floating point, no `HashMap` iteration and no padding, so the same layer
+/// sequence always yields byte-identical output. Every layer must be exactly
+/// [`TEX_SIZE`] × [`TEX_SIZE`] × 4 RGBA bytes and `columns` must be non-zero;
+/// a malformed input is a caller bug and panics instead of silently shifting
+/// the grid. An empty layer set produces a zero-sized sheet.
+pub fn compose_atlas_rgba(layers: &[Vec<u8>], columns: usize) -> AtlasSheet {
+    assert!(columns > 0, "compose_atlas_rgba needs at least one column");
+    for (index, layer) in layers.iter().enumerate() {
+        assert_eq!(
+            layer.len(),
+            LAYER_BYTES,
+            "compose_atlas_rgba layer {index} must be {LAYER_BYTES} RGBA bytes, got {}",
+            layer.len()
+        );
+    }
+
+    let rows = layers.len().div_ceil(columns);
+    let width = (columns as u32) * TEX_SIZE;
+    let height = (rows as u32) * TEX_SIZE;
+    let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
+    let row_bytes = (TEX_SIZE * 4) as usize;
+    for (index, layer) in layers.iter().enumerate() {
+        let col = index % columns;
+        let row = index / columns;
+        for y in 0..TEX_SIZE {
+            let src = ((y * TEX_SIZE) * 4) as usize;
+            let dst = (((row as u32 * TEX_SIZE + y) * width + col as u32 * TEX_SIZE) * 4) as usize;
+            rgba[dst..dst + row_bytes].copy_from_slice(&layer[src..src + row_bytes]);
+        }
+    }
+
+    AtlasSheet {
+        width,
+        height,
+        rgba,
+        tiles: layers.len(),
+    }
+}
+
+/// The exact slice of the composed block array the atlas artifact pins.
+///
+/// It is the [`NUM_TEX_LAYERS`] authored/procedural base layers (the built-in
+/// `0..=47` contract) followed by `pack_layers` in registry order, truncated
+/// to the [`PACK_LAYER_BASE`]..[`PACK_LAYER_CAP`] pack budget. The reserved
+/// placeholder band above the last real pack slot is deliberately excluded:
+/// it is fixed checker filler with no authored identity, so including it would
+/// only make the pinned sheet larger, not stronger. `base` is never mutated
+/// and a malformed base/pack layer normalises through
+/// [`compose_block_array_layers`] exactly like the live renderer upload.
+pub fn pinned_atlas_layers(base: &[Vec<u8>], pack_layers: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    let pack_slot_count = pack_layers
+        .len()
+        .min((PACK_LAYER_CAP - PACK_LAYER_BASE) as usize);
+    compose_block_array_layers(base, pack_layers)
+        .into_iter()
+        .take(NUM_TEX_LAYERS as usize + pack_slot_count)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1203,5 +1294,84 @@ mod tests {
             iron_pixels.iter().any(|px| px != first),
             "iron ore texture must not be a flat color"
         );
+    }
+
+    #[test]
+    fn atlas_tiles_layers_row_major_without_padding() {
+        let layers: Vec<Vec<u8>> = (0..10u8).map(|fill| vec![fill; LAYER_BYTES]).collect();
+        let sheet = compose_atlas_rgba(&layers, ATLAS_COLUMNS);
+
+        assert_eq!(sheet.tiles, 10);
+        assert_eq!(sheet.width, 8 * TEX_SIZE);
+        assert_eq!(sheet.height, 2 * TEX_SIZE);
+        assert_eq!(sheet.rgba.len(), (sheet.width * sheet.height * 4) as usize);
+
+        // Tile 0 sits at the top-left and tile 8 starts the second row.
+        assert!(sheet.rgba[..4].iter().all(|byte| *byte == 0));
+        let tile8 = &sheet.rgba[(sheet.width as usize * TEX_SIZE as usize * 4)..][..4];
+        assert!(tile8.iter().all(|byte| *byte == 8));
+        // The two unused cells on the second row stay transparent black.
+        let tail = &sheet.rgba[sheet.rgba.len() - 4..];
+        assert!(tail.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn atlas_for_the_builtin_base_pins_shape_and_digest() {
+        // Measured from a real `--demo-atlas <fresh-dir>` run. A change here
+        // means the composed block-face pixels drifted; re-pin only together
+        // with a deliberate art change.
+        const PINNED_RGBA_DIGEST: u64 = 0xaa21_2bc3_f53c_e34c;
+        const PINNED_PNG_DIGEST: u64 = 0x4a89_e7b5_ab33_7a8a;
+        const PINNED_PNG_BYTES: usize = 32_465;
+
+        let base = generate_all_texture_layers_rgba();
+        let layers = pinned_atlas_layers(&base, &[]);
+        assert_eq!(layers.len(), NUM_TEX_LAYERS as usize);
+
+        let sheet = compose_atlas_rgba(&layers, ATLAS_COLUMNS);
+        assert_eq!(sheet.width, 128);
+        assert_eq!(sheet.height, 96);
+        assert_eq!(sheet.tiles, 48);
+        assert_eq!(sheet.rgba.len(), 49_152);
+        assert_eq!(
+            crate::pack::defaults::atlas_digest(&sheet.rgba),
+            PINNED_RGBA_DIGEST,
+            "composed atlas pixels drifted from the pinned digest"
+        );
+
+        let png =
+            crate::pack::defaults::encode_rgba_png_dims(sheet.width, sheet.height, &sheet.rgba);
+        assert_eq!(png.len(), PINNED_PNG_BYTES);
+        assert_eq!(
+            crate::pack::defaults::atlas_png_digest(&png),
+            PINNED_PNG_DIGEST,
+            "atlas.png bytes drifted from the pinned digest"
+        );
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "atlas must be a PNG");
+    }
+
+    #[test]
+    fn pinned_atlas_layers_excludes_the_placeholder_band() {
+        let base = generate_all_texture_layers_rgba();
+        let pack: Vec<Vec<u8>> = (0..3u32)
+            .map(|index| vec![0x40 + index as u8; LAYER_BYTES])
+            .collect();
+        let layers = pinned_atlas_layers(&base, &pack);
+
+        assert_eq!(layers.len(), NUM_TEX_LAYERS as usize + pack.len());
+        assert_eq!(&layers[..NUM_TEX_LAYERS as usize], &base[..]);
+        assert_eq!(&layers[NUM_TEX_LAYERS as usize..], pack.as_slice());
+    }
+
+    #[test]
+    #[should_panic(expected = "compose_atlas_rgba layer 0 must be")]
+    fn compose_atlas_rgba_rejects_a_malformed_layer() {
+        let _ = compose_atlas_rgba(&[vec![0u8; LAYER_BYTES - 1]], ATLAS_COLUMNS);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one column")]
+    fn compose_atlas_rgba_rejects_zero_columns() {
+        let _ = compose_atlas_rgba(&[], 0);
     }
 }

@@ -54,9 +54,9 @@ use opencraft::demo::content::{content_demo_step, ContentDemo, CONTENT_DEMO_DEAD
 #[cfg(test)]
 use opencraft::demo::digests::crafting_demo_grid;
 use opencraft::demo::digests::{
-    capture_demo_lines, crafting_demo_lines, demo_restart_lines, demo_save_v10_lines,
-    external_pack_demo_lines, palette_demo_lines, presentation_demo_lines, village_demo_lines,
-    worldgen_demo_lines,
+    atlas_demo_lines, capture_demo_lines, crafting_demo_lines, demo_restart_lines,
+    demo_save_v10_lines, external_pack_demo_lines, palette_demo_lines, presentation_demo_lines,
+    village_demo_lines, worldgen_demo_lines,
 };
 #[cfg(test)]
 use opencraft::demo::survival::SurvivalStage;
@@ -7273,6 +7273,26 @@ fn external_pack_demo_request(cli: &CliConfig) -> Result<Option<&Path>, &'static
     Ok(Some(dir))
 }
 
+/// Pre-flight guard for the `--demo-atlas <dir>` launch switch.
+///
+/// Returns `Ok(None)` for every other launch, the output directory when the
+/// atlas artifact is requested, and a user-facing error line when the request
+/// is malformed. Like the external-pack guard it is deliberately strict: the
+/// atlas is a one-shot headless artifact, so it refuses a world intent
+/// (`--new`) and a missing directory instead of silently opening a window.
+fn atlas_demo_request(cli: &CliConfig) -> Result<Option<&Path>, &'static str> {
+    let Some(dir) = cli.demo_atlas.as_deref() else {
+        return Ok(None);
+    };
+    if cli.force_new_world {
+        return Err("--demo-atlas cannot be combined with --new");
+    }
+    if dir.as_os_str().is_empty() {
+        return Err("--demo-atlas requires an output directory");
+    }
+    Ok(Some(dir))
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -7375,6 +7395,37 @@ fn main() {
                 None
             };
             let (lines, ok) = external_pack_demo_lines(dir, fixture);
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            for line in lines {
+                let _ = writeln!(stdout, "{line}");
+            }
+            let _ = stdout.flush();
+            if !ok {
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+    }
+
+    // `--demo-atlas <dir>` is the headless deterministic atlas artifact: it
+    // composes the authored/procedural block-face layers on the CPU, writes
+    // `<dir>/atlas.png` through the shared PNG writer, and prints one pinned
+    // digest line before any settings read/write, window, GPU, audio engine,
+    // event loop, pack load or world startup. It runs after the external-pack
+    // proof (so pack demos keep priority) and rejects a combined `--new` or a
+    // missing directory with exit 2.
+    match atlas_demo_request(&cli) {
+        Err(message) => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: {message}");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        Ok(Some(dir)) => {
+            let (lines, ok) = atlas_demo_lines(dir);
             use std::io::Write as _;
             let mut stdout = std::io::stdout().lock();
             for line in lines {
@@ -8821,6 +8872,81 @@ mod tests {
     }
 
     #[test]
+    fn demo_atlas_request_rejects_new_and_missing_directory() {
+        let demo = CliConfig::parse_args(["--demo-atlas", "out/atlas"]);
+        assert_eq!(demo.demo_atlas.as_deref(), Some(Path::new("out/atlas")));
+        assert!(
+            !cli_has_world_intent(&demo),
+            "the headless atlas artifact is a launch switch, never a world intent"
+        );
+        assert_eq!(atlas_demo_request(&demo), Ok(Some(Path::new("out/atlas"))));
+
+        // A bare switch (or one followed by another switch) fails closed.
+        let empty = CliConfig::parse_args(["--demo-atlas"]);
+        assert_eq!(empty.demo_atlas, Some(PathBuf::new()));
+        assert_eq!(
+            atlas_demo_request(&empty),
+            Err("--demo-atlas requires an output directory")
+        );
+
+        // The artifact is one-shot: combining it with `--new` is rejected.
+        let with_new = CliConfig::parse_args(["--demo-atlas", "out/atlas", "--new"]);
+        assert!(with_new.force_new_world);
+        assert_eq!(
+            atlas_demo_request(&with_new),
+            Err("--demo-atlas cannot be combined with --new")
+        );
+    }
+
+    #[test]
+    fn main_demo_atlas_short_circuit_precedes_world_startup() {
+        // The atlas artifact must follow the validate and external-pack
+        // branches and run before any startup content/session or settings
+        // read: no window, GPU, audio engine, event loop, pack load or
+        // settings write is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let validate_worldgen_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let external_pack_at = body
+            .find("external_pack_demo_request(")
+            .expect("fn main must consume cli.demo_external_pack through the guard");
+        let demo_at = body
+            .find("atlas_demo_request(")
+            .expect("fn main must consume cli.demo_atlas through the guard");
+        let digest_at = body
+            .find("atlas_demo_lines(")
+            .expect("fn main must call atlas_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_pack_at < demo_at,
+            "the atlas artifact must follow the validate-pack branch"
+        );
+        assert!(
+            validate_worldgen_at < demo_at,
+            "the atlas artifact must follow the validate-worldgen branch"
+        );
+        assert!(
+            external_pack_at < demo_at,
+            "the atlas artifact must follow the external-pack proof"
+        );
+        assert!(demo_at < startup_at, "cli.demo_atlas must precede startup");
+        assert!(
+            digest_at < startup_at,
+            "atlas_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
     fn capture_demo_pins_the_fixed_house_line_set() {
         // Measured from a real `--demo-capture <fresh-dir>` run. Never derive
         // these strings from the code under test: the region, byte count and
@@ -9160,6 +9286,50 @@ stack = 64
         let (registry, report) = build_session_registry(&[spec]);
         assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
         registry
+    }
+
+    #[test]
+    fn atlas_demo_pins_the_builtin_artifact_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("atlas");
+        let (lines, ok) = atlas_demo_lines(&out);
+        assert!(ok, "a clean built-in atlas must succeed: {lines:#?}");
+
+        // Literals measured from a real `--demo-atlas <fresh-dir>` run. The
+        // output path is the only machine-dependent token and is asserted by
+        // construction.
+        let expected = format!(
+            "atlas: path={} width=128 height=96 layers=48 bytes=32465 digest=0xaa212bc3f53ce34c png=0x4a89e7b5ab337a8a",
+            out.join("atlas.png").display()
+        );
+        assert_eq!(
+            lines,
+            vec![expected, "atlas_demo: ok=true".to_string()],
+            "the pinned atlas line set drifted"
+        );
+
+        let png = std::fs::read(out.join("atlas.png")).expect("atlas.png must be written");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "atlas must be a PNG");
+    }
+
+    #[test]
+    fn atlas_demo_reports_a_write_failure_instead_of_panicking() {
+        // A regular file where the output directory should be is a realistic
+        // filesystem failure; the demo must latch ok=false rather than panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let (lines, ok) = atlas_demo_lines(&blocker.join("atlas"));
+        assert!(!ok, "an unwritable output must fail closed: {lines:#?}");
+        assert!(
+            lines[0].starts_with("atlas: failed reason="),
+            "the failure must name the I/O reason: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("atlas_demo: ok=false")
+        );
     }
 
     #[test]

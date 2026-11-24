@@ -1052,6 +1052,65 @@ pub fn external_pack_demo_lines(pack_dir: &Path, fixture: Option<&Path>) -> (Vec
 }
 
 // ---------------------------------------------------------------------------
+// Headless deterministic atlas artifact (`--demo-atlas`, M019/S05-T03)
+// ---------------------------------------------------------------------------
+
+/// File name written below the `--demo-atlas` output directory.
+pub const ATLAS_DEMO_FILE: &str = "atlas.png";
+
+/// Build and write the deterministic `--demo-atlas` artifact.
+///
+/// The sheet comes from the same CPU composer the live renderer uploads:
+/// [`generate_all_texture_layers_rgba`] -> [`pinned_atlas_layers`] ->
+/// [`compose_atlas_rgba`], then the shared PNG writer. No GPU state, settings
+/// file, pack stack, window or network is touched, and the output directory is
+/// the only write. The pinned selection excludes the reserved placeholder band
+/// (see [`pinned_atlas_layers`]) and deliberately composes the machine- and
+/// user-config-independent built-in base layers only; pack layers would make
+/// the artifact depend on the local pack stack.
+///
+/// Returns `(lines, ok)`. `ok` is false only when the output directory or file
+/// cannot be written; the caller exits non-zero on that flag.
+pub fn atlas_demo_lines(out_dir: &Path) -> (Vec<String>, bool) {
+    use crate::pack::defaults::{atlas_digest, atlas_png_digest, encode_rgba_png_dims};
+    use crate::render::texture::{compose_atlas_rgba, pinned_atlas_layers, ATLAS_COLUMNS};
+
+    let base = crate::render::texture::generate_all_texture_layers_rgba();
+    let layers = pinned_atlas_layers(&base, &[]);
+    let sheet = compose_atlas_rgba(&layers, ATLAS_COLUMNS);
+    let png = encode_rgba_png_dims(sheet.width, sheet.height, &sheet.rgba);
+    let path = out_dir.join(ATLAS_DEMO_FILE);
+
+    if let Err(error) = std::fs::create_dir_all(out_dir).and_then(|()| std::fs::write(&path, &png))
+    {
+        return (
+            vec![
+                format!("atlas: failed reason={error}"),
+                "atlas_demo: ok=false".to_string(),
+            ],
+            false,
+        );
+    }
+
+    let digest = atlas_digest(&sheet.rgba);
+    let png_digest = atlas_png_digest(&png);
+    (
+        vec![
+            format!(
+                "atlas: path={} width={} height={} layers={} bytes={} digest=0x{digest:016x} png=0x{png_digest:016x}",
+                path.display(),
+                sheet.width,
+                sheet.height,
+                sheet.tiles,
+                png.len(),
+            ),
+            "atlas_demo: ok=true".to_string(),
+        ],
+        true,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Headless crafting digest (`--demo-crafting`, M010/S05-T06)
 // ---------------------------------------------------------------------------
 
