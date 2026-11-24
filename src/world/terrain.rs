@@ -546,12 +546,13 @@ mod tests {
             (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
         ];
         // (uniform, non_air_cells, FNV-1a 64 digest) captured from the
-        // unmodified pre-M010 generator. These are the behavior-preservation
-        // gate for S01: any terrain drift must fail here, not merely differ
-        // from a second run of the same code.
+        // unmodified pre-M010 generator, except the Winter case re-pinned by
+        // M019/S04 when oak output moved to authored prefab cells (D351). These
+        // are the behavior-preservation gate for S01: any other terrain drift
+        // must fail here, not merely differ from a second run of the same code.
         let expected: [(Option<BlockId>, usize, u64); 3] = [
             (None, 26_913, 5_429_992_561_724_371_152),
-            (None, 20_878, 8_773_073_591_056_755_479),
+            (None, 20_889, 3_148_434_793_551_996_225),
             (Some(BlockId::Air), 0, 16_934_947_671_703_429_925),
         ];
 

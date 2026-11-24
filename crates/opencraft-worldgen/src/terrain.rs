@@ -547,16 +547,26 @@ fn place_pack_ore_veins(
     }
 }
 
-/// Whether any oak log — a trunk cell of a tree rooted in the footprint or a
-/// one-block branch of a tree rooted next to it — falls inside the vertical
-/// window a ruin could occupy (`surface + 1..=surface + TREE_CANOPY_HEADROOM`).
+/// Whether any oak log — a trunk cell or a branch of a tree rooted in or next
+/// to the footprint — falls inside the vertical window a ruin could occupy
+/// (`surface + 1..=surface + TREE_CANOPY_HEADROOM`).
 ///
 /// `place_ruin_at`'s in-chunk OakLog scan can only see the chunk layer that owns
 /// the anchor surface, while a D088 tree near a vertical chunk edge keeps cells
 /// in the layer above. This pure model check closes that gap, so the
 /// tree-overlap policy is layer-independent: a ruin never clips a trunk or a
 /// branch, even when the tree's upper cells live in the next chunk layer.
-fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
+///
+/// The log cells come from the authored oak prefab selected by
+/// `(trunk_height, layout)` (M019/S04), so the overlap rule sees exactly the
+/// cells the emission pass would write. Every prefab log cell lies within one
+/// block of its root column, so the bounded 7x7 expanded-root scan stays
+/// sufficient.
+fn tree_logs_intersect_ruin_window(
+    spec: &RuinSpec,
+    seed: u32,
+    structures: &StructureCatalog,
+) -> bool {
     let min_wy = spec.surface + 1;
     let max_wy = spec.surface + TREE_CANOPY_HEADROOM;
     let min_x = spec.anchor_x - RUIN_FOOTPRINT_HALF;
@@ -564,9 +574,9 @@ fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
     let min_z = spec.anchor_z - RUIN_FOOTPRINT_HALF;
     let max_z = spec.anchor_z + RUIN_FOOTPRINT_HALF;
 
-    // A branch reaches one block out from its root, so every tree that could
-    // write a log into the footprint is rooted in the footprint expanded by
-    // one. One bounded 7x7 scan covers all of them.
+    // A log cell reaches at most one block out from its root column, so every
+    // tree that could write a log into the footprint is rooted in the footprint
+    // expanded by one. One bounded 7x7 scan covers all of them.
     for rz in (min_z - 1)..=(max_z + 1) {
         for rx in (min_x - 1)..=(max_x + 1) {
             let h = terrain_height_at_seeded(rx, rz, seed);
@@ -574,26 +584,19 @@ fn tree_logs_intersect_ruin_window(spec: &RuinSpec, seed: u32) -> bool {
             let Some(tree) = oak_tree_at(rx, rz, h, biome, seed) else {
                 continue;
             };
-
-            // Trunk cells stay on the root column, so only trees rooted inside
-            // the footprint can intersect it.
-            if (min_x..=max_x).contains(&rx)
-                && (min_z..=max_z).contains(&rz)
-                && h < max_wy
-                && h + tree.trunk_height >= min_wy
-            {
-                return true;
-            }
-
-            // Keep only branch cells that land in the footprint and the
-            // window. The terrain check mirrors the emission pass: a branch is
-            // never written into a ground cell. Branch cells are well above
-            // sea level, so Water cannot occupy them.
-            for (bx, by, bz) in tree.branch_cells(rx, rz, h) {
+            let Some(prefab) = structures.oak(tree.trunk_height, tree.layout) else {
+                continue;
+            };
+            for cell in &prefab.blocks {
+                if cell.block != BLOCK_OAK_LOG {
+                    continue;
+                }
+                let bx = rx + cell.position[0] as i32 - prefab.origin[0] as i32;
+                let by = h + 1 + cell.position[1] as i32 - prefab.origin[1] as i32;
+                let bz = rz + cell.position[2] as i32 - prefab.origin[2] as i32;
                 if (min_x..=max_x).contains(&bx)
                     && (min_z..=max_z).contains(&bz)
                     && (min_wy..=max_wy).contains(&by)
-                    && terrain_height_at_seeded(bx, bz, seed) < by
                 {
                     return true;
                 }
@@ -656,8 +659,9 @@ fn place_surface_ruins(
             // The in-chunk log scan inside `place_ruin_at` can only see the
             // current chunk layer. A D088 tree can straddle a vertical chunk
             // edge, so also reject anchors whose window intersects any trunk or
-            // branch in the pure tree model (see `tree_logs_intersect_ruin_window`).
-            if tree_logs_intersect_ruin_window(&spec, seed) {
+            // branch in the pure tree model, using the same authored prefab
+            // cells the tree pass emits (see `tree_logs_intersect_ruin_window`).
+            if tree_logs_intersect_ruin_window(&spec, seed, structures) {
                 continue;
             }
             // A catalog without the prefab for this wall height skips the
@@ -1116,75 +1120,62 @@ pub fn generate_chunk_with_context(
             // 3..29) so canopies never cross a chunk border. The gate is the
             // pre-season terrain class (`Plains`/`Forest` + the Grass height
             // band in `oak_tree_at`), never the post-season surface block, so
-            // Winter keeps its trunks and branches and only the leaves are
+            // Winter keeps its prefab skeleton and only the leaves are
             // seasonal (D088). Beaches, seabeds and mountain stone stay out of
             // the band by construction, exactly as before.
+            //
+            // The tree's cells come from the authored oak prefab selected by
+            // `(trunk_height, layout)` (M019/S04, D351): placement math stays
+            // in code, prefab cells are data. Grid `y = 0` is the first cell
+            // above the column surface, so a prefab cell binds at
+            // `h + 1 + (grid_y - origin_y)`.
             //
             // Every chunk layer whose vertical span intersects the tree emits
             // the cells it owns. A tree near the shore can top the first
             // chunk-Y boundary (wy 32); gating on the surface layer alone used
             // to clip exactly those trees halfway. `tree_top` is derived from
             // the same model constants as the emitted cells, so this
-            // intersection test can never skip a branch or canopy top.
+            // intersection test can never skip a prefab cell.
             let tree_top = h + TREE_MAX_HEIGHT_OVER_SURFACE;
             if tree_top >= base_wy && h + 1 < base_wy + CHUNK_SIZE as i32 {
                 if let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) {
-                    for ty in (h + 1)..=(h + tree.trunk_height) {
-                        let ly_tree = ty - base_wy;
-                        if (0..CHUNK_SIZE as i32).contains(&ly_tree) {
-                            chunk.set(lx, ly_tree as usize, lz, BLOCK_OAK_LOG);
-                        }
-                    }
-
-                    // Deterministic branches on the upper trunk. A branch may
-                    // replace an existing leaf but never terrain, water, Snow or
-                    // another structure cell. Admitting leaves keeps the log
-                    // skeleton identical in every season regardless of the
-                    // column iteration order (Winter has no leaves to collide
-                    // with, so an Air-only rule would make winter trees grow
-                    // extra branches).
-                    for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
-                        let ly_b = by - base_wy;
-                        if !(0..CHUNK_SIZE as i32).contains(&ly_b) {
-                            continue;
-                        }
-                        let tlx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
-                        let tlz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
-                        if matches!(
-                            chunk.get(tlx, ly_b as usize, tlz),
-                            BLOCK_AIR | BLOCK_OAK_LEAVES
-                        ) {
-                            chunk.set(tlx, ly_b as usize, tlz, BLOCK_OAK_LOG);
-                        }
-                    }
-
-                    // Only leaves are seasonal: Spring, Summer and Autumn keep
-                    // the full canopy, Winter stays bare. The trunk and branches
-                    // above survive every season.
-                    if season != Season::Winter {
-                        let trunk_h = tree.trunk_height;
-                        let canopy_base = h + trunk_h - 1;
-                        let canopy_top = h + trunk_h + 1;
-                        for cy in canopy_base..=canopy_top {
-                            let ly_c = cy - base_wy;
-                            if !(0..CHUNK_SIZE as i32).contains(&ly_c) {
+                    // A catalog without this oak skips the tree; the builtin
+                    // family is always complete, so this is the documented
+                    // overlay degradation path, never a panic.
+                    if let Some(prefab) = structures.oak(tree.trunk_height, tree.layout) {
+                        for cell in &prefab.blocks {
+                            if cell.block == BLOCK_AIR {
                                 continue;
                             }
-                            let radius: i32 = if cy == canopy_top { 1 } else { 2 };
-                            for dz in -radius..=radius {
-                                for dx in -radius..=radius {
-                                    if dx == 0 && dz == 0 && cy <= h + trunk_h {
-                                        continue;
-                                    }
-                                    if dx.abs() == 2 && dz.abs() == 2 && cy == canopy_base {
-                                        continue;
-                                    }
-                                    let tlx = (lx as i32 + dx) as usize;
-                                    let tlz = (lz as i32 + dz) as usize;
-                                    if chunk.get(tlx, ly_c as usize, tlz) == BLOCK_AIR {
-                                        chunk.set(tlx, ly_c as usize, tlz, BLOCK_OAK_LEAVES);
-                                    }
+                            let bx = wx + cell.position[0] as i32 - prefab.origin[0] as i32;
+                            let by = h + 1 + cell.position[1] as i32 - prefab.origin[1] as i32;
+                            let bz = wz + cell.position[2] as i32 - prefab.origin[2] as i32;
+                            let ly_tree = by - base_wy;
+                            if !(0..CHUNK_SIZE as i32).contains(&ly_tree) {
+                                continue;
+                            }
+                            let tlx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+                            let tlz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+                            let current = chunk.get(tlx, ly_tree as usize, tlz);
+                            match cell.block {
+                                // Logs replace Air or an existing leaf, so the
+                                // skeleton is identical in every season
+                                // regardless of column iteration order (Winter
+                                // has no leaves to collide with).
+                                BLOCK_OAK_LOG
+                                    if matches!(current, BLOCK_AIR | BLOCK_OAK_LEAVES) =>
+                                {
+                                    chunk.set(tlx, ly_tree as usize, tlz, BLOCK_OAK_LOG);
                                 }
+                                // Only leaves are seasonal: Spring, Summer and
+                                // Autumn keep the full canopy, Winter stays
+                                // bare. Leaves only ever fill Air.
+                                BLOCK_OAK_LEAVES
+                                    if current == BLOCK_AIR && season != Season::Winter =>
+                                {
+                                    chunk.set(tlx, ly_tree as usize, tlz, BLOCK_OAK_LEAVES);
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -1269,12 +1260,14 @@ mod tests {
             (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
         ];
         // (uniform, non_air_cells, FNV-1a 64 digest) captured from the
-        // unmodified pre-M010 generator. These are the behavior-preservation
-        // gate for the crate move: any terrain drift must fail here, not
-        // merely differ from a second run of the same code.
+        // unmodified pre-M010 generator, except the Winter case re-pinned by
+        // M019/S04 when oak output moved to authored prefab cells (D351). These
+        // are the behavior-preservation gate for the crate move: any terrain
+        // drift must fail here, not merely differ from a second run of the same
+        // code.
         let expected: [(Option<u16>, usize, u64); 3] = [
             (None, 26_913, 5_429_992_561_724_371_152),
-            (None, 20_878, 8_773_073_591_056_755_479),
+            (None, 20_889, 3_148_434_793_551_996_225),
             (Some(BLOCK_AIR), 0, 16_934_947_671_703_429_925),
         ];
 
@@ -2357,6 +2350,40 @@ mod tests {
         );
     }
 
+    /// The world-space `(wx, wy, wz, block)` cells of a tree, read from the
+    /// builtin authored oak prefab selected by its model.
+    ///
+    /// Tests use this instead of duplicating the emission mapping, so a prefab
+    /// edit is exercised through the same binding rule the generator uses
+    /// (grid `y = 0` is the first cell above the column surface).
+    fn tree_prefab_cells(wx: i32, wz: i32, h: i32, tree: OakTree) -> Vec<(i32, i32, i32, u16)> {
+        let prefab = StructureCatalog::builtin()
+            .oak(tree.trunk_height, tree.layout)
+            .expect("builtin catalog must define every oak variant");
+        prefab
+            .blocks
+            .iter()
+            .filter(|block| block.block != BLOCK_AIR)
+            .map(|block| {
+                (
+                    wx + block.position[0] as i32 - prefab.origin[0] as i32,
+                    h + 1 + block.position[1] as i32 - prefab.origin[1] as i32,
+                    wz + block.position[2] as i32 - prefab.origin[2] as i32,
+                    block.block,
+                )
+            })
+            .collect()
+    }
+
+    /// The world-space log cells (`oak_log`) of a tree, from its prefab.
+    fn tree_log_cells(wx: i32, wz: i32, h: i32, tree: OakTree) -> Vec<(i32, i32, i32)> {
+        tree_prefab_cells(wx, wz, h, tree)
+            .into_iter()
+            .filter(|(_, _, _, block)| *block == BLOCK_OAK_LOG)
+            .map(|(bx, by, bz, _)| (bx, by, bz))
+            .collect()
+    }
+
     /// First column of `biome` whose surface is high enough for trees (above
     /// the beach band), so the density comparison is not sampled on a coast.
     fn first_tree_column(seed: u32, biome: Biome) -> (i32, i32, i32) {
@@ -2438,9 +2465,9 @@ mod tests {
                 continue;
             }
 
-            // Not a trunk column: the only other legal log is a branch of a
-            // tree rooted in a neighbouring column (branches are one block
-            // out, so dx/dz are in -1..=1).
+            // Not a trunk column: the only other legal log is a log cell of a
+            // tree rooted in a neighbouring column (all prefab log cells are at
+            // most one block out, so dx/dz are in -1..=1).
             let mut explained = false;
             'neighbours: for ndz in -1..=1 {
                 for ndx in -1..=1 {
@@ -2453,10 +2480,7 @@ mod tests {
                     let Some(source) = oak_tree_at(sx, sz, sh, sb, seed) else {
                         continue;
                     };
-                    if source
-                        .branch_cells(sx, sz, sh)
-                        .any(|(bx, by, bz)| (bx, by, bz) == (wx, lowest_log, wz))
-                    {
+                    if tree_log_cells(sx, sz, sh, source).contains(&(wx, lowest_log, wz)) {
                         explained = true;
                         break 'neighbours;
                     }
@@ -4052,10 +4076,10 @@ position = [0, 0, 0]
                 if top < CHUNK_SIZE as i32 {
                     continue;
                 }
-                let clear_branches = tree
-                    .branch_cells(wx, wz, h)
+                let clear_logs = tree_log_cells(wx, wz, h, tree)
+                    .into_iter()
                     .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by);
-                if clear_branches {
+                if clear_logs {
                     return (wx, wz, h, tree);
                 }
             }
@@ -4138,10 +4162,11 @@ position = [0, 0, 0]
         // regenerate a treeless Winter. The trunk and branches survive every
         // season; only leaves disappear in Winter.
         let (twx, twz, th, tree) = find_tree(seed, |wx, wz, h, tree| {
-            tree.branch_cells(wx, wz, h)
+            tree_log_cells(wx, wz, h, tree)
+                .into_iter()
                 .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
         })
-        .expect("seed 1 must grow at least one oak with clear branch cells");
+        .expect("seed 1 must grow at least one oak with clear log cells");
         for (day, season) in seasons {
             for ty in (th + 1)..=(th + tree.trunk_height) {
                 assert_eq!(
@@ -4150,7 +4175,7 @@ position = [0, 0, 0]
                     "day {day} ({season:?}) lost the trunk block at ({twx}, {ty}, {twz})"
                 );
             }
-            for (bx, by, bz) in tree.branch_cells(twx, twz, th) {
+            for (bx, by, bz) in tree_log_cells(twx, twz, th, tree) {
                 assert_eq!(
                     generated_block_at(bx, by, bz, seed, season),
                     BLOCK_OAK_LOG,
@@ -4311,10 +4336,11 @@ position = [0, 0, 0]
     fn test_spring_summer_and_autumn_keep_oak_canopy_and_trunks() {
         let seed = DEFAULT_WORLD_SEED;
         let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
-            tree.branch_cells(wx, wz, h)
+            tree_log_cells(wx, wz, h, tree)
+                .into_iter()
                 .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
         })
-        .expect("seed must grow at least one oak with clear branch cells");
+        .expect("seed must grow at least one oak with clear log cells");
         let trunk_h = tree.trunk_height;
         let (cx, cz) = (
             wx.div_euclid(CHUNK_SIZE as i32),
@@ -4336,7 +4362,7 @@ position = [0, 0, 0]
                 BLOCK_OAK_LEAVES,
                 "{season:?} has no canopy leaf at ({wx}, {leaf_wy}, {wz})"
             );
-            for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+            for (bx, by, bz) in tree_log_cells(wx, wz, h, tree) {
                 assert_eq!(
                     generated_block_at(bx, by, bz, seed, season),
                     BLOCK_OAK_LOG,
@@ -4367,7 +4393,7 @@ position = [0, 0, 0]
                 "autumn removed the trunk block at ({wx}, {ty}, {wz})"
             );
         }
-        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+        for (bx, by, bz) in tree_log_cells(wx, wz, h, tree) {
             assert_eq!(
                 generated_block_at(bx, by, bz, seed, Season::Autumn),
                 BLOCK_OAK_LOG,
@@ -4397,10 +4423,11 @@ position = [0, 0, 0]
     fn test_seasonal_winter_keeps_trunks_and_branches_without_leaves() {
         let seed = DEFAULT_WORLD_SEED;
         let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
-            tree.branch_cells(wx, wz, h)
+            tree_log_cells(wx, wz, h, tree)
+                .into_iter()
                 .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
         })
-        .expect("seed must grow at least one oak with clear branch cells");
+        .expect("seed must grow at least one oak with clear log cells");
         let trunk_h = tree.trunk_height;
         let (cx, cz) = (
             wx.div_euclid(CHUNK_SIZE as i32),
@@ -4419,7 +4446,7 @@ position = [0, 0, 0]
                 "winter removed the trunk block at ({wx}, {ty}, {wz})"
             );
         }
-        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+        for (bx, by, bz) in tree_log_cells(wx, wz, h, tree) {
             assert_eq!(
                 generated_block_at(bx, by, bz, seed, Season::Winter),
                 BLOCK_OAK_LOG,
@@ -4450,6 +4477,304 @@ position = [0, 0, 0]
             count_blocks_in_chunk_column(cx, cz, seed, Season::Winter, BLOCK_OAK_LOG) > 0,
             "winter chunk column lost every oak trunk"
         );
+    }
+
+    /// Generate one chunk with an explicit structure catalog (`None` = the
+    /// compile-time builtin) and no rules, villages or spawn override.
+    fn generate_with_catalog(
+        pos: ChunkPos,
+        seed: u32,
+        season: Season,
+        structures: Option<&StructureCatalog>,
+    ) -> ChunkBuffer {
+        generate_chunk_with_context(
+            pos,
+            seed,
+            season,
+            &WorldGenContext {
+                rules: &[],
+                villages: None,
+                spawn_column: None,
+                structures,
+            },
+        )
+    }
+
+    /// M019/S04, D351: the authored catalog — not inline code — fully drives oak
+    /// output. Every one of the eight `(trunk_height, layout)` variants must be
+    /// reachable, an explicit builtin catalog must reproduce `structures: None`
+    /// byte for byte, and adding one legal leaf cell to a variant prefab must
+    /// change exactly that world cell in the generated chunk.
+    #[test]
+    fn catalog_drives_output() {
+        let seed = DEFAULT_WORLD_SEED;
+        let builtin = StructureCatalog::builtin();
+        // One representative tree per `(trunk_height, layout)` variant, indexed
+        // as `(trunk_height - 4) * 4 + layout`, from a chunk that contains
+        // exactly one tree of that variant: the catalog edit below is global to
+        // the variant, so a single instance keeps the diff literal. Each tree
+        // must also fit fully inside its chunk layer so its prefab cells are
+        // all observable in one generated chunk.
+        let mut found: [Option<(i32, i32, i32, OakTree)>; 8] = [None; 8];
+        let mut remaining = found.len();
+        'chunks: for cz in -16..=16 {
+            for cx in -16..=16 {
+                let mut counts = [0usize; 8];
+                let mut first: [Option<(i32, i32, i32, OakTree)>; 8] = [None; 8];
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let wx = cx * CHUNK_SIZE as i32 + lx as i32;
+                        let wz = cz * CHUNK_SIZE as i32 + lz as i32;
+                        let h = terrain_height_at_seeded(wx, wz, seed);
+                        let biome = biome_at_seeded(wx, wz, seed);
+                        let Some(tree) = oak_tree_at(wx, wz, h, biome, seed) else {
+                            continue;
+                        };
+                        let index = (tree.trunk_height - 4) as usize * 4 + tree.layout as usize;
+                        counts[index] += 1;
+                        if first[index].is_none() {
+                            first[index] = Some((wx, wz, h, tree));
+                        }
+                    }
+                }
+                for (variant, slot) in found.iter_mut().enumerate() {
+                    if slot.is_some() || counts[variant] != 1 {
+                        continue;
+                    }
+                    let candidate = first[variant].expect("a counted tree must be recorded");
+                    let fits_layer = candidate.2.rem_euclid(CHUNK_SIZE as i32)
+                        + TREE_MAX_HEIGHT_OVER_SURFACE
+                        < CHUNK_SIZE as i32;
+                    if fits_layer {
+                        *slot = Some(candidate);
+                        remaining -= 1;
+                    }
+                }
+                if remaining == 0 {
+                    break 'chunks;
+                }
+            }
+        }
+        assert!(
+            found.iter().all(Option::is_some),
+            "the bounded chunk scan did not reach all eight (trunk_height, layout) variants"
+        );
+
+        for (wx, wz, h, tree) in found.iter().flatten().copied() {
+            let pos = ChunkPos::new(
+                wx.div_euclid(CHUNK_SIZE as i32),
+                h.div_euclid(CHUNK_SIZE as i32),
+                wz.div_euclid(CHUNK_SIZE as i32),
+            );
+            let name = format!("oak_t{}_l{}", tree.trunk_height, tree.layout);
+            let prefab = builtin
+                .oak(tree.trunk_height, tree.layout)
+                .expect("builtin catalog must define every oak variant");
+            assert_eq!(prefab.name, name, "prefab name must match the model");
+
+            let baseline = generate_with_catalog(pos, seed, Season::Summer, None);
+            let explicit = generate_with_catalog(pos, seed, Season::Summer, Some(builtin));
+            assert_chunks_equal(
+                &explicit,
+                &baseline,
+                "an explicit builtin catalog must match structures: None",
+            );
+
+            // Pick a prefab Air cell that is also Air in the generated layer,
+            // then declare it a leaf. That single edit must surface as exactly
+            // one OakLeaves cell in the chunk.
+            let base_wy = pos.y * CHUNK_SIZE as i32;
+            let mut extra = None;
+            for block in &prefab.blocks {
+                if block.block != BLOCK_AIR {
+                    continue;
+                }
+                let bx = wx + block.position[0] as i32 - prefab.origin[0] as i32;
+                let by = h + 1 + block.position[1] as i32 - prefab.origin[1] as i32;
+                let bz = wz + block.position[2] as i32 - prefab.origin[2] as i32;
+                if by.div_euclid(CHUNK_SIZE as i32) != pos.y {
+                    continue;
+                }
+                let ly = (by - base_wy) as usize;
+                let tlx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+                let tlz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+                if baseline.get(tlx, ly, tlz) == BLOCK_AIR {
+                    extra = Some((block.position, (bx, by, bz), ly));
+                    break;
+                }
+            }
+            let (grid_position, (ex, _, ez), expected_ly) = extra
+                .expect("an oak prefab must have an Air cell that is Air in the baseline chunk");
+
+            let mut prefabs: Vec<Prefab> = builtin
+                .names()
+                .map(|name| builtin.get(name).expect("named prefab must exist").clone())
+                .collect();
+            {
+                let target = prefabs
+                    .iter_mut()
+                    .find(|candidate| candidate.name == name)
+                    .expect("the variant prefab must be in the catalog");
+                let cell = target
+                    .blocks
+                    .iter_mut()
+                    .find(|block| block.position == grid_position)
+                    .expect("the chosen grid cell must exist");
+                assert_eq!(cell.block, BLOCK_AIR, "the edit target must start as Air");
+                cell.block = BLOCK_OAK_LEAVES;
+            }
+            let edited = StructureCatalog::from_prefabs(prefabs);
+            let modified = generate_with_catalog(pos, seed, Season::Summer, Some(&edited));
+
+            let expected = (
+                ex.rem_euclid(CHUNK_SIZE as i32) as usize,
+                expected_ly,
+                ez.rem_euclid(CHUNK_SIZE as i32) as usize,
+            );
+            let mut differences = 0usize;
+            for ly in 0..CHUNK_SIZE {
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let before = baseline.get(lx, ly, lz);
+                        let after = modified.get(lx, ly, lz);
+                        if before == after {
+                            continue;
+                        }
+                        differences += 1;
+                        assert_eq!(
+                            (lx, ly, lz),
+                            expected,
+                            "the extra prefab leaf changed an unexpected cell"
+                        );
+                        assert_eq!(before, BLOCK_AIR, "the extra leaf overrode a non-Air cell");
+                        assert_eq!(after, BLOCK_OAK_LEAVES);
+                    }
+                }
+            }
+            assert_eq!(
+                differences, 1,
+                "the extra prefab leaf must change exactly one world cell"
+            );
+        }
+    }
+
+    /// M019/S04, D351: for one representative tree chunk, Winter drops every
+    /// prefab leaf cell and keeps every prefab log cell identical to Summer
+    /// (only cells outside the generated layer are skipped).
+    #[test]
+    fn winter_drops_prefab_leaves_only() {
+        let seed = DEFAULT_WORLD_SEED;
+        let (wx, wz, h, tree) = find_tree(seed, |wx, wz, h, tree| {
+            let fits_layer =
+                h.rem_euclid(CHUNK_SIZE as i32) + TREE_MAX_HEIGHT_OVER_SURFACE < CHUNK_SIZE as i32;
+            fits_layer
+                && tree_log_cells(wx, wz, h, tree)
+                    .into_iter()
+                    .all(|(bx, by, bz)| terrain_height_at_seeded(bx, bz, seed) < by)
+        })
+        .expect("seed must grow at least one in-layer oak with clear log cells");
+        let pos = ChunkPos::new(
+            wx.div_euclid(CHUNK_SIZE as i32),
+            h.div_euclid(CHUNK_SIZE as i32),
+            wz.div_euclid(CHUNK_SIZE as i32),
+        );
+        let base_wy = pos.y * CHUNK_SIZE as i32;
+        let summer = generate_with_catalog(pos, seed, Season::Summer, None);
+        let winter = generate_with_catalog(pos, seed, Season::Winter, None);
+
+        let mut leaves = 0usize;
+        let mut logs = 0usize;
+        let mut shed = 0usize;
+        for (bx, by, bz, block) in tree_prefab_cells(wx, wz, h, tree) {
+            if by.div_euclid(CHUNK_SIZE as i32) != pos.y {
+                continue;
+            }
+            let ly = (by - base_wy) as usize;
+            let lx = bx.rem_euclid(CHUNK_SIZE as i32) as usize;
+            let lz = bz.rem_euclid(CHUNK_SIZE as i32) as usize;
+            match block {
+                BLOCK_OAK_LEAVES => {
+                    leaves += 1;
+                    assert_ne!(
+                        winter.get(lx, ly, lz),
+                        BLOCK_OAK_LEAVES,
+                        "winter kept a prefab leaf at ({bx}, {by}, {bz})"
+                    );
+                    if summer.get(lx, ly, lz) == BLOCK_OAK_LEAVES {
+                        shed += 1;
+                        assert_eq!(
+                            winter.get(lx, ly, lz),
+                            BLOCK_AIR,
+                            "winter did not clear the prefab leaf at ({bx}, {by}, {bz})"
+                        );
+                    }
+                }
+                BLOCK_OAK_LOG => {
+                    logs += 1;
+                    assert_eq!(
+                        winter.get(lx, ly, lz),
+                        summer.get(lx, ly, lz),
+                        "winter changed the prefab log at ({bx}, {by}, {bz})"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(leaves > 0, "the representative tree has no prefab leaves");
+        assert!(logs > 0, "the representative tree has no prefab logs");
+        assert!(shed > 0, "no prefab leaf was actually emitted in Summer");
+    }
+
+    /// Negative: a structure catalog without the oak variants skips the tree
+    /// pass instead of panicking, never emits an oak cell, and leaves every
+    /// terrain surface cell untouched.
+    #[test]
+    fn catalog_without_oaks_skips_trees() {
+        let seed = DEFAULT_WORLD_SEED;
+        let empty = StructureCatalog::from_prefabs(Vec::new());
+        let positions = [
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(-3, 0, 7),
+            ChunkPos::new(3, 1, -2),
+        ];
+        for pos in positions {
+            let built = generate_with_catalog(pos, seed, Season::Summer, None);
+            let bare = generate_with_catalog(pos, seed, Season::Summer, Some(&empty));
+            for ly in 0..CHUNK_SIZE {
+                for lz in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let block = bare.get(lx, ly, lz);
+                        assert!(
+                            !matches!(block, BLOCK_OAK_LOG | BLOCK_OAK_LEAVES),
+                            "a catalog without oaks still emitted an oak cell at {pos:?} \
+                             ({lx}, {ly}, {lz})"
+                        );
+                    }
+                }
+            }
+            // Removing trees never rewrites a ground cell: the surface block is
+            // identical with and without the catalog.
+            let base_wx = pos.x * CHUNK_SIZE as i32;
+            let base_wy = pos.y * CHUNK_SIZE as i32;
+            let base_wz = pos.z * CHUNK_SIZE as i32;
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let wx = base_wx + lx as i32;
+                    let wz = base_wz + lz as i32;
+                    let h = terrain_height_at_seeded(wx, wz, seed);
+                    let ly = h - base_wy;
+                    if !(0..CHUNK_SIZE as i32).contains(&ly) {
+                        continue;
+                    }
+                    assert_eq!(
+                        bare.get(lx, ly as usize, lz),
+                        built.get(lx, ly as usize, lz),
+                        "the surface cell moved without a structure catalog at \
+                         {pos:?} ({wx}, {h}, {wz})"
+                    );
+                }
+            }
+        }
     }
 
     /// Negative/structural: a season change alters only two things — the
@@ -4564,7 +4889,7 @@ position = [0, 0, 0]
                 "shoreline tree at ({wx}, {wz}) lost trunk block ({wx}, {ty}, {wz})"
             );
         }
-        for (bx, by, bz) in tree.branch_cells(wx, wz, h) {
+        for (bx, by, bz) in tree_log_cells(wx, wz, h, tree) {
             assert_eq!(
                 generated_block_at(bx, by, bz, seed, Season::Summer),
                 BLOCK_OAK_LOG,
