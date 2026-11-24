@@ -118,6 +118,12 @@ hardness = 1.0
 EOF
 write_valid_png "packs/legacy/old_block.png" "$PNG_RUBY" || fail "cannot seed legacy/old_block.png"
 
+# External v3 fixture: authored from docs/TEXTURE-PACKS.md alone. It proves
+# the documented flat six-face overrides, the three block models, all three
+# alpha classes and a [builtin_icons] override validate without repo help.
+cp -a "$CRATE_ROOT/tests/fixtures/packs/external-v3" packs/external-v3 ||
+    fail "cannot seed external-v3 fixture"
+
 cp -a packs "$WORK/packs.expected" || fail "cannot snapshot the pack tree"
 
 run_validate() {
@@ -206,6 +212,43 @@ grep -Fq 'validate-pack: legacy: 0 entries, 1 errors, 0 warnings' "$OUT" ||
     fail "scenario 5: summary must report exactly one pack-level error"
 
 # ---------------------------------------------------------------------------
+# Scenario 6: the external-v3 fixture authored from the docs alone.
+# It must validate with 0 errors AND 0 warnings, and every documented feature
+# must appear as a named `ok:` entry.
+# ---------------------------------------------------------------------------
+OUT="$WORK/external-v3.out"
+rc="$(run_validate "$OUT" --validate-pack external-v3)"
+[[ "$rc" -eq 0 ]] || {
+    cat "$OUT" >&2
+    fail "scenario 6: external-v3 exit $rc (expected 0)"
+}
+grep -Fq 'validate-pack: external-v3: 11 entries, 0 errors, 0 warnings' "$OUT" ||
+    fail "scenario 6: missing the exact 0 errors / 0 warnings summary"
+# Six distinct built-in stone faces plus a `_top`-only dirt override.
+for face in east west top bottom south north; do
+    grep -Fq "ok: face stone $face" "$OUT" ||
+        fail "scenario 6: missing 'ok: face stone $face'"
+done
+grep -Fq 'ok: face dirt top' "$OUT" ||
+    fail "scenario 6: missing the top-only dirt override"
+grep -Fq 'ok: block external:reed model=cross alpha=cutout' "$OUT" ||
+    fail "scenario 6: missing the cross/cutout entry"
+grep -Fq 'ok: block external:wheat model=crop alpha=cutout' "$OUT" ||
+    fail "scenario 6: missing the crop/cutout entry"
+grep -Fq 'ok: block external:frosted_glass model=cube alpha=blend' "$OUT" ||
+    fail "scenario 6: missing the cube/blend entry"
+grep -Fq 'ok: builtin_icon apple' "$OUT" ||
+    fail "scenario 6: missing the [builtin_icons] override entry"
+if grep -q '^error:' "$OUT"; then
+    cat "$OUT" >&2
+    fail "scenario 6: external-v3 reported an error"
+fi
+if grep -q '^warning:' "$OUT"; then
+    cat "$OUT" >&2
+    fail "scenario 6: external-v3 reported a warning"
+fi
+
+# ---------------------------------------------------------------------------
 # Read-only contract: no settings file, untouched sentinel save and packs.
 # ---------------------------------------------------------------------------
 [[ ! -e "$WORK/settings.toml" ]] ||
@@ -217,4 +260,4 @@ if ! diff -r "$WORK/packs" "$WORK/packs.expected" >/dev/null 2>&1; then
     fail "validation modified pack files"
 fi
 
-echo "VALIDATE PACK SMOKE OK: clean=0 broken=1 missing=1 no-value=1 legacy-v2=1; settings/save/packs untouched"
+echo "VALIDATE PACK SMOKE OK: clean=0 broken=1 missing=1 no-value=1 legacy-v2=1 external-v3=0; settings/save/packs untouched"

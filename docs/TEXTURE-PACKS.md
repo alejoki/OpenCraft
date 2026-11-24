@@ -43,7 +43,7 @@ The game ships one pack, `packs/default`, so a fresh install has a working prese
 
 Packs can be stacked in the Settings menu, and a stack applies later-pack-wins per authored file and field: a later pack that ships one PNG replaces only that layer, while earlier packs keep every other layer, logo, tint, description, and sound they authored.
 
-The repository ships three example packs as test fixtures under `tests/fixtures/packs/`: `mymod-ruby` (a complete Format v3 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; a normal install ships only the `packs/default` pack.
+The repository ships four test fixtures under `tests/fixtures/packs/`: `external-v3` (a validation fixture authored from this document that exercises six-face overrides, all three models and all three alpha classes), `mymod-ruby` (a complete Format v3 content pack), `ruby-overlay` (a texture-only overlay), and `uat-sound` (the sound fixture). Copy the folders you want into your own `packs/` directory. These are examples and test fixtures, not part of a normal install; a normal install ships only the `packs/default` pack.
 
 ## pack.toml reference
 
@@ -205,7 +205,7 @@ chance = 0.02
 
 ## Reference packs (test fixtures)
 
-The repository ships two content-oriented examples under `tests/fixtures/packs/` next to the sound fixture. Copy both folders into the game's `packs/` directory and select them in this order:
+The repository ships two content-oriented examples under `tests/fixtures/packs/` next to the sound and validation fixtures. Copy both folders into the game's `packs/` directory and select them in this order:
 
 1. `tests/fixtures/packs/mymod-ruby`
 2. `tests/fixtures/packs/ruby-overlay`
@@ -220,6 +220,8 @@ The repository ships two content-oriented examples under `tests/fixtures/packs/`
 - Two worldgen rules: a ruby-ore vein rule in stone from y 4 to 40, and a ruby-ore surface patch on plains and forest grass from y 40 to 110.
 
 `ruby-overlay` is a `format_version = 3` manifest with no content arrays and a single authored file, `stone.png`. Stacked after `mymod-ruby`, it replaces the stone block layer and leaves every other pack file, definition and field alone.
+
+`tests/fixtures/packs/external-v3` is a validation fixture rather than a gameplay example: it was authored from this document alone and has no repository-specific hints. It exercises six distinct flat face overrides on `stone`, a `_top`-only override on `dirt`, a `cross`/`cutout` plant, a `crop`/`cutout` block, a cube/`blend` block and a `[builtin_icons]` apple override. `--validate-pack external-v3` reports `11 entries, 0 errors, 0 warnings`, so it is the fastest regression check for the documented surface.
 
 With that stack selected, these headless commands exercise the same code paths a world does:
 
