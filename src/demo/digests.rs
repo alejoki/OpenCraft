@@ -1714,6 +1714,7 @@ pub fn village_demo_generate(
             rules: &[],
             villages: Some(catalog),
             spawn_column: Some(spawn),
+            structures: None,
         },
     )
 }
@@ -1811,6 +1812,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
             rules: &[],
             villages: None,
             spawn_column: Some(spawn),
+            structures: None,
         },
     );
     let context_ok = village_demo_chunks_equal(&legacy_sample, &default_sample);
@@ -1950,6 +1952,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                     rules: &[],
                     villages: Some(&empty_catalog),
                     spawn_column: Some(spawn),
+                    structures: None,
                 },
             );
             let via_none = generate_chunk_with_context(
@@ -1960,6 +1963,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                     rules: &[],
                     villages: None,
                     spawn_column: Some(spawn),
+                    structures: None,
                 },
             );
             village_demo_chunks_equal(&legacy, &via_empty)

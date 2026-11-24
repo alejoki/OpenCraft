@@ -24,15 +24,16 @@ use opencraft_core::chunk::{linear_index, local_coords_from_index, ChunkPos, CHU
 
 use crate::biome::{biome_for_height, forest_noise, Biome, BEACH_BAND, SEA_LEVEL};
 use crate::block::{
-    BLOCK_AIR, BLOCK_BEDROCK, BLOCK_BRICK, BLOCK_COAL_ORE, BLOCK_COBBLESTONE, BLOCK_DIRT,
-    BLOCK_GRASS, BLOCK_IRON_ORE, BLOCK_LOOT_CHEST, BLOCK_OAK_LEAVES, BLOCK_OAK_LOG, BLOCK_SAND,
-    BLOCK_SNOW, BLOCK_STONE, BLOCK_WATER,
+    BLOCK_AIR, BLOCK_BEDROCK, BLOCK_COAL_ORE, BLOCK_DIRT, BLOCK_GRASS, BLOCK_IRON_ORE,
+    BLOCK_LOOT_CHEST, BLOCK_OAK_LEAVES, BLOCK_OAK_LOG, BLOCK_SAND, BLOCK_SNOW, BLOCK_STONE,
+    BLOCK_WATER,
 };
 use crate::buffer::ChunkBuffer;
 use crate::height::{terrain_height_at_seeded, MAX_TERRAIN_HEIGHT};
-use crate::prefab::PREFAB_CAPS;
-use crate::ruin::{ruin_at, ruin_loot_chest_pos, RuinSpec, RUIN_FOOTPRINT_HALF};
+use crate::prefab::{MarkerKind, MarkerLootTable, Prefab, PREFAB_CAPS};
+use crate::ruin::{ruin_at, RuinSpec, RUIN_FOOTPRINT_HALF};
 use crate::season::Season;
+use crate::structure::StructureCatalog;
 use crate::tree::{oak_tree_at, TREE_CANOPY_HEADROOM, TREE_MAX_HEIGHT_OVER_SURFACE};
 use crate::village::{place_village_cells, VillageCatalog};
 
@@ -627,6 +628,7 @@ fn place_surface_ruins(
     biomes: &[[Biome; CHUNK_SIZE]; CHUNK_SIZE],
     pos: ChunkPos,
     seed: u32,
+    structures: &StructureCatalog,
 ) {
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
@@ -658,7 +660,13 @@ fn place_surface_ruins(
             if tree_logs_intersect_ruin_window(&spec, seed) {
                 continue;
             }
-            place_ruin_at(chunk, heights, base_wy, spec);
+            // A catalog without the prefab for this wall height skips the
+            // anchor. Builtin is always complete, so this is the documented
+            // degradation path for an overlay, never a panic.
+            let Some(prefab) = structures.ruin(spec.wall_height) else {
+                continue;
+            };
+            place_ruin_at(chunk, heights, base_wy, spec, prefab);
         }
     }
 }
@@ -735,136 +743,109 @@ fn place_pack_surface_patches(
     }
 }
 
-/// Write one ruin shell into `chunk`.
+/// Write one authored ruin prefab into `chunk`.
 ///
-/// `ruin_at`'s chunk-interior anchor margin guarantees the whole footprint lies
-/// inside this chunk, so every `lx`/`lz` below is a plain offset (no wrapping).
-/// `ruin_at`'s footprint-aware vertical-fit gate additionally guarantees every
-/// shell cell — including the tallest corner pillar on the highest footprint
-/// column — stays in the chunk layer that owns the anchor surface, so the
-/// in-range skips remain defensive only.
+/// `ruin_at`'s chunk-interior anchor margin guarantees the whole 5x5 footprint
+/// lies inside this chunk, so the remapped columns below never wrap. Every
+/// non-Air [`Prefab::blocks`] entry is bound to its **own** column's surface
+/// height (D349): grid `y = 0` is the first cell above that column, so a cell
+/// lands at `h_column + 1 + (grid_y - origin_y)`. The legacy shell had the same
+/// per-column binding, so builtin output stays byte-identical.
 ///
 /// Three policies are pinned here, all deterministic and independent of
 /// iteration order:
 ///
 /// 1. Tree-overlap: if any footprint column already holds `OakLog`, the anchor
 ///    is skipped entirely — a ruin never carves through a tree.
-/// 2. Only-into-Air: each shell cell is written only where the chunk currently
-///    holds `BLOCK_AIR`, so trees, leaves, the Grass surface skin, Snow and
-///    Water are never overwritten. Footprint columns whose own surface is not
-///    Grass are skipped too, so a shell cannot stand on a Sand/Stone neighbour.
-/// 3. One loot chest: after the shell loop, a single `LootChest` is written at
-///    [`ruin_loot_chest_pos`] (the anchor column, one above the surface) and
-///    only when that cell is currently `Air`. An interlocking shell, leaves,
-///    Water or any other occupant wins, and the anchor then carries no chest;
-///    this pass never writes a second chest.
+/// 2. Only-into-Air: each prefab cell is written only where the chunk
+///    currently holds `BLOCK_AIR`, so trees, leaves, the Grass surface skin,
+///    Snow and Water are never overwritten. Footprint columns whose own surface
+///    is not Grass/Snow are skipped too, so a shell cannot stand on a
+///    Sand/Stone neighbour.
+/// 3. One marker, one chest: typed `loot_chest`/`ruin` markers emit exactly one
+///    `LootChest` each, at `h_column + 1 + (marker.y - origin_y)`, and only
+///    into Air. A prefab with no marker writes no chest, and an occupied chest
+///    cell suppresses only the chest. The marker's `table` is authored
+///    metadata only: the world stores just the block and loot stays
+///    position-derived through `ruin_loot_chest_pos` / `ruin_loot_chest_at`
+///    (MEM350/MEM352).
 fn place_ruin_at(
     chunk: &mut ChunkBuffer,
     heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
     base_wy: i32,
     spec: RuinSpec,
+    prefab: &Prefab,
 ) {
-    let anchor_lx = spec.anchor_x.rem_euclid(CHUNK_SIZE as i32);
-    let anchor_lz = spec.anchor_z.rem_euclid(CHUNK_SIZE as i32);
+    let chunk_size = CHUNK_SIZE as i32;
+    let origin_x = prefab.origin[0] as i32;
+    let origin_y = prefab.origin[1] as i32;
+    let origin_z = prefab.origin[2] as i32;
 
-    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-            let lx = (anchor_lx + dx) as usize;
-            let lz = (anchor_lz + dz) as usize;
+    // Tree-overlap policy: an OakLog anywhere in a footprint column skips the
+    // whole anchor, chest included.
+    for grid_z in 0..prefab.size[2] as i32 {
+        for grid_x in 0..prefab.size[0] as i32 {
+            let lx = (spec.anchor_x + grid_x - origin_x).rem_euclid(chunk_size) as usize;
+            let lz = (spec.anchor_z + grid_z - origin_z).rem_euclid(chunk_size) as usize;
             if (0..CHUNK_SIZE).any(|ly| chunk.get(lx, ly, lz) == BLOCK_OAK_LOG) {
                 return;
             }
         }
     }
 
-    for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-        for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-            // Shell only: the footprint interior stays open Air.
-            if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
-                continue;
-            }
-            let lx = (anchor_lx + dx) as usize;
-            let lz = (anchor_lz + dz) as usize;
-            let h = heights[lz][lx];
-            let surface_ly = h - base_wy;
-            if !(0..CHUNK_SIZE as i32).contains(&surface_ly) {
-                continue;
-            }
-            // Per-footprint-column surface gate: the shell stands on the
-            // seasonal land skin (Grass, or Snow in Winter) only, so a
-            // footprint straddling a beach or a mountain stone column simply
-            // loses those cells.
-            if !matches!(
-                chunk.get(lx, surface_ly as usize, lz),
-                BLOCK_GRASS | BLOCK_SNOW
-            ) {
-                continue;
-            }
-            let block = ruin_wall_block(dx, dz);
-            let bottom = ruin_cell_bottom(dx, dz);
-            let top = ruin_cell_top(dx, dz, spec.wall_height);
-            for level in bottom..=top {
-                let ly = h + level - base_wy;
-                if !(0..CHUNK_SIZE as i32).contains(&ly) {
-                    continue;
-                }
-                let ly = ly as usize;
-                if chunk.get(lx, ly, lz) == BLOCK_AIR {
-                    chunk.set(lx, ly, lz, block);
-                }
-            }
+    for block in &prefab.blocks {
+        if block.block == BLOCK_AIR {
+            continue;
+        }
+        let dx = block.position[0] as i32 - origin_x;
+        let dz = block.position[2] as i32 - origin_z;
+        let lx = (spec.anchor_x + dx).rem_euclid(chunk_size) as usize;
+        let lz = (spec.anchor_z + dz).rem_euclid(chunk_size) as usize;
+        let h = heights[lz][lx];
+        let surface_ly = h - base_wy;
+        if !(0..chunk_size).contains(&surface_ly) {
+            continue;
+        }
+        // Per-footprint-column surface gate: the shell stands on the seasonal
+        // land skin (Grass, or Snow in Winter) only, so a footprint straddling
+        // a beach or a mountain stone column simply loses those cells.
+        if !matches!(
+            chunk.get(lx, surface_ly as usize, lz),
+            BLOCK_GRASS | BLOCK_SNOW
+        ) {
+            continue;
+        }
+        let wy = h + 1 + (block.position[1] as i32 - origin_y);
+        let ly = wy - base_wy;
+        if !(0..chunk_size).contains(&ly) {
+            continue;
+        }
+        let ly = ly as usize;
+        if chunk.get(lx, ly, lz) == BLOCK_AIR {
+            chunk.set(lx, ly, lz, block.block);
         }
     }
 
-    // One loot chest at the interior centre. The only-into-Air rule applies to
-    // the chest as well: a neighbouring shell, leaves, Water or anything else
-    // already occupying the cell wins, and this anchor carries no chest rather
-    // than overwriting it. No second chest is ever written.
-    let chest = ruin_loot_chest_pos(&spec);
-    let chest_lx = chest.x.rem_euclid(CHUNK_SIZE as i32);
-    let chest_lz = chest.z.rem_euclid(CHUNK_SIZE as i32);
-    let chest_ly = chest.y - base_wy;
-    if (0..CHUNK_SIZE as i32).contains(&chest_lx)
-        && (0..CHUNK_SIZE as i32).contains(&chest_ly)
-        && (0..CHUNK_SIZE as i32).contains(&chest_lz)
-    {
-        let (lx, ly, lz) = (chest_lx as usize, chest_ly as usize, chest_lz as usize);
+    // Typed markers are origin-relative, exactly like sockets. Only the
+    // loot-chest/ruin pair the placement rule understands emits a block; the
+    // table itself is not stored in the world.
+    for marker in &prefab.markers {
+        if marker.kind != MarkerKind::LootChest || marker.table != MarkerLootTable::Ruin {
+            continue;
+        }
+        let lx = (spec.anchor_x + marker.position[0]).rem_euclid(chunk_size) as usize;
+        let lz = (spec.anchor_z + marker.position[2]).rem_euclid(chunk_size) as usize;
+        let h = heights[lz][lx];
+        let wy = h + 1 + (marker.position[1] - origin_y);
+        let ly = wy - base_wy;
+        if !(0..chunk_size).contains(&ly) {
+            continue;
+        }
+        let ly = ly as usize;
         if chunk.get(lx, ly, lz) == BLOCK_AIR {
             chunk.set(lx, ly, lz, BLOCK_LOOT_CHEST);
         }
     }
-}
-
-/// Wall material for a footprint offset: Brick on the four corner pillars,
-/// Cobblestone on the wall runs between them. Both are already complete,
-/// legal-edit opaque blocks, so ruins add no block ids and no registry rows.
-#[inline]
-fn ruin_wall_block(dx: i32, dz: i32) -> u16 {
-    if dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF {
-        BLOCK_BRICK
-    } else {
-        BLOCK_COBBLESTONE
-    }
-}
-
-/// Lowest wall level (above the column surface) at which this footprint cell
-/// starts. The centre of the +z wall is a doorway: it is left open for the
-/// whole wall height so the ruin reads as an entrance, not a sealed box.
-#[inline]
-fn ruin_cell_bottom(dx: i32, dz: i32) -> i32 {
-    if dx == 0 && dz == RUIN_FOOTPRINT_HALF {
-        2
-    } else {
-        1
-    }
-}
-
-/// Highest wall level of this footprint cell: corner pillars stand one block
-/// above the wall runs between them.
-#[inline]
-fn ruin_cell_top(dx: i32, dz: i32, wall_height: i32) -> i32 {
-    let corner = dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF;
-    wall_height + i32::from(corner)
 }
 
 /// Generates `pos` with the default world seed and [`Season::Summer`].
@@ -939,6 +920,7 @@ pub fn generate_chunk_seeded_with(
             rules,
             villages: None,
             spawn_column: None,
+            structures: None,
         },
     )
 }
@@ -947,14 +929,21 @@ pub fn generate_chunk_seeded_with(
 ///
 /// `rules` is the pack worldgen stack (empty for vanilla worlds), `villages`
 /// is the optional accepted village catalog (empty/`None` reproduces the
-/// pre-M015 generator byte-for-byte) and `spawn_column` lets a caller that
-/// already knows the spawn skip the bounded [`crate::spawn::find_spawn_column`]
-/// search when the village planner needs it.
+/// pre-M015 generator byte-for-byte), `spawn_column` lets a caller that
+/// already knows the spawn skip the bounded
+/// [`crate::spawn::find_spawn_column`] search when the village planner needs
+/// it, and `structures` is the optional accepted structure catalog.
+///
+/// `structures: None` means [`StructureCatalog::builtin()`]: the compile-time
+/// master compiled into the crate, so generation never touches the
+/// filesystem. A `Some` catalog is the same builtin overlaid by accepted
+/// runtime files (see [`StructureCatalog::load_sorted`]).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorldGenContext<'a> {
     pub rules: &'a [WorldgenRule],
     pub villages: Option<&'a VillageCatalog>,
     pub spawn_column: Option<(i32, i32)>,
+    pub structures: Option<&'a StructureCatalog>,
 }
 
 /// Whether a chunk whose base starts at `base_wy` is entirely above every
@@ -1002,6 +991,13 @@ pub fn generate_chunk_with_context(
     let base_wx = pos.x * CHUNK_SIZE as i32;
     let base_wy = pos.y * CHUNK_SIZE as i32;
     let base_wz = pos.z * CHUNK_SIZE as i32;
+    // `None` is the compile-time builtin master: no filesystem access and the
+    // exact pre-slice ruin shells. A runtime catalog overlays it by name, so a
+    // rejected file can only fall back to builtin output.
+    let structures: &StructureCatalog = match ctx.structures {
+        Some(catalog) => catalog,
+        None => StructureCatalog::builtin(),
+    };
 
     // Conservative gate computed before either early return: a chunk can only
     // skip the block loop when it provably holds no village cell either.
@@ -1204,7 +1200,7 @@ pub fn generate_chunk_with_context(
     // Third structure pass: after ores, so a ruin can never be carved by the
     // ore pass, and after trees, so the tree-overlap policy can see the actual
     // OakLog cells it refuses to overwrite.
-    place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed);
+    place_surface_ruins(&mut chunk, &heights, &biomes, pos, seed, structures);
     // Pack patches run last and only touch `wy == h`, so no structure or
     // canopy cell can ever be rewritten.
     place_pack_surface_patches(&mut chunk, &heights, &biomes, pos, seed, ctx.rules);
@@ -1223,9 +1219,9 @@ pub fn generate_chunk_with_context(
 mod tests {
     use super::*;
     use crate::biome::{biome_at_seeded, MOUNTAIN_HEIGHT_THRESHOLD};
-    use crate::block::{BLOCK_AIR, BLOCK_CRAFTING_TABLE};
+    use crate::block::{BLOCK_AIR, BLOCK_BRICK, BLOCK_COBBLESTONE, BLOCK_CRAFTING_TABLE};
     use crate::height::MIN_TERRAIN_HEIGHT;
-    use crate::prefab::{Prefab, PrefabBlock};
+    use crate::prefab::{parse_prefab, Prefab, PrefabBlock};
     use crate::ruin::{
         ruin_at, ruin_at_seeded, ruin_covers, ruin_loot, ruin_loot_chest_at, ruin_loot_chest_pos,
         RuinSpec, RUIN_MAX_HEIGHT, RUIN_MIN_HEIGHT, RUIN_WALL_MAX_HEIGHT,
@@ -2634,6 +2630,57 @@ mod tests {
         chests
     }
 
+    /// Legacy shell oracle: `(dx, dz, level, block)` for every cell of a ruin
+    /// with `spec.wall_height`, derived from the pre-prefab formula rather
+    /// than from the authored prefab. The prefab must reproduce this set
+    /// exactly, which is what keeps generated ruin bytes unchanged.
+    fn legacy_shell_cells(spec: &RuinSpec) -> Vec<(i32, i32, i32, u16)> {
+        let mut cells = Vec::new();
+        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
+                    continue;
+                }
+                let corner = dx.abs() == RUIN_FOOTPRINT_HALF && dz.abs() == RUIN_FOOTPRINT_HALF;
+                let block = if corner {
+                    BLOCK_BRICK
+                } else {
+                    BLOCK_COBBLESTONE
+                };
+                let bottom = if dx == 0 && dz == RUIN_FOOTPRINT_HALF {
+                    2
+                } else {
+                    1
+                };
+                let top = spec.wall_height + i32::from(corner);
+                for level in bottom..=top {
+                    cells.push((dx, dz, level, block));
+                }
+            }
+        }
+        cells
+    }
+
+    /// World-local cell for one prefab grid position: each footprint column
+    /// contributes its own surface height (D349).
+    fn prefab_cell_world(
+        spec: &RuinSpec,
+        prefab: &Prefab,
+        grid: [i32; 3],
+        heights: &[[i32; CHUNK_SIZE]; CHUNK_SIZE],
+        base_wy: i32,
+    ) -> (usize, usize, usize) {
+        let origin = [
+            prefab.origin[0] as i32,
+            prefab.origin[1] as i32,
+            prefab.origin[2] as i32,
+        ];
+        let lx = (spec.anchor_x + grid[0] - origin[0]).rem_euclid(CHUNK_SIZE as i32) as usize;
+        let lz = (spec.anchor_z + grid[2] - origin[2]).rem_euclid(CHUNK_SIZE as i32) as usize;
+        let wy = heights[lz][lx] + 1 + (grid[1] - origin[1]);
+        (lx, (wy - base_wy) as usize, lz)
+    }
+
     #[test]
     fn test_surface_ruins_stand_on_plains_forest_land_in_every_season() {
         let seed = DEFAULT_WORLD_SEED;
@@ -2686,7 +2733,10 @@ mod tests {
             let on_shell = covering.iter().any(|spec| {
                 let dx = wx - spec.anchor_x;
                 let dz = wz - spec.anchor_z;
-                dx.abs().max(dz.abs()) == RUIN_FOOTPRINT_HALF && ruin_wall_block(dx, dz) as u8 == id
+                let level = wy - h;
+                legacy_shell_cells(spec).iter().any(|&(cx, cz, cl, block)| {
+                    cx == dx && cz == dz && cl == level && block == id as u16
+                })
             });
             assert!(
                 on_shell,
@@ -2843,7 +2893,10 @@ mod tests {
         chunk.set(18, 9, 16, BLOCK_OAK_LEAVES);
         chunk.set(14, 10, 14, BLOCK_WATER);
 
-        place_ruin_at(&mut chunk, &heights, base_wy, spec);
+        let prefab = StructureCatalog::builtin()
+            .ruin(spec.wall_height)
+            .expect("builtin ruin prefab");
+        place_ruin_at(&mut chunk, &heights, base_wy, spec, prefab);
 
         assert_eq!(
             chunk.get(18, 9, 16),
@@ -2875,7 +2928,7 @@ mod tests {
             }
         }
         tree_chunk.set(17, 9, 17, BLOCK_OAK_LOG);
-        place_ruin_at(&mut tree_chunk, &heights, base_wy, spec);
+        place_ruin_at(&mut tree_chunk, &heights, base_wy, spec, prefab);
         for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
             for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
                 for ly in 0..CHUNK_SIZE {
@@ -2920,26 +2973,22 @@ mod tests {
             chunk
         };
 
+        let prefab = StructureCatalog::builtin()
+            .ruin(spec.wall_height)
+            .expect("builtin ruin prefab");
         let mut chunk = grass_flat();
-        place_ruin_at(&mut chunk, &heights, base_wy, spec);
+        place_ruin_at(&mut chunk, &heights, base_wy, spec, prefab);
 
         // Every shell cell is painted, including both levels of the wall runs
         // and the taller corner pillars; the doorway stays open.
-        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
-                    continue;
-                }
-                let lx = (spec.anchor_x + dx) as usize;
-                let lz = (spec.anchor_z + dz) as usize;
-                for level in ruin_cell_bottom(dx, dz)..=ruin_cell_top(dx, dz, spec.wall_height) {
-                    assert_eq!(
-                        chunk.get(lx, (spec.surface + level) as usize, lz),
-                        ruin_wall_block(dx, dz),
-                        "shell cell ({dx}, {level}, {dz}) was not painted"
-                    );
-                }
-            }
+        for (dx, dz, level, block) in legacy_shell_cells(&spec) {
+            let lx = (spec.anchor_x + dx) as usize;
+            let lz = (spec.anchor_z + dz) as usize;
+            assert_eq!(
+                chunk.get(lx, (spec.surface + level) as usize, lz),
+                block,
+                "shell cell ({dx}, {level}, {dz}) was not painted"
+            );
         }
 
         let chest = ruin_loot_chest_pos(&spec);
@@ -2962,7 +3011,7 @@ mod tests {
         // no LootChest is created anywhere.
         let mut blocked = grass_flat();
         blocked.set(16, 11, 16, BLOCK_STONE);
-        place_ruin_at(&mut blocked, &heights, base_wy, spec);
+        place_ruin_at(&mut blocked, &heights, base_wy, spec, prefab);
         assert_eq!(blocked.get(16, 11, 16), BLOCK_STONE);
         for lz in 0..CHUNK_SIZE {
             for ly in 0..CHUNK_SIZE {
@@ -2980,7 +3029,7 @@ mod tests {
         // chest included.
         let mut tree = grass_flat();
         tree.set(17, 11, 17, BLOCK_OAK_LOG);
-        place_ruin_at(&mut tree, &heights, base_wy, spec);
+        place_ruin_at(&mut tree, &heights, base_wy, spec, prefab);
         assert_eq!(tree.get(16, 11, 16), BLOCK_AIR);
         for lz in 0..CHUNK_SIZE {
             for ly in 0..CHUNK_SIZE {
@@ -2993,6 +3042,358 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// First Proof (research): the authored ruin prefab binds every cell to its
+    /// own column's surface, the marker becomes exactly one chest on the
+    /// position-derived loot seam, and the only-into-Air/tree-overlap policies
+    /// are preserved. Inline fixture, real `place_ruin_at` — no mocks.
+    #[test]
+    fn test_ruin_prefab_binds_columns_and_places_the_marker_chest() {
+        const RUIN_TEXT: &str = r#"format = 1
+name = "ruin_wall_2"
+origin = [2, 0, 2]
+size = [5, 3, 5]
+
+layers = [
+  [ "*+++*", "+...+", "+...+", "+...+", "*+.+*" ],
+  [ "*+++*", "+...+", "+...+", "+...+", "*+++*" ],
+  [ "*...*", ".....", ".....", ".....", "*...*" ],
+]
+
+[palette]
+"+" = "cobblestone"
+"*" = "brick"
+
+[[markers]]
+kind = "loot_chest"
+table = "ruin"
+position = [0, 0, 0]
+"#;
+        let prefab = parse_prefab(RUIN_TEXT).expect("inline ruin prefab must parse");
+        let serialized = prefab.to_toml_string();
+        assert_eq!(
+            parse_prefab(&serialized).expect("canonical ruin prefab must re-parse"),
+            prefab,
+            "prefab marker round-trip changed the value"
+        );
+        assert!(serialized.contains("[[markers]]"));
+        assert!(serialized.contains("position = [0, 0, 0]"));
+
+        // A real anchor makes `ruin_loot_chest_at` meaningful: the loot seam is
+        // position-derived, not prefab-derived. Pick wall_height 2 and a
+        // surface whose whole stepped footprint stays in one chunk layer.
+        let seed = DEFAULT_WORLD_SEED;
+        let spec = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed)
+            .into_iter()
+            .find(|spec| {
+                spec.wall_height == 2
+                    && spec.surface >= 34
+                    && spec.surface <= 60 - TREE_CANOPY_HEADROOM.min(3)
+            })
+            .expect("region must contain a wall_height 2 ruin with room for a stepped fixture");
+        let base_wy = spec.surface.div_euclid(CHUNK_SIZE as i32) * CHUNK_SIZE as i32;
+
+        let mut heights = [[spec.surface; CHUNK_SIZE]; CHUNK_SIZE];
+        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
+                let lx = (spec.anchor_x + dx).rem_euclid(CHUNK_SIZE as i32) as usize;
+                let lz = (spec.anchor_z + dz).rem_euclid(CHUNK_SIZE as i32) as usize;
+                heights[lz][lx] = if dx == 0 && dz == 0 {
+                    spec.surface
+                } else {
+                    // Neighbours step through surface-1..=surface+2, so every
+                    // column owns a different binding height.
+                    spec.surface - 1 + (dx + 2 + (dz + 2) * 5).rem_euclid(4)
+                };
+            }
+        }
+
+        let mut chunk = ChunkBuffer::uniform(BLOCK_AIR);
+        for (lz, row) in heights.iter().enumerate() {
+            for (lx, &h) in row.iter().enumerate() {
+                chunk.set(lx, (h - base_wy) as usize, lz, BLOCK_GRASS);
+            }
+        }
+
+        // Pre-seed two real shell cells with non-Air occupants: only-into-Air
+        // must leave them untouched.
+        let (leaf_lx, leaf_ly, leaf_lz) =
+            prefab_cell_world(&spec, &prefab, [0, 0, 0], &heights, base_wy);
+        let (water_lx, water_ly, water_lz) =
+            prefab_cell_world(&spec, &prefab, [1, 0, 0], &heights, base_wy);
+        chunk.set(leaf_lx, leaf_ly, leaf_lz, BLOCK_OAK_LEAVES);
+        chunk.set(water_lx, water_ly, water_lz, BLOCK_WATER);
+
+        place_ruin_at(&mut chunk, &heights, base_wy, spec, &prefab);
+
+        // Every non-Air prefab cell lands at `h_column + 1 + (grid_y - origin_y)`,
+        // except the two pre-seeded occupants.
+        for block in &prefab.blocks {
+            if block.block == BLOCK_AIR {
+                continue;
+            }
+            let grid = [
+                block.position[0] as i32,
+                block.position[1] as i32,
+                block.position[2] as i32,
+            ];
+            let (lx, ly, lz) = prefab_cell_world(&spec, &prefab, grid, &heights, base_wy);
+            let expected = if (lx, ly, lz) == (leaf_lx, leaf_ly, leaf_lz) {
+                BLOCK_OAK_LEAVES
+            } else if (lx, ly, lz) == (water_lx, water_ly, water_lz) {
+                BLOCK_WATER
+            } else {
+                block.block
+            };
+            assert_eq!(
+                chunk.get(lx, ly, lz),
+                expected,
+                "prefab cell {grid:?} did not bind to its column at ({lx}, {ly}, {lz})"
+            );
+        }
+
+        // Doorway: the +z centre column stays open at level 1.
+        let doorway = [
+            prefab.origin[0] as i32,
+            0,
+            prefab.origin[2] as i32 + RUIN_FOOTPRINT_HALF,
+        ];
+        let (dx_lx, dx_ly, dx_lz) = prefab_cell_world(&spec, &prefab, doorway, &heights, base_wy);
+        assert_eq!(
+            chunk.get(dx_lx, dx_ly, dx_lz),
+            BLOCK_AIR,
+            "the doorway was walled up"
+        );
+
+        // Exactly one chest, on the anchor column at surface + 1.
+        let chest = ruin_loot_chest_pos(&spec);
+        let (chest_lx, chest_ly, chest_lz) = (
+            chest.x.rem_euclid(CHUNK_SIZE as i32) as usize,
+            (chest.y - base_wy) as usize,
+            chest.z.rem_euclid(CHUNK_SIZE as i32) as usize,
+        );
+        assert_eq!(chunk.get(chest_lx, chest_ly, chest_lz), BLOCK_LOOT_CHEST);
+        let mut chests = 0usize;
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if chunk.get(lx, ly, lz) == BLOCK_LOOT_CHEST {
+                        chests += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(chests, 1, "the marker must emit exactly one chest");
+        assert!(
+            ruin_loot_chest_at(chest, seed).is_some(),
+            "the position-derived loot seam must resolve the placed chest"
+        );
+
+        // Negative 1: an OakLog in a footprint column suppresses the whole
+        // shell and the chest.
+        let mut tree = ChunkBuffer::uniform(BLOCK_AIR);
+        for (lz, row) in heights.iter().enumerate() {
+            for (lx, &h) in row.iter().enumerate() {
+                tree.set(lx, (h - base_wy) as usize, lz, BLOCK_GRASS);
+            }
+        }
+        let log_lx = (spec.anchor_x + 1).rem_euclid(CHUNK_SIZE as i32) as usize;
+        let log_lz = (spec.anchor_z + 1).rem_euclid(CHUNK_SIZE as i32) as usize;
+        tree.set(
+            log_lx,
+            (spec.surface + 1 - base_wy) as usize,
+            log_lz,
+            BLOCK_OAK_LOG,
+        );
+        place_ruin_at(&mut tree, &heights, base_wy, spec, &prefab);
+        assert_eq!(tree.get(chest_lx, chest_ly, chest_lz), BLOCK_AIR);
+        for lz in 0..CHUNK_SIZE {
+            for ly in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    let block = tree.get(lx, ly, lz);
+                    assert!(
+                        !matches!(block, BLOCK_COBBLESTONE | BLOCK_BRICK | BLOCK_LOOT_CHEST),
+                        "tree-overlapped anchor still wrote {block:?}"
+                    );
+                }
+            }
+        }
+
+        // Negative 2: an occupied chest cell suppresses only the chest.
+        let mut blocked = ChunkBuffer::uniform(BLOCK_AIR);
+        for (lz, row) in heights.iter().enumerate() {
+            for (lx, &h) in row.iter().enumerate() {
+                blocked.set(lx, (h - base_wy) as usize, lz, BLOCK_GRASS);
+            }
+        }
+        blocked.set(chest_lx, chest_ly, chest_lz, BLOCK_STONE);
+        place_ruin_at(&mut blocked, &heights, base_wy, spec, &prefab);
+        assert_eq!(blocked.get(chest_lx, chest_ly, chest_lz), BLOCK_STONE);
+        assert_eq!(
+            blocked.get(leaf_lx, leaf_ly, leaf_lz),
+            BLOCK_BRICK,
+            "the shell must still be painted when only the chest cell is occupied"
+        );
+
+        // Negative 3: a marker-less prefab writes no chest.
+        let mut markerless = prefab.clone();
+        markerless.markers.clear();
+        let mut no_marker = ChunkBuffer::uniform(BLOCK_AIR);
+        for (lz, row) in heights.iter().enumerate() {
+            for (lx, &h) in row.iter().enumerate() {
+                no_marker.set(lx, (h - base_wy) as usize, lz, BLOCK_GRASS);
+            }
+        }
+        place_ruin_at(&mut no_marker, &heights, base_wy, spec, &markerless);
+        assert_eq!(no_marker.get(chest_lx, chest_ly, chest_lz), BLOCK_AIR);
+    }
+
+    /// The catalog drives output: `None` is the builtin master, and a runtime
+    /// catalog with one extra authored brick cell changes exactly that cell.
+    #[test]
+    fn test_catalog_drives_ruin_output() {
+        let seed = DEFAULT_WORLD_SEED;
+        let anchors = ruin_anchors_in_region(RUIN_SCAN_RADIUS, seed);
+        let mut target = None;
+        for spec in &anchors {
+            let pos = ChunkPos::new(
+                spec.anchor_x.div_euclid(CHUNK_SIZE as i32),
+                spec.surface.div_euclid(CHUNK_SIZE as i32),
+                spec.anchor_z.div_euclid(CHUNK_SIZE as i32),
+            );
+            // Only anchor in this chunk with this wall height: otherwise the
+            // modified prefab would change more than one cell.
+            let same_height_anchors = anchors
+                .iter()
+                .filter(|other| {
+                    other.wall_height == spec.wall_height
+                        && other.anchor_x.div_euclid(CHUNK_SIZE as i32) == pos.x
+                        && other.anchor_z.div_euclid(CHUNK_SIZE as i32) == pos.z
+                })
+                .count();
+            if same_height_anchors != 1 || spec.surface.rem_euclid(CHUNK_SIZE as i32) > 27 {
+                continue;
+            }
+            let chunk = generate_chunk_seeded(pos, seed, Season::Summer);
+            // The anchor itself must have emitted its marker chest (so it was
+            // not tree-suppressed and this chunk really owns this spec).
+            let chest = ruin_loot_chest_pos(spec);
+            let chest_block = chunk.get(
+                chest.x.rem_euclid(CHUNK_SIZE as i32) as usize,
+                (chest.y - pos.y * CHUNK_SIZE as i32) as usize,
+                chest.z.rem_euclid(CHUNK_SIZE as i32) as usize,
+            );
+            if chest_block == BLOCK_LOOT_CHEST {
+                target = Some((*spec, pos, chunk));
+                break;
+            }
+        }
+        let (spec, pos, builtin_chunk) =
+            target.expect("region must contain an isolated generated ruin");
+
+        let builtin_catalog = StructureCatalog::builtin().clone();
+        let via_none = generate_chunk_with_context(
+            pos,
+            seed,
+            Season::Summer,
+            &WorldGenContext {
+                rules: &[],
+                villages: None,
+                spawn_column: None,
+                structures: None,
+            },
+        );
+        let via_builtin = generate_chunk_with_context(
+            pos,
+            seed,
+            Season::Summer,
+            &WorldGenContext {
+                rules: &[],
+                villages: None,
+                spawn_column: None,
+                structures: Some(&builtin_catalog),
+            },
+        );
+        assert_chunks_equal(
+            &builtin_chunk,
+            &via_none,
+            "`None` must reproduce the legacy chunk",
+        );
+        assert_chunks_equal(
+            &builtin_chunk,
+            &via_builtin,
+            "the builtin catalog must reproduce the legacy chunk",
+        );
+
+        let ruin_name = format!("ruin_wall_{}", spec.wall_height);
+        let mut prefabs: Vec<Prefab> = builtin_catalog
+            .names()
+            .map(|name| {
+                builtin_catalog
+                    .get(name)
+                    .expect("name came from the catalog")
+                    .clone()
+            })
+            .collect();
+        let modified = prefabs
+            .iter_mut()
+            .find(|prefab| prefab.name == ruin_name)
+            .expect("builtin catalog must contain the targeted ruin");
+        // Grid y = 1, centre interior: Air in every authored wall height, so
+        // adding a brick there changes exactly one generated cell.
+        let extra = modified
+            .blocks
+            .iter_mut()
+            .find(|block| block.position == [2, 1, 2])
+            .expect("the authored grid includes every cell, air included");
+        assert_eq!(
+            extra.block, BLOCK_AIR,
+            "fixture assumes an air interior cell"
+        );
+        extra.block = BLOCK_BRICK;
+        let custom_catalog = StructureCatalog::from_prefabs(prefabs);
+        let via_custom = generate_chunk_with_context(
+            pos,
+            seed,
+            Season::Summer,
+            &WorldGenContext {
+                rules: &[],
+                villages: None,
+                spawn_column: None,
+                structures: Some(&custom_catalog),
+            },
+        );
+
+        let extra_wx = spec.anchor_x;
+        let extra_wy = terrain_height_at_seeded(extra_wx, spec.anchor_z, seed) + 1 + 1;
+        let extra_wz = spec.anchor_z;
+        let (extra_lx, extra_ly, extra_lz) = (
+            extra_wx.rem_euclid(CHUNK_SIZE as i32) as usize,
+            extra_wy.rem_euclid(CHUNK_SIZE as i32) as usize,
+            extra_wz.rem_euclid(CHUNK_SIZE as i32) as usize,
+        );
+        assert_eq!(
+            via_custom.get(extra_lx, extra_ly, extra_lz),
+            BLOCK_BRICK,
+            "the runtime catalog's extra authored cell must be emitted"
+        );
+
+        let mut diffs = Vec::new();
+        for ly in 0..CHUNK_SIZE {
+            for lz in 0..CHUNK_SIZE {
+                for lx in 0..CHUNK_SIZE {
+                    if builtin_chunk.get(lx, ly, lz) != via_custom.get(lx, ly, lz) {
+                        diffs.push((lx, ly, lz));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            diffs,
+            vec![(extra_lx, extra_ly, extra_lz)],
+            "a single authored cell must change exactly one generated cell"
+        );
     }
 
     /// Generated acceptance: real chunks in the pinned region contain at least
@@ -3050,6 +3451,7 @@ mod tests {
             // *every* generated chest, not only the isolated one below.
             let base_wy = spec.surface.div_euclid(CHUNK_SIZE as i32) * CHUNK_SIZE as i32;
             let layer_top = base_wy + CHUNK_SIZE as i32 - 1;
+            let shell = legacy_shell_cells(&spec);
             for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
                 for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
                     let fx = spec.anchor_x + dx;
@@ -3062,8 +3464,11 @@ mod tests {
                         spec.anchor_x,
                         spec.anchor_z
                     );
-                    for level in ruin_cell_bottom(dx, dz)..=ruin_cell_top(dx, dz, spec.wall_height)
+                    for &(cdx, cdz, level, _) in shell
+                        .iter()
+                        .filter(|(cdx, cdz, _, _)| *cdx == dx && *cdz == dz)
                     {
+                        debug_assert_eq!((cdx, cdz), (dx, dz));
                         let cell_wy = column_surface + level;
                         assert!(
                             (base_wy..=layer_top).contains(&cell_wy),
@@ -3131,27 +3536,20 @@ mod tests {
         });
         let spec = isolated.expect("no isolated chest-bearing ruin in the scan region");
 
-        for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-            for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
-                    continue;
-                }
-                let wx = spec.anchor_x + dx;
-                let wz = spec.anchor_z + dz;
-                // Each footprint column paints relative to its own surface, so
-                // a slope inside the footprint is part of the complete shell.
-                let column_surface = terrain_height_at_seeded(wx, wz, seed);
-                for level in ruin_cell_bottom(dx, dz)..=ruin_cell_top(dx, dz, spec.wall_height) {
-                    let wy = column_surface + level;
-                    assert_eq!(
-                        generated_block_at(wx, wy, wz, seed, Season::Summer),
-                        ruin_wall_block(dx, dz),
-                        "isolated ruin at ({}, {}) is missing shell cell ({dx}, {level}, {dz})",
-                        spec.anchor_x,
-                        spec.anchor_z
-                    );
-                }
-            }
+        for (dx, dz, level, block) in legacy_shell_cells(spec) {
+            let wx = spec.anchor_x + dx;
+            let wz = spec.anchor_z + dz;
+            // Each footprint column paints relative to its own surface, so a
+            // slope inside the footprint is part of the complete shell.
+            let column_surface = terrain_height_at_seeded(wx, wz, seed);
+            let wy = column_surface + level;
+            assert_eq!(
+                generated_block_at(wx, wy, wz, seed, Season::Summer),
+                block,
+                "isolated ruin at ({}, {}) is missing shell cell ({dx}, {level}, {dz})",
+                spec.anchor_x,
+                spec.anchor_z
+            );
         }
         let chest = ruin_loot_chest_pos(spec);
         assert_eq!(
@@ -3214,34 +3612,25 @@ mod tests {
                 continue;
             }
             checked += 1;
-            for dz in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                for dx in -RUIN_FOOTPRINT_HALF..=RUIN_FOOTPRINT_HALF {
-                    if dx.abs() != RUIN_FOOTPRINT_HALF && dz.abs() != RUIN_FOOTPRINT_HALF {
-                        continue;
-                    }
-                    let wx = spec.anchor_x + dx;
-                    let wz = spec.anchor_z + dz;
-                    let top = ruin_cell_top(dx, dz, spec.wall_height);
-                    for level in ruin_cell_bottom(dx, dz)..=top {
-                        let wy = spec.surface + level;
-                        let pos =
-                            ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
-                        let chunk = cache
-                            .entry((pos.x, pos.y, pos.z))
-                            .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
-                        let block = chunk.get(
-                            wx.rem_euclid(ch) as usize,
-                            wy.rem_euclid(ch) as usize,
-                            wz.rem_euclid(ch) as usize,
-                        );
-                        assert!(
-                            !matches!(block, BLOCK_COBBLESTONE | BLOCK_BRICK),
-                            "anchor ({}, {}) overlaps a tree but still placed {block:?} at ({wx}, {wy}, {wz})",
-                            spec.anchor_x,
-                            spec.anchor_z
-                        );
-                    }
-                }
+            for (dx, dz, level, _) in legacy_shell_cells(spec) {
+                let wx = spec.anchor_x + dx;
+                let wz = spec.anchor_z + dz;
+                let wy = spec.surface + level;
+                let pos = ChunkPos::new(wx.div_euclid(ch), wy.div_euclid(ch), wz.div_euclid(ch));
+                let chunk = cache
+                    .entry((pos.x, pos.y, pos.z))
+                    .or_insert_with(|| generate_chunk_seeded(pos, seed, Season::Summer));
+                let block = chunk.get(
+                    wx.rem_euclid(ch) as usize,
+                    wy.rem_euclid(ch) as usize,
+                    wz.rem_euclid(ch) as usize,
+                );
+                assert!(
+                    !matches!(block, BLOCK_COBBLESTONE | BLOCK_BRICK),
+                    "anchor ({}, {}) overlaps a tree but still placed {block:?} at ({wx}, {wy}, {wz})",
+                    spec.anchor_x,
+                    spec.anchor_z
+                );
             }
         }
         assert!(
@@ -4589,6 +4978,7 @@ mod tests {
             rules: &[],
             villages: Some(catalog),
             spawn_column: Some(find_spawn_column(VILLAGE_TEST_SEED)),
+            structures: None,
         }
     }
 
@@ -4822,11 +5212,13 @@ mod tests {
             rules: &rules,
             villages: None,
             spawn_column: Some(spawn),
+            structures: None,
         };
         let with_village = WorldGenContext {
             rules: &rules,
             villages: Some(&catalog),
             spawn_column: Some(spawn),
+            structures: None,
         };
 
         let mut found = false;
@@ -4906,6 +5298,7 @@ mod tests {
                                 rules: &[],
                                 villages: Some(&catalog),
                                 spawn_column: Some(spawn),
+                                structures: None,
                             },
                         );
                         for cell in &cells {
@@ -4998,6 +5391,7 @@ mod tests {
                                     rules: &[],
                                     villages: Some(&catalog),
                                     spawn_column: Some(spawn),
+                                    structures: None,
                                 },
                             );
                             for cell in &cells {

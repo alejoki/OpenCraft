@@ -16,6 +16,8 @@ use crate::world::season::Season;
 use crate::world::terrain::{generate_chunk_with_context, WorldGenContext, DEFAULT_WORLD_SEED};
 use crate::world::village::VillageCatalog;
 
+use opencraft_worldgen::structure::StructureCatalog;
+
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
 
@@ -195,11 +197,13 @@ fn gen_context<'a>(
     rules: &'a [WorldgenRule],
     villages: Option<&'a VillageCatalog>,
     spawn_column: Option<(i32, i32)>,
+    structures: Option<&'a StructureCatalog>,
 ) -> WorldGenContext<'a> {
     WorldGenContext {
         rules,
         villages,
         spawn_column,
+        structures,
     }
 }
 
@@ -1278,7 +1282,7 @@ impl WorldManager {
                     pos,
                     seed,
                     target,
-                    &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                    &gen_context(rules.as_ref(), catalog.as_deref(), spawn, None),
                 );
                 let _ = tx.send((pos, chunk));
             });
@@ -1526,7 +1530,7 @@ impl WorldManager {
                             pos,
                             seed,
                             gen_season,
-                            &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                            &gen_context(rules.as_ref(), catalog.as_deref(), spawn, None),
                         );
                         let _ = tx.send((pos, chunk));
                     });
@@ -4338,7 +4342,7 @@ mod tests {
         }
     }
 
-    /// The helper both dispatch sites share must carry all three context fields
+    /// The helper both dispatch sites share must carry all four context fields
     /// unchanged (and the empty context must be genuinely empty).
     #[test]
     fn gen_context_carries_catalog_spawn_and_rules() {
@@ -4353,18 +4357,23 @@ mod tests {
         }];
         let spawn = (12, -34);
 
-        let ctx = gen_context(&rules, Some(&catalog), Some(spawn));
+        let ctx = gen_context(&rules, Some(&catalog), Some(spawn), None);
         assert_eq!(ctx.rules.len(), 1);
         assert!(
             matches!(ctx.villages, Some(installed) if std::ptr::eq(installed, &catalog)),
             "the catalog pointer must be carried, not a copy"
         );
         assert_eq!(ctx.spawn_column, Some(spawn));
+        assert!(
+            ctx.structures.is_none(),
+            "this task wires the structure catalog only through the context field"
+        );
 
-        let empty = gen_context(&[], None, None);
+        let empty = gen_context(&[], None, None, None);
         assert!(empty.rules.is_empty());
         assert!(empty.villages.is_none());
         assert_eq!(empty.spawn_column, None);
+        assert!(empty.structures.is_none());
     }
 
     /// With the catalog installed, every plan cell this chunk owns must land in
@@ -4374,7 +4383,7 @@ mod tests {
         let catalog = checked_in_village_catalog();
         let plan = seed_14_village(&catalog);
         let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let ctx = gen_context(&[], Some(&catalog), Some(spawn));
+        let ctx = gen_context(&[], Some(&catalog), Some(spawn), None);
         let cs = CHUNK_SIZE as i32;
         let mut measured_chunks = 0usize;
         let mut measured_cells = 0usize;
@@ -4427,8 +4436,13 @@ mod tests {
         assert!(!plan_cells.is_empty());
 
         let real_spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let suppressed = gen_context(&[], Some(&catalog), Some((plan.anchor[0], plan.anchor[1])));
-        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn));
+        let suppressed = gen_context(
+            &[],
+            Some(&catalog),
+            Some((plan.anchor[0], plan.anchor[1])),
+            None,
+        );
+        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn), None);
         let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Summer);
         let rejected =
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &suppressed);
@@ -4469,7 +4483,7 @@ mod tests {
         let plan_cells = plan.cells_for_chunk(pos);
         assert!(!plan_cells.is_empty());
 
-        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn));
+        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn), None);
         let summer_chunk =
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
         for cell in &plan_cells {
@@ -4524,7 +4538,7 @@ mod tests {
     #[test]
     fn none_catalog_generation_is_byte_identical_to_the_legacy_seam() {
         let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let ctx = gen_context(&[], None, Some(spawn));
+        let ctx = gen_context(&[], None, Some(spawn), None);
         for pos in [
             ChunkPos::new(-6, 0, 3),
             ChunkPos::new(0, 0, 0),

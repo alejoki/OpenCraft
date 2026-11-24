@@ -21,6 +21,8 @@ use crate::world::chunk::{Chunk, ChunkPos, ChunkStorage};
 use crate::world::season::Season;
 use crate::world::village::VillageCatalog;
 
+use opencraft_worldgen::structure::StructureCatalog;
+
 pub use opencraft_worldgen::biome::{
     biome_at_seeded, biome_for_height, forest_noise, Biome, BEACH_BAND, MOUNTAIN_HEIGHT_THRESHOLD,
     SEA_LEVEL,
@@ -45,14 +47,16 @@ pub use opencraft_worldgen::tree::{
 ///
 /// `rules` is the pack worldgen stack (empty for vanilla worlds), `villages`
 /// is the optional accepted village catalog (empty/`None` reproduces the
-/// pre-M015 generator byte-for-byte) and `spawn_column` lets a caller that
+/// pre-M015 generator byte-for-byte), `spawn_column` lets a caller that
 /// already knows the spawn skip the bounded [`find_spawn_column`] search when
-/// the village planner needs it.
+/// the village planner needs it, and `structures` is the optional accepted
+/// structure catalog (`None` means the compile-time builtin master).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorldGenContext<'a> {
     pub rules: &'a [WorldgenRule],
     pub villages: Option<&'a VillageCatalog>,
     pub spawn_column: Option<(i32, i32)>,
+    pub structures: Option<&'a StructureCatalog>,
 }
 
 /// Maps the game calendar season onto the neutral crate season.
@@ -158,6 +162,7 @@ pub fn generate_chunk_seeded_with(
             rules,
             villages: None,
             spawn_column: None,
+            structures: None,
         },
     )
 }
@@ -185,6 +190,7 @@ pub fn generate_chunk_with_context(
         rules: rules.as_ref(),
         villages: ctx.villages,
         spawn_column: ctx.spawn_column,
+        structures: ctx.structures,
     };
     chunk_from_buffer(opencraft_worldgen::terrain::generate_chunk_with_context(
         pos,
@@ -358,6 +364,7 @@ mod tests {
                 rules: &rules,
                 villages: None,
                 spawn_column: None,
+                structures: None,
             },
         );
 
@@ -371,6 +378,7 @@ mod tests {
                 rules: &neutral,
                 villages: None,
                 spawn_column: None,
+                structures: None,
             },
         ));
         assert!(
