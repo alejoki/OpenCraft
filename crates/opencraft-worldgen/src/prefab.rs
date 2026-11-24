@@ -790,9 +790,14 @@ impl Prefab {
 // ---------------------------------------------------------------------------
 
 /// One prefab file's outcome during a sorted directory walk.
-struct PrefabFile {
-    file_name: String,
-    outcome: Result<Prefab, String>,
+///
+/// Shared with the structure family: the walk policy (sorted file names,
+/// regular files only, 1 MiB cap, duplicate declared names) is identical for
+/// `worldgen/prefabs` and `worldgen/structures`, so both families reuse
+/// [`scan_prefab_dir_in`] rather than re-implementing it.
+pub(crate) struct PrefabFile {
+    pub file_name: String,
+    pub outcome: Result<Prefab, String>,
 }
 
 /// One identity claimed by an existing `root/prefabs/*.toml` entry.
@@ -957,6 +962,25 @@ impl PrefabCatalog {
 /// This is the fail-closed half of the catalog policy: unlike
 /// [`PrefabCatalog::load_sorted`], any rejected file makes `ok` false.
 pub fn validate_worldgen_lines(root: &Path) -> (Vec<String>, bool) {
+    let (mut lines, accepted, errors) = prefab_section(root);
+    let warnings = 0usize;
+    lines.push(format!(
+        "validate-worldgen: {accepted} prefabs, {errors} errors, {warnings} warnings"
+    ));
+    (lines, errors == 0)
+}
+
+/// Render the prefab half of the `--validate-worldgen` report.
+///
+/// Returns the `ok: prefab` / `error:` lines in walk order, the accepted count
+/// and the rejected count. The caller supplies the summary line so the
+/// prefab-only report ([`validate_worldgen_lines`]) and the combined
+/// prefab-plus-structure report in [`crate::structure`] share exactly one
+/// implementation and one line ordering.
+///
+/// Fail-closed like [`validate_worldgen_lines`]: a missing or unreadable tree
+/// is valid empty content with zero lines and zero counts.
+pub(crate) fn prefab_section(root: &Path) -> (Vec<String>, usize, usize) {
     let mut lines = Vec::new();
     let mut accepted = 0usize;
     let mut errors = 0usize;
@@ -975,25 +999,36 @@ pub fn validate_worldgen_lines(root: &Path) -> (Vec<String>, bool) {
             }
         }
     }
-    let warnings = 0usize;
-    lines.push(format!(
-        "validate-worldgen: {accepted} prefabs, {errors} errors, {warnings} warnings"
-    ));
-    (lines, errors == 0)
+    (lines, accepted, errors)
 }
 
 /// Logical `worldgen/prefabs/<file>: <reason>` label used by every diagnostic.
 fn logical_file_label(file_name: &str, reason: &str) -> String {
-    format!("{WORLDGEN_DIR}/{PREFABS_SUBDIR}/{file_name}: {reason}")
+    logical_file_label_in(PREFABS_SUBDIR, file_name, reason)
+}
+
+/// Logical `<subdir>/<file>: <reason>` label below [`WORLDGEN_DIR`].
+///
+/// Diagnostics never echo the caller's spelling of `root`, so a custom root and
+/// the default tree produce the same greppable label.
+pub(crate) fn logical_file_label_in(subdir: &str, file_name: &str, reason: &str) -> String {
+    format!("{WORLDGEN_DIR}/{subdir}/{file_name}: {reason}")
 }
 
 /// Walk `root/prefabs` in raw file-name order, applying the per-file policy.
-///
-/// Sorting by `OsString` (raw bytes on Unix) removes `fs::read_dir` ordering
-/// nondeterminism, so first-wins duplicate handling and report order are
-/// stable across filesystems.
 fn scan_prefab_dir(root: &Path) -> Vec<PrefabFile> {
-    let dir = root.join(PREFABS_SUBDIR);
+    scan_prefab_dir_in(root, PREFABS_SUBDIR)
+}
+
+/// Walk `root/<subdir>` in raw file-name order, applying the per-file policy.
+///
+/// Shared by the prefab and structure families: sorting by `OsString` (raw
+/// bytes on Unix) removes `fs::read_dir` ordering nondeterminism, so first-wins
+/// duplicate handling and report order are stable across filesystems. Only
+/// regular `.toml` files are considered; a missing or unreadable directory
+/// yields an empty walk.
+pub(crate) fn scan_prefab_dir_in(root: &Path, subdir: &str) -> Vec<PrefabFile> {
+    let dir = root.join(subdir);
     let Ok(read_dir) = fs::read_dir(&dir) else {
         return Vec::new();
     };
