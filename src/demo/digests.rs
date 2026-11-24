@@ -44,6 +44,7 @@ use crate::world::persistence::{
 };
 use crate::world::season::Season;
 use crate::world::session::WorldSession;
+use crate::world::structure::StructureCatalog;
 use crate::world::terrain::{
     biome_at_seeded, find_spawn_column, generate_chunk_seeded, generate_chunk_seeded_with,
     generate_chunk_with_context, terrain_height_at_seeded, Biome, WorldGenContext,
@@ -1706,6 +1707,21 @@ pub fn village_demo_generate(
     catalog: &VillageCatalog,
     spawn: (i32, i32),
 ) -> Chunk {
+    village_demo_generate_structures(pos, seed, catalog, spawn, None)
+}
+
+/// The same seam, with an optional explicit structure catalog.
+///
+/// `None` selects the compile-time builtin master exactly like production, so
+/// the `structures` demo leg can compare builtin generation against a runtime
+/// catalog loaded from the same `worldgen/` root.
+fn village_demo_generate_structures(
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn: (i32, i32),
+    structures: Option<&StructureCatalog>,
+) -> Chunk {
     generate_chunk_with_context(
         pos,
         seed,
@@ -1714,7 +1730,7 @@ pub fn village_demo_generate(
             rules: &[],
             villages: Some(catalog),
             spawn_column: Some(spawn),
-            structures: None,
+            structures,
         },
     )
 }
@@ -1775,6 +1791,13 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
     // determinism) and the accepted counts must stay internally consistent.
     let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
     for diagnostic in &diagnostics {
+        lines.push(format!("village_demo: warning {diagnostic}"));
+    }
+
+    // The structure catalog shares the same root and its diagnostics follow
+    // the village warnings, so one launch reports every rejected file.
+    let (structure_catalog, structure_diagnostics) = StructureCatalog::load_sorted(root);
+    for diagnostic in &structure_diagnostics {
         lines.push(format!("village_demo: warning {diagnostic}"));
     }
     let (reloaded, reloaded_diagnostics) = VillageCatalog::load_sorted(root);
@@ -2144,7 +2167,46 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         ));
     }
 
-    // (k) Session leg: a real `WorldSession` on the pinned production seed must
+    // (k) Structures leg: the checked-in `worldgen/structures/` files must
+    // reproduce the compile-time builtin master over the demo window. A broken
+    // structure file is rejected by the fail-soft loader (one warning above)
+    // and the per-name builtin fallback keeps generation identical. With no
+    // `worldgen/` root the effective catalog is still the complete builtin
+    // master, so `prefabs=11 missing=0 identical=true` while villages stay at
+    // `prefabs=0` — the same fail-soft asymmetry the catalog legs describe.
+    let structures_window = match &chosen {
+        Some(plan) => village_demo_window(&plan.bounds),
+        None => vec![
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, 2, 0),
+            ChunkPos::new(0, 3, 0),
+        ],
+    };
+    let structures_identical = structures_window.iter().all(|&pos| {
+        let builtin =
+            village_demo_generate_structures(pos, VILLAGE_DEMO_SEED, &catalog, spawn, None);
+        let runtime = village_demo_generate_structures(
+            pos,
+            VILLAGE_DEMO_SEED,
+            &catalog,
+            spawn,
+            Some(&structure_catalog),
+        );
+        village_demo_chunks_equal(&builtin, &runtime)
+    });
+    let structures_missing = structure_catalog.missing_required().len();
+    lines.push(format!(
+        "village_demo: leg=structures prefabs={} missing={} fingerprint=0x{:016x} identical={structures_identical}",
+        structure_catalog.len(),
+        structures_missing,
+        structure_catalog.fingerprint(),
+    ));
+    if structures_missing != 0 || !structures_identical {
+        failed.get_or_insert("structures");
+    }
+
+    // (l) Session leg: a real `WorldSession` on the pinned production seed must
     // stream the village through `WorldManager::update_streaming` (the same
     // dispatch a playing client uses) and reproduce the plan block for block.
     // The session is never saved, so no file or directory is created.

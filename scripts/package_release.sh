@@ -9,7 +9,7 @@
 # `packs/default` pack -- then proves the staged copy headlessly from a fresh
 # temp CWD before archiving it:
 #   (a) --demo-ui         exits 0 with exactly 3 lines whose last ends ok=true
-#   (b) --demo-village    exits 0 with exactly 12 lines, last = village_demo: ok=true
+#   (b) --demo-village    exits 0 with exactly 13 lines, last = village_demo: ok=true
 #   (c) --validate-pack   exits 0 with the exact 12-entry summary line
 #
 # Player state is never staged: the shipped `packs/default` IS staged, while a
@@ -119,13 +119,13 @@ tail -n 1 "$SMOKE/demo-ui.out" | grep -Eq 'ok=true$' || {
     fail "--demo-ui last line does not end with ok=true"
 }
 
-# (b) --demo-village: 12 lines, last exactly village_demo: ok=true.
+# (b) --demo-village: 13 lines, last exactly village_demo: ok=true.
 rc="$(run_headless demo-village --demo-village)"
 [[ "$rc" == "0" ]] || {
     cat "$SMOKE/demo-village.out" >&2
     fail "--demo-village exited $rc (expected 0)"
 }
-check_lines demo-village 12
+check_lines demo-village 13
 [[ "$(tail -n 1 "$SMOKE/demo-village.out")" == "village_demo: ok=true" ]] || {
     cat "$SMOKE/demo-village.out" >&2
     fail "--demo-village last line is not 'village_demo: ok=true'"

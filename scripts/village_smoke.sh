@@ -22,14 +22,16 @@
 #     byte-identical). Failure legs pin the exit-2 usage error and the exit-1
 #     "not a directory" write error.
 #
-#   Generate: --demo-village pins the twelve-line digest (catalog fingerprint,
+#   Generate: --demo-village pins the thirteen-line digest (catalog fingerprint,
 #     site cell/anchor, 10-20 count, layout digest, order/single-chunk/empty/
-#     outside identical proofs, fit, session cells) and proves the output is
-#     byte-identical across two independent temp cwds.
+#     outside identical proofs, fit, structures builtin reproduction, session
+#     cells) and proves the output is byte-identical across two independent
+#     temp cwds.
 #
 #   Degradation: a corrupt prefab keeps --demo-village at exit 0 with two
-#     warning lines and reduced counts; a missing worldgen/ tree exits 1 with
-#     failed=site.
+#     warning lines and reduced counts, and the structures leg still reports
+#     the complete builtin catalog; a missing worldgen/ tree exits 1 with
+#     failed=site while the structures leg stays prefabs=11 identical=true.
 #
 #   Dispatch budget (opt-in): with SMOKE_PROFILE=release SMOKE_BUDGET=1 the
 #     ignored release harness `streaming_budget_villages` runs and the whole
@@ -550,6 +552,7 @@ pinned_lines "$TEMP_DIR/generate-a.log" "generate" \
     "village_demo: leg=empty_catalog identical=true" \
     "village_demo: leg=outside identical=true" \
     "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true" \
+    "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true" \
     "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true" \
     "village_demo: ok=true"
 
@@ -589,6 +592,7 @@ pinned_lines "$TEMP_DIR/generate-degraded.log" "generate-degraded" \
     "village_demo: leg=empty_catalog identical=true" \
     "village_demo: leg=outside identical=true" \
     "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true" \
+    "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true" \
     "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2850 identical=true" \
     "village_demo: ok=true"
 
@@ -613,6 +617,7 @@ pinned_lines "$TEMP_DIR/generate-absent.log" "generate-absent" \
     "village_demo: leg=empty_catalog identical=false" \
     "village_demo: leg=outside identical=false" \
     "village_demo: leg=fit foundations=false no_overlap=false no_orphan_road=false sockets_linked=false" \
+    "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true" \
     "village_demo: leg=session cell=none spawn=0,0 chunks=0 cells=0 identical=false" \
     "village_demo: ok=false failed=site"
 

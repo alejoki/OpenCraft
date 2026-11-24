@@ -8567,6 +8567,8 @@ mod tests {
                 "village_demo: leg=outside identical=true".to_string(),
                 "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true"
                     .to_string(),
+                "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true"
+                    .to_string(),
                 "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true"
                     .to_string(),
                 "village_demo: ok=true".to_string(),

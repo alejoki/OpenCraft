@@ -405,8 +405,10 @@ win over anything generation would place.
 These are the shipped headless proofs:
 
 ```bash
-# Reads only worldgen/. Prints the catalog fingerprint, a pinned plan, and
-# identical-cell proofs. It writes nothing and opens no window. Exit 0/1.
+# Reads only worldgen/. Prints the catalog fingerprint, a pinned plan,
+# identical-cell proofs, and a structures leg proving the checked-in
+# worldgen/structures/ files reproduce the compile-time builtin master. It
+# writes nothing and opens no window. Exit 0/1.
 opencraft --demo-village
 
 # Drives the real two-corner capture state machine in an isolated world.
@@ -435,8 +437,8 @@ Both run in temporary working directories with a copied `worldgen/` tree and
 leave the repository untouched. The script builds the game and pins the
 validator's clean, broken, oversize, duplicate, missing-tree and
 broken-structure cases; capture success plus idempotence and failure legs; the
-deterministic `--demo-village` digest; and the reduced-village degradation
-path.
+deterministic `--demo-village` digest (including the structures leg that
+reproduces the builtin master); and the reduced-village degradation path.
 
 The release streaming and frame budget harnesses are ignored tests, because
 they must measure the release binary on an idle desktop session:

@@ -14,7 +14,7 @@
 # run three headless seams from the extracted directory with
 # DISPLAY/WAYLAND_DISPLAY removed:
 #   --demo-ui        exit 0, exactly 3 lines, last ends ok=true
-#   --demo-village   exit 0, exactly 12 lines, last = village_demo: ok=true
+#   --demo-village   exit 0, exactly 13 lines, last = village_demo: ok=true
 #   --validate-pack  exit 0, exact 12-entry summary (fixture pack copied into
 #                    a scratch packs/ inside the temp extraction, never into
 #                    the archive)
@@ -135,7 +135,7 @@ rc="$(run_headless demo-village --demo-village)"
     cat "$LINUX_DIR/demo-village.out" >&2
     fail "linux --demo-village exited $rc (expected 0)"
 }
-check_lines demo-village 12
+check_lines demo-village 13
 [[ "$(tail -n 1 "$LINUX_DIR/demo-village.out")" == "village_demo: ok=true" ]] || {
     cat "$LINUX_DIR/demo-village.out" >&2
     fail "linux --demo-village last line is not 'village_demo: ok=true'"
