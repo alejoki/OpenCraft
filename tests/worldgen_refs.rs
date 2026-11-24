@@ -9,7 +9,8 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use opencraft::world::block::{BlockId, BUILTIN_BLOCK_COUNT};
-use opencraft::world::prefab::{validate_worldgen_lines, Prefab, PrefabCatalog};
+use opencraft::world::prefab::{Prefab, PrefabCatalog};
+use opencraft::world::structure::validate_worldgen_lines;
 
 /// The three reference prefabs that S02 village definitions and S07 docs
 /// consume. Names are the stable content API and must not be renamed here.
@@ -71,7 +72,18 @@ fn validate_worldgen_report_is_exact_for_reference_tree() {
             "ok: prefab plains_hub".to_owned(),
             "ok: prefab small_house".to_owned(),
             "ok: prefab wheat_farm".to_owned(),
-            "validate-worldgen: 3 prefabs, 0 errors, 0 warnings".to_owned(),
+            "ok: structure oak_t4_l0".to_owned(),
+            "ok: structure oak_t4_l1".to_owned(),
+            "ok: structure oak_t4_l2".to_owned(),
+            "ok: structure oak_t4_l3".to_owned(),
+            "ok: structure oak_t5_l0".to_owned(),
+            "ok: structure oak_t5_l1".to_owned(),
+            "ok: structure oak_t5_l2".to_owned(),
+            "ok: structure oak_t5_l3".to_owned(),
+            "ok: structure ruin_wall_1".to_owned(),
+            "ok: structure ruin_wall_2".to_owned(),
+            "ok: structure ruin_wall_3".to_owned(),
+            "validate-worldgen: 3 prefabs, 11 structures, 0 errors, 0 warnings".to_owned(),
         ]
     );
     assert!(ok);

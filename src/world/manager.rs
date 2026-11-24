@@ -4406,7 +4406,10 @@ mod tests {
                 .filter_map(|name| builtin.get(name).cloned())
                 .collect(),
         );
-        assert_eq!(&structures, builtin, "the clone must stay semantically equal");
+        assert_eq!(
+            &structures, builtin,
+            "the clone must stay semantically equal"
+        );
 
         let ctx = gen_context(&rules, Some(&catalog), Some(spawn), Some(&structures));
         assert_eq!(ctx.rules.len(), 1);
@@ -4436,8 +4439,7 @@ mod tests {
     /// manager field that feeds them.
     #[test]
     fn manager_carries_the_installed_structure_catalog() {
-        let mut mgr =
-            WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
+        let mut mgr = WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
         assert!(
             mgr.structure_catalog().is_none(),
             "a new manager starts on the builtin master path"

@@ -43,10 +43,22 @@ const CLEAN_LINES: [&str; 10] = [
     "capture_demo: ok=true",
 ];
 
-/// The exact `--validate-worldgen` report for a clean demo root.
-const VALIDATE_LINES: [&str; 2] = [
+/// The exact `--validate-worldgen` report for a clean demo root: the captured
+/// prefab, the eleven builtin structures, then the combined summary.
+const VALIDATE_LINES: [&str; 13] = [
     "ok: prefab capture",
-    "validate-worldgen: 1 prefabs, 0 errors, 0 warnings",
+    "ok: structure oak_t4_l0",
+    "ok: structure oak_t4_l1",
+    "ok: structure oak_t4_l2",
+    "ok: structure oak_t4_l3",
+    "ok: structure oak_t5_l0",
+    "ok: structure oak_t5_l1",
+    "ok: structure oak_t5_l2",
+    "ok: structure oak_t5_l3",
+    "ok: structure ruin_wall_1",
+    "ok: structure ruin_wall_2",
+    "ok: structure ruin_wall_3",
+    "validate-worldgen: 1 prefabs, 11 structures, 0 errors, 0 warnings",
 ];
 
 /// Run the real binary with `args` from `dir` as the process CWD, with any
@@ -474,7 +486,18 @@ fn second_run_in_the_same_directory_prefills_capture_2_and_keeps_the_tree_valid(
         vec![
             "ok: prefab capture".to_owned(),
             "ok: prefab capture_2".to_owned(),
-            "validate-worldgen: 2 prefabs, 0 errors, 0 warnings".to_owned(),
+            "ok: structure oak_t4_l0".to_owned(),
+            "ok: structure oak_t4_l1".to_owned(),
+            "ok: structure oak_t4_l2".to_owned(),
+            "ok: structure oak_t4_l3".to_owned(),
+            "ok: structure oak_t5_l0".to_owned(),
+            "ok: structure oak_t5_l1".to_owned(),
+            "ok: structure oak_t5_l2".to_owned(),
+            "ok: structure oak_t5_l3".to_owned(),
+            "ok: structure ruin_wall_1".to_owned(),
+            "ok: structure ruin_wall_2".to_owned(),
+            "ok: structure ruin_wall_3".to_owned(),
+            "validate-worldgen: 2 prefabs, 11 structures, 0 errors, 0 warnings".to_owned(),
         ],
         "{}",
         report(&validate)

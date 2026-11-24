@@ -11,8 +11,9 @@
 #     nor any other untracked file is required, so a fresh clone passes.
 #
 #   Validator matrix: --validate-worldgen pins clean, invalid-TOML, oversize,
-#     duplicate-name, and missing-tree runs whole-line, including the exit code
-#     (0/1/1/1/0) and the sorted-by-filename diagnostic order.
+#     duplicate-name, missing-tree, and broken-structure runs whole-line,
+#     including the exit code (0/1/1/1/0 plus 1 for a rejected structure file)
+#     and the sorted-by-filename diagnostic order.
 #
 #   Capture: --demo-capture pins the ten-line success digest (region, 423-byte
 #     write, roundtrip, validate, socket, ambiguous marker, catalog, captured-
@@ -216,7 +217,18 @@ pinned_lines "$TEMP_DIR/valid-clean.log" "validator-clean" \
     "ok: prefab plains_hub" \
     "ok: prefab small_house" \
     "ok: prefab wheat_farm" \
-    "validate-worldgen: 3 prefabs, 0 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 3 prefabs, 11 structures, 0 errors, 0 warnings"
 
 # --- Leg 3: validator broken TOML ----------------------------------------
 VALID_BROKEN="$TEMP_DIR/valid-broken"
@@ -235,7 +247,18 @@ pinned_lines "$TEMP_DIR/valid-broken.log" "validator-broken" \
     "ok: prefab plains_hub" \
     "error: worldgen/prefabs/small_house.toml: invalid TOML" \
     "ok: prefab wheat_farm" \
-    "validate-worldgen: 2 prefabs, 1 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 2 prefabs, 11 structures, 1 errors, 0 warnings"
 
 # --- Leg 4: validator oversize -------------------------------------------
 VALID_OVERSIZE="$TEMP_DIR/valid-oversize"
@@ -254,7 +277,18 @@ pinned_lines "$TEMP_DIR/valid-oversize.log" "validator-oversize" \
     "ok: prefab plains_hub" \
     "error: worldgen/prefabs/small_house.toml: size 33x4x5 exceeds cap 32x32x32" \
     "ok: prefab wheat_farm" \
-    "validate-worldgen: 2 prefabs, 1 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 2 prefabs, 11 structures, 1 errors, 0 warnings"
 
 # --- Leg 5: validator duplicate name -------------------------------------
 VALID_DUPLICATE="$TEMP_DIR/valid-duplicate"
@@ -276,7 +310,18 @@ pinned_lines "$TEMP_DIR/valid-duplicate.log" "validator-duplicate" \
     "ok: prefab plains_hub" \
     "error: worldgen/prefabs/small_house.toml: duplicate prefab name 'small_house'" \
     "ok: prefab wheat_farm" \
-    "validate-worldgen: 3 prefabs, 1 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 3 prefabs, 11 structures, 1 errors, 0 warnings"
 
 # --- Leg 6: validator missing tree ---------------------------------------
 MISSING_CWD="$TEMP_DIR/missing-cwd"
@@ -290,8 +335,53 @@ RC=$?
     exit 1
 }
 pinned_lines "$TEMP_DIR/valid-missing.log" "validator-missing" \
-    "validate-worldgen: 0 prefabs, 0 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 0 prefabs, 11 structures, 0 errors, 0 warnings"
 [[ ! -e "$TEMP_DIR/absent" ]] || fail "the validator created the absent tree $TEMP_DIR/absent"
+
+# --- Leg 6b: validator broken structure file ------------------------------
+# The authored structures/ tree is also the builtin master: a rejected runtime
+# file is named once, its builtin keeps the effective `ok: structure` line, and
+# the report fails closed with one error.
+VALID_STRUCTURE="$TEMP_DIR/valid-structure"
+copy_worldgen "$VALID_STRUCTURE"
+printf 'format = [\n' >>"$VALID_STRUCTURE/worldgen/structures/oak_t4_l0.toml" \
+    || fail "cannot corrupt oak_t4_l0.toml for the broken-structure leg"
+LAUNCH_DIRS+=("$VALID_STRUCTURE")
+( cd "$VALID_STRUCTURE" && "$BIN" --validate-worldgen ) >"$TEMP_DIR/valid-structure.log" 2>&1
+RC=$?
+[[ $RC -eq 1 ]] || {
+    echo "VILLAGE SMOKE FAIL: validator broken-structure exit code $RC (expected 1)"
+    cat "$TEMP_DIR/valid-structure.log"
+    exit 1
+}
+pinned_lines "$TEMP_DIR/valid-structure.log" "validator-structure" \
+    "ok: prefab plains_hub" \
+    "ok: prefab small_house" \
+    "ok: prefab wheat_farm" \
+    "error: worldgen/structures/oak_t4_l0.toml: invalid TOML" \
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 3 prefabs, 11 structures, 1 errors, 0 warnings"
 
 # --- Leg 7: capture success ----------------------------------------------
 CAPTURE_CWD="$TEMP_DIR/capture-cwd"
@@ -346,7 +436,18 @@ RC=$?
 }
 pinned_lines "$TEMP_DIR/capture-validate-1.log" "capture-validate-1" \
     "ok: prefab capture" \
-    "validate-worldgen: 1 prefabs, 0 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 1 prefabs, 11 structures, 0 errors, 0 warnings"
 
 # --- Leg 8: capture idempotence ------------------------------------------
 cp "$CAPTURE_TOML" "$TEMP_DIR/capture-first.toml" || fail "cannot save the first capture.toml"
@@ -381,7 +482,18 @@ RC=$?
 pinned_lines "$TEMP_DIR/capture-validate-2.log" "capture-validate-2" \
     "ok: prefab capture" \
     "ok: prefab capture_2" \
-    "validate-worldgen: 2 prefabs, 0 errors, 0 warnings"
+    "ok: structure oak_t4_l0" \
+    "ok: structure oak_t4_l1" \
+    "ok: structure oak_t4_l2" \
+    "ok: structure oak_t4_l3" \
+    "ok: structure oak_t5_l0" \
+    "ok: structure oak_t5_l1" \
+    "ok: structure oak_t5_l2" \
+    "ok: structure oak_t5_l3" \
+    "ok: structure ruin_wall_1" \
+    "ok: structure ruin_wall_2" \
+    "ok: structure ruin_wall_3" \
+    "validate-worldgen: 2 prefabs, 11 structures, 0 errors, 0 warnings"
 
 # --- Leg 9: capture failure legs -----------------------------------------
 ( cd "$CAPTURE_CWD" && "$BIN" --demo-capture ) >"$TEMP_DIR/capture-no-value.log" 2>&1
@@ -601,7 +713,7 @@ done
 
 # --- Leg 14: PASS + one evidence line per pinned digest group -------------
 echo "VILLAGE SMOKE PASS [profile=$PROFILE]"
-echo "VILLAGE SMOKE EVIDENCE: validator matrix clean=0/broken=1/oversize=1/duplicate=1/missing=0 pinned whole-line"
+echo "VILLAGE SMOKE EVIDENCE: validator matrix clean=0/broken=1/oversize=1/duplicate=1/missing=0/structure=1 pinned whole-line"
 echo "VILLAGE SMOKE EVIDENCE: capture success bytes=423 sockets=1 markers=0 ambiguous-write=false catalog+village+road ok"
 echo "VILLAGE SMOKE EVIDENCE: capture idempotence capture.toml byte-identical second path=prefabs/capture_2.toml bytes=425"
 echo "VILLAGE SMOKE EVIDENCE: generate digest=0x79663be18a213bab session chunks=6 cells=2962 deterministic across two temp cwds"

@@ -52,8 +52,8 @@ use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
 };
-use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 use crate::world::structure::StructureCatalog;
+use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 use crate::world::village::VillageCatalog;
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is

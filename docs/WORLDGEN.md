@@ -9,11 +9,21 @@ runs the shipped binary and reads or writes the paths named here.
 
 ## 1. What authored worldgen is
 
-Authored worldgen is repository-tracked content under two directories:
+Authored worldgen is repository-tracked content under three directories:
 
-- `worldgen/prefabs/<name>.toml` — one structure prefab.
+- `worldgen/prefabs/<name>.toml` — one captureable prefab for a village.
 - `worldgen/villages/<name>.toml` — one village definition that names a hub
   prefab, biome allow-list, sizing knobs, and prefab pools.
+- `worldgen/structures/<name>.toml` — one generated structure prefab (the
+  eight oak variants and three surface-ruin wall heights), optionally carrying
+  typed `[[markers]]` such as a ruin loot chest.
+
+The `worldgen/structures/` files are both the authoring surface and the
+**compile-time builtin master**. Generation is identical with no filesystem:
+the builtins are compiled in. An author's on-disk edit overlays the builtin of
+the same name at world creation, and a rejected file produces exactly one
+`worldgen/structures/<file>: <reason>` diagnostic while the builtin keeps
+generating.
 
 The `worldgen/` tree sits beside `config/` at the repository root. It is not a
 texture pack or a data-only content pack, it is not installed through the pack
@@ -174,6 +184,22 @@ Reading the example:
   it may be negative: this one is grid `[2, 1, 0]`, which is the north face at
   road level. `direction` is `north` (`-Z`), `south` (`+Z`), `east` (`+X`), or
   `west` (`-X`). Socket positions are unique and are sorted when serialized.
+- `[[markers]]` is optional and additive; a file without it serializes
+  byte-identically to the pre-marker format. Each entry attaches typed meaning
+  to a cell that also appears in the block grid:
+
+  ```toml
+  [[markers]]
+  kind = "loot_chest"
+  table = "ruin"
+  position = [0, 0, 0]
+  ```
+
+  `position` is origin-relative like a socket. `kind` is `loot_chest` and
+  `table` is `ruin` today; any other value is rejected with a stable reason.
+  The marker is metadata only — it never replaces the addressed block or
+  changes generation placement, which stays in code. Markers are sorted by
+  the same `(y, z, x)` key as sockets when serialized.
 - Every grid cell must be present, including air. A wrong layer count, row
   count, or row length is rejected with the offending layer or row.
 
@@ -194,28 +220,52 @@ The optional directory defaults to `worldgen`. The command is release-facing
 and windowless: it does not start a world, window, GPU, audio engine, settings
 file, or save.
 
-Output is deterministic and filename-ordered:
+Output is deterministic and filename-ordered, and covers both content
+families (the prefab section first, then the structure section):
 
 ```text
 ok: prefab plains_hub
 ok: prefab small_house
 ok: prefab wheat_farm
-validate-worldgen: 3 prefabs, 0 errors, 0 warnings
+ok: structure oak_t4_l0
+ok: structure oak_t4_l1
+ok: structure oak_t4_l2
+ok: structure oak_t4_l3
+ok: structure oak_t5_l0
+ok: structure oak_t5_l1
+ok: structure oak_t5_l2
+ok: structure oak_t5_l3
+ok: structure ruin_wall_1
+ok: structure ruin_wall_2
+ok: structure ruin_wall_3
+validate-worldgen: 3 prefabs, 11 structures, 0 errors, 0 warnings
 ```
 
 - One `ok:` line per accepted file, or one `error:` line per rejected file.
+- This is the combined prefab + structure report: a rejected
+  `worldgen/structures/<file>` contributes exactly one
+  `error: worldgen/structures/<file>: <reason>` line, while that name's
+  builtin keeps its effective `ok: structure <name>` line. A wrong file stem
+  is named for the stem mismatch. A missing required builtin name is reported
+  as `error: worldgen/structures: missing required structure prefab '<name>'`.
 - The summary line is always
-  `validate-worldgen: N prefabs, E errors, W warnings`. The warning count is
-  currently always 0 and is reserved for future passes.
-- Exit code 0 means no errors. Exit code 1 means at least one file was rejected.
-- A missing or unreadable tree is valid empty content: the zero summary and
-  exit 0.
-- Only `.toml` regular files directly under `<root>/prefabs/` are read.
-  Non-`.toml` files, directories, and nested directories are ignored.
+  `validate-worldgen: N prefabs, S structures, E errors, W warnings`. `S`
+  counts the effective catalog names, which includes every builtin, so a
+  prefabs-only or absent root still prints `11 structures`. `W` is currently
+  always 0 and is reserved for future passes.
+- Exit code 0 means no errors. Exit code 1 means at least one file was
+  rejected or a required structure name is missing.
+- A missing or unreadable prefab tree is valid empty content; because the
+  structure master is always complete, a missing root still prints the eleven
+  structure lines and exits 0.
+- Only `.toml` regular files directly under `<root>/prefabs/` and
+  `<root>/structures/` are read. Non-`.toml` files, directories, and nested
+  directories are ignored.
 - File names, not header names, determine order, so a duplicate header name
   keeps the sorted-first file and rejects the later one.
-- Diagnostics always use the logical `worldgen/prefabs/<file>` label, however
-  the root was spelled on the command line.
+- Diagnostics always use the logical `worldgen/prefabs/<file>` or
+  `worldgen/structures/<file>` label, however the root was spelled on the
+  command line.
 
 The stable per-file reasons include `invalid TOML`,
 `size 33x4x5 exceeds cap 32x32x32`,
@@ -225,11 +275,17 @@ The stable per-file reasons include `invalid TOML`,
 `socket position [x, y, z] is outside the prefab`,
 `socket direction 'up' is unknown`,
 `duplicate socket at [x, y, z]`, `layer 1 has 3 rows, expected 4`, and
-`row 1/2 has length 4, expected 5`.
+`row 1/2 has length 4, expected 5`. The structure family adds
+`file name does not match prefab name '<name>'`,
+`marker position [x, y, z] is outside the prefab`,
+`marker kind '<kind>' is unknown`, `marker table '<table>' is unknown`,
+`duplicate marker at [x, y, z]`, and the oak/ruin family invariants (oak
+name/size/origin/layout, ruin `size.y == wall_height + 1`,
+`origin == [2, 0, 2]`, and the forbidden generic loot-chest block).
 
-Each prefab file is capped at 1 MiB. A larger file is rejected whole.
-`--validate-worldgen` audits prefabs; a village definition is checked when the
-catalog loads (see section 6).
+Each prefab or structure file is capped at 1 MiB. A larger file is rejected
+whole. `--validate-worldgen` audits prefabs and structures; a village
+definition is checked when the catalog loads (see section 6).
 
 ## 6. Village definitions
 
@@ -377,9 +433,10 @@ SMOKE_PROFILE=release bash scripts/village_smoke.sh
 
 Both run in temporary working directories with a copied `worldgen/` tree and
 leave the repository untouched. The script builds the game and pins the
-validator's clean, broken, oversize, duplicate and missing-tree cases; capture
-success plus idempotence and failure legs; the deterministic `--demo-village`
-digest; and the reduced-village degradation path.
+validator's clean, broken, oversize, duplicate, missing-tree and
+broken-structure cases; capture success plus idempotence and failure legs; the
+deterministic `--demo-village` digest; and the reduced-village degradation
+path.
 
 The release streaming and frame budget harnesses are ignored tests, because
 they must measure the release binary on an idle desktop session:
@@ -445,6 +502,10 @@ The reference content is:
   chest.
 - `worldgen/prefabs/wheat_farm.toml` — 7x2x7 field with one north socket.
 - `worldgen/villages/plains.toml` — the plains/forest definition above.
+- `worldgen/structures/oak_t4_l0.toml` … `oak_t5_l3.toml` — the eight oak
+  variants selected by `(trunk_height, layout)`.
+- `worldgen/structures/ruin_wall_1.toml` … `ruin_wall_3.toml` — the three
+  surface-ruin wall heights, each with a `loot_chest`/`ruin` marker.
 
 ### Degradation contract
 
@@ -466,5 +527,8 @@ session alive, writes nothing, and shows the reason on the prompt line.
 | `duplicate prefab name '<name>'` | Two different files under `worldgen/prefabs/` declare the same `name`. | Rename one file or change its header `name`; the sorted-first file wins and the later one is rejected. |
 | `prefab '<name>' socket <n> is not at grid y=1` | A village pool names a prefab whose socket is above or below road level. | Capture the prefab with the marker at the road-level opening, or edit the socket so `origin[1] + position[1] == 1`. |
 | `pool '<key>' names unknown prefab '<name>'` | A village pool names a prefab that is missing or failed validation, so it is not in the catalog. | Fix the spelling or add the prefab, then run `opencraft --validate-worldgen` and `opencraft --demo-village` and confirm `diagnostics=0`. |
-| `worldgen/prefabs/<file>: file is larger than 1 MiB` (or `worldgen/villages/<file>: ...`) | A prefab or village file exceeds the 1 MiB per-file cap. | Trim the content or split the structure; oversized files are rejected whole. |
+| `worldgen/prefabs/<file>: file is larger than 1 MiB` (or `worldgen/villages/<file>: ...`, `worldgen/structures/<file>: ...`) | A prefab, village, or structure file exceeds the 1 MiB per-file cap. | Trim the content or split the structure; oversized files are rejected whole. |
+| `worldgen/structures/<file>: file name does not match prefab name '<name>'` | The structure file stem and its declared `name` disagree. | Rename the file to `<name>.toml` or fix the header; the builtin of the declared name keeps generating in the meantime. |
+| `worldgen/structures/<file>: <family reason>` | A structure file parses but violates an oak/ruin invariant (size, origin, layout, marker, or the generic loot-chest rule). | Fix the file and rerun `opencraft --validate-worldgen`; the builtin keeps generating until the file is accepted. |
+| `worldgen/structures: missing required structure prefab '<name>'` | The effective structure catalog lacks one of the eleven required oak/ruin names. | Keep the builtin master complete; do not delete a `worldgen/structures/` file without replacing its name. |
 | `worldgen/villages/<file>: invalid TOML` | A village definition has a syntax or schema error; other files still load. | Fix the file and rerun `opencraft --demo-village`; the warning names the logical path and the stable reason. |

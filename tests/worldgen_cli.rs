@@ -22,13 +22,53 @@ const BIN: &str = env!("CARGO_BIN_EXE_opencraft");
 /// The checkout root containing the checked-in `worldgen/` tree.
 const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
-/// The exact clean report for the checked-in reference tree.
-const CLEAN_LINES: [&str; 4] = [
+/// The exact clean report for the checked-in reference tree: the prefab
+/// section, the eleven effective builtin structure names, then the summary.
+const CLEAN_LINES: [&str; 15] = [
     "ok: prefab plains_hub",
     "ok: prefab small_house",
     "ok: prefab wheat_farm",
-    "validate-worldgen: 3 prefabs, 0 errors, 0 warnings",
+    "ok: structure oak_t4_l0",
+    "ok: structure oak_t4_l1",
+    "ok: structure oak_t4_l2",
+    "ok: structure oak_t4_l3",
+    "ok: structure oak_t5_l0",
+    "ok: structure oak_t5_l1",
+    "ok: structure oak_t5_l2",
+    "ok: structure oak_t5_l3",
+    "ok: structure ruin_wall_1",
+    "ok: structure ruin_wall_2",
+    "ok: structure ruin_wall_3",
+    "validate-worldgen: 3 prefabs, 11 structures, 0 errors, 0 warnings",
 ];
+
+/// The eleven structure lines in ascending name order, shared by the
+/// prefab-error legs whose structure section is always the builtin master.
+const STRUCTURE_LINES: [&str; 11] = [
+    "ok: structure oak_t4_l0",
+    "ok: structure oak_t4_l1",
+    "ok: structure oak_t4_l2",
+    "ok: structure oak_t4_l3",
+    "ok: structure oak_t5_l0",
+    "ok: structure oak_t5_l1",
+    "ok: structure oak_t5_l2",
+    "ok: structure oak_t5_l3",
+    "ok: structure ruin_wall_1",
+    "ok: structure ruin_wall_2",
+    "ok: structure ruin_wall_3",
+];
+
+/// Build the expected report for a prefab section plus the builtin structure
+/// section. The structure catalog always contains the eleven builtins, even
+/// when the prefab half is broken or missing.
+fn expected_report(prefab_lines: &[&str], prefabs: usize, errors: usize) -> Vec<String> {
+    let mut lines: Vec<String> = prefab_lines.iter().map(|line| (*line).to_owned()).collect();
+    lines.extend(STRUCTURE_LINES.iter().map(|line| (*line).to_owned()));
+    lines.push(format!(
+        "validate-worldgen: {prefabs} prefabs, 11 structures, {errors} errors, 0 warnings"
+    ));
+    lines
+}
 
 /// Run the real binary with `args` from `dir` as the process CWD, with any
 /// graphical environment removed so a regression that reaches startup fails
@@ -200,12 +240,15 @@ fn broken_toml_reports_one_error_and_exits_one() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "ok: prefab plains_hub",
-            "error: worldgen/prefabs/small_house.toml: invalid TOML",
-            "ok: prefab wheat_farm",
-            "validate-worldgen: 2 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "ok: prefab plains_hub",
+                "error: worldgen/prefabs/small_house.toml: invalid TOML",
+                "ok: prefab wheat_farm",
+            ],
+            2,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -230,12 +273,15 @@ fn oversize_axis_reports_the_cap_and_exits_one() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "ok: prefab plains_hub",
-            "error: worldgen/prefabs/small_house.toml: size 33x4x5 exceeds cap 32x32x32",
-            "ok: prefab wheat_farm",
-            "validate-worldgen: 2 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "ok: prefab plains_hub",
+                "error: worldgen/prefabs/small_house.toml: size 33x4x5 exceeds cap 32x32x32",
+                "ok: prefab wheat_farm",
+            ],
+            2,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -259,13 +305,16 @@ fn oversize_file_reports_the_byte_cap_and_exits_one() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "error: worldgen/prefabs/huge.toml: file is larger than 1 MiB",
-            "ok: prefab plains_hub",
-            "ok: prefab small_house",
-            "ok: prefab wheat_farm",
-            "validate-worldgen: 3 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "error: worldgen/prefabs/huge.toml: file is larger than 1 MiB",
+                "ok: prefab plains_hub",
+                "ok: prefab small_house",
+                "ok: prefab wheat_farm",
+            ],
+            3,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -289,12 +338,15 @@ fn out_of_range_socket_reports_the_pinned_reason() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "ok: prefab plains_hub",
-            "error: worldgen/prefabs/small_house.toml: socket position [99, 1, -2] is outside the prefab",
-            "ok: prefab wheat_farm",
-            "validate-worldgen: 2 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "ok: prefab plains_hub",
+                "error: worldgen/prefabs/small_house.toml: socket position [99, 1, -2] is outside the prefab",
+                "ok: prefab wheat_farm",
+            ],
+            2,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -320,12 +372,15 @@ fn unknown_palette_character_reports_the_pinned_reason() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "error: worldgen/prefabs/plains_hub.toml: palette character '$' is not defined",
-            "ok: prefab small_house",
-            "ok: prefab wheat_farm",
-            "validate-worldgen: 2 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "error: worldgen/prefabs/plains_hub.toml: palette character '$' is not defined",
+                "ok: prefab small_house",
+                "ok: prefab wheat_farm",
+            ],
+            2,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -349,13 +404,16 @@ fn duplicate_name_rejects_the_later_sorted_file() {
     );
     assert_eq!(
         stdout_lines(&output),
-        vec![
-            "ok: prefab plains_hub",
-            "ok: prefab small_house",
-            "ok: prefab wheat_farm",
-            "error: worldgen/prefabs/zzz_duplicate.toml: duplicate prefab name 'small_house'",
-            "validate-worldgen: 3 prefabs, 1 errors, 0 warnings",
-        ],
+        expected_report(
+            &[
+                "ok: prefab plains_hub",
+                "ok: prefab small_house",
+                "ok: prefab wheat_farm",
+                "error: worldgen/prefabs/zzz_duplicate.toml: duplicate prefab name 'small_house'",
+            ],
+            3,
+            1,
+        ),
         "{}",
         report(&output)
     );
@@ -370,7 +428,7 @@ fn missing_tree_is_valid_empty_content() {
     assert_eq!(output.status.code(), Some(0), "{}", report(&output));
     assert_eq!(
         stdout_lines(&output),
-        vec!["validate-worldgen: 0 prefabs, 0 errors, 0 warnings"],
+        expected_report(&[], 0, 0),
         "{}",
         report(&output)
     );

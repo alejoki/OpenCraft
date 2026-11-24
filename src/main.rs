@@ -203,13 +203,13 @@ use opencraft::world::season::{season_of, weather_of_with, Weather};
 use opencraft::world::session::{BowFireError, ChestCommandError};
 #[cfg(test)]
 use opencraft::world::spawning::{SpawnReport, MAX_MOBS_TOTAL};
+use opencraft::world::structure::StructureCatalog;
 #[cfg(test)]
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 #[cfg(test)]
 use opencraft::world::terrain::{biome_at_seeded, generate_chunk_seeded_with, Biome};
 #[cfg(test)]
 use opencraft::world::terrain::{ruin_loot_chest_at, SEA_LEVEL};
-use opencraft::world::structure::StructureCatalog;
 use opencraft::world::village::VillageCatalog;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -7312,13 +7312,14 @@ fn main() {
     }
 
     // `--validate-worldgen [dir]` is a headless, pre-startup short-circuit:
-    // it walks the optional worldgen root (default `worldgen`), prints one
-    // stable per-prefab line plus a summary, and exits 0/1 without a session,
-    // event loop, window, GPU, save, settings file or pack stack. It is a
-    // release-facing launch switch (D245): unlike `--check-config` and
-    // `--creator-trace` it is deliberately not release-gated.
+    // it walks the optional worldgen root (default `worldgen`), prints stable
+    // per-prefab and per-structure lines plus one summary, and exits 0/1
+    // without a session, event loop, window, GPU, save, settings file or pack
+    // stack. It is a release-facing launch switch (D245): unlike
+    // `--check-config` and `--creator-trace` it is deliberately not
+    // release-gated.
     if let Some(root) = cli.validate_worldgen.as_deref() {
-        let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(root);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -8129,6 +8130,64 @@ mod tests {
         assert!(
             validate_at < body.find("cli.demo_ui").unwrap_or(usize::MAX),
             "validate-worldgen must precede the demo-ui branch"
+        );
+    }
+
+    #[test]
+    fn combined_validator_names_broken_structure_files_and_falls_back_to_builtin() {
+        // Measured from the real combined report: a rejected runtime structure
+        // file contributes exactly one logical-path diagnostic, the builtin of
+        // that name keeps its `ok: structure` line, and the summary counts the
+        // error. A wrong stem is named for the stem mismatch, not for TOML.
+        const STRUCTURE_LINES: [&str; 11] = [
+            "ok: structure oak_t4_l0",
+            "ok: structure oak_t4_l1",
+            "ok: structure oak_t4_l2",
+            "ok: structure oak_t4_l3",
+            "ok: structure oak_t5_l0",
+            "ok: structure oak_t5_l1",
+            "ok: structure oak_t5_l2",
+            "ok: structure oak_t5_l3",
+            "ok: structure ruin_wall_1",
+            "ok: structure ruin_wall_2",
+            "ok: structure ruin_wall_3",
+        ];
+        fn expected(diagnostic: &str) -> Vec<String> {
+            let mut lines = vec![diagnostic.to_owned()];
+            lines.extend(STRUCTURE_LINES.iter().map(|line| (*line).to_owned()));
+            lines.push(
+                "validate-worldgen: 0 prefabs, 11 structures, 1 errors, 0 warnings".to_owned(),
+            );
+            lines
+        }
+
+        let broken = tempfile::tempdir().expect("broken tempdir");
+        std::fs::create_dir_all(broken.path().join("structures")).expect("create structures");
+        std::fs::write(
+            broken.path().join("structures/oak_t4_l0.toml"),
+            "format = [\n",
+        )
+        .expect("write broken structure");
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(broken.path());
+        assert!(!ok, "a rejected structure file must fail closed: {lines:?}");
+        assert_eq!(
+            lines,
+            expected("error: worldgen/structures/oak_t4_l0.toml: invalid TOML")
+        );
+
+        let wrong_stem = tempfile::tempdir().expect("wrong-stem tempdir");
+        std::fs::create_dir_all(wrong_stem.path().join("structures")).expect("create structures");
+        let oak = include_str!("../worldgen/structures/oak_t4_l0.toml")
+            .replace("name = \"oak_t4_l0\"", "name = \"oak_mystery\"");
+        std::fs::write(wrong_stem.path().join("structures/wrong_stem.toml"), oak)
+            .expect("write wrong-stem structure");
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(wrong_stem.path());
+        assert!(!ok, "a wrong-stem file must fail closed: {lines:?}");
+        assert_eq!(
+            lines,
+            expected(
+                "error: worldgen/structures/wrong_stem.toml: file name does not match prefab name 'oak_mystery'"
+            )
         );
     }
 
@@ -27615,7 +27674,10 @@ stack = 64
             .as_ref()
             .expect("the checked-in structures tree is opt-in content");
         assert_eq!(structures.len(), 11, "eight oaks plus three ruins");
-        assert_eq!(structures.ruin(2).map(|prefab| prefab.name.as_str()), Some("ruin_wall_2"));
+        assert_eq!(
+            structures.ruin(2).map(|prefab| prefab.name.as_str()),
+            Some("ruin_wall_2")
+        );
         assert_eq!(content.worldgen_root.as_deref(), Some(root));
         assert!(
             !content
@@ -27631,8 +27693,7 @@ stack = 64
     fn worldgen_warnings_split_the_file_from_the_reason_for_both_families() {
         let warnings = worldgen_warnings(&[
             "worldgen/villages/plains.toml: could not read file: boom".to_string(),
-            "worldgen/structures/ruin_wall_1.toml: ruin prefab size must be [5, 2, 5]"
-                .to_string(),
+            "worldgen/structures/ruin_wall_1.toml: ruin prefab size must be [5, 2, 5]".to_string(),
             "unlabelled diagnostic".to_string(),
         ]);
 
@@ -27641,8 +27702,7 @@ stack = 64
         assert_eq!(warnings[0].reason, "could not read file: boom");
         assert_eq!(warnings[1].field, "worldgen/structures/ruin_wall_1.toml");
         assert_eq!(
-            warnings[1].reason,
-            "ruin prefab size must be [5, 2, 5]",
+            warnings[1].reason, "ruin prefab size must be [5, 2, 5]",
             "the same split serves structure labels"
         );
         assert_eq!(warnings[2].field, "worldgen");
@@ -27686,7 +27746,10 @@ stack = 64
             "the startup session must hold the launch catalog"
         );
         assert!(
-            app.session.world.structure_catalog().is_some_and(|catalog| catalog.len() == 11),
+            app.session
+                .world
+                .structure_catalog()
+                .is_some_and(|catalog| catalog.len() == 11),
             "the startup session must hold the runtime structure catalog"
         );
         assert!(
@@ -27749,7 +27812,11 @@ stack = 64
         // builtin master, no diagnostics.
         let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
         assert!(villages.is_empty());
-        assert_eq!(structures.len(), 11, "the builtin master is always complete");
+        assert_eq!(
+            structures.len(),
+            11,
+            "the builtin master is always complete"
+        );
         assert!(diagnostics.is_empty(), "missing tree: {diagnostics:?}");
 
         // One broken definition per family appears on disk: the next call sees
