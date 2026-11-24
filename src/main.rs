@@ -55,7 +55,8 @@ use opencraft::demo::content::{content_demo_step, ContentDemo, CONTENT_DEMO_DEAD
 use opencraft::demo::digests::crafting_demo_grid;
 use opencraft::demo::digests::{
     capture_demo_lines, crafting_demo_lines, demo_restart_lines, demo_save_v10_lines,
-    palette_demo_lines, presentation_demo_lines, village_demo_lines, worldgen_demo_lines,
+    external_pack_demo_lines, palette_demo_lines, presentation_demo_lines, village_demo_lines,
+    worldgen_demo_lines,
 };
 #[cfg(test)]
 use opencraft::demo::survival::SurvivalStage;
@@ -7252,6 +7253,26 @@ impl ApplicationHandler for GameApp {
     }
 }
 
+/// Pre-flight guard for the `--demo-external-pack <dir>` launch switch.
+///
+/// Returns `Ok(None)` for every other launch, the directory when the demo is
+/// requested, and a user-facing error line when the request is malformed. The
+/// rule is deliberately strict: the demo is a one-shot headless proof, so it
+/// refuses a world intent (`--new`) and a missing directory instead of
+/// silently opening a window or falling through to a normal launch.
+fn external_pack_demo_request(cli: &CliConfig) -> Result<Option<&Path>, &'static str> {
+    let Some(dir) = cli.demo_external_pack.as_deref() else {
+        return Ok(None);
+    };
+    if cli.force_new_world {
+        return Err("--demo-external-pack cannot be combined with --new");
+    }
+    if dir.as_os_str().is_empty() {
+        return Err("--demo-external-pack requires a pack directory");
+    }
+    Ok(Some(dir))
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -7330,6 +7351,42 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+
+    // `--demo-external-pack <dir>` is the headless external v3 pack proof: it
+    // loads a pack directory installed outside `packs/` through the production
+    // loader and registry builder, then proves six faces, cross/crop/blend
+    // meshing, a built-in icon override, and a v10 save/reload before any
+    // settings, window, GPU, audio engine, event loop or world startup. It runs
+    // after the validate branches (so those keep priority) and rejects a
+    // combined `--new` or a missing directory with exit 2.
+    match external_pack_demo_request(&cli) {
+        Err(message) => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: {message}");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        Ok(Some(dir)) => {
+            let fixture = if cli.save_path != Path::new(DEFAULT_SAVE_PATH) {
+                Some(cli.save_path.as_path())
+            } else {
+                None
+            };
+            let (lines, ok) = external_pack_demo_lines(dir, fixture);
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            for line in lines {
+                let _ = writeln!(stdout, "{line}");
+            }
+            let _ = stdout.flush();
+            if !ok {
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
     }
 
     // `--demo-capture <dir>` is the headless capture -> validate leg: it builds
@@ -8617,6 +8674,149 @@ mod tests {
         assert!(
             digest_at < startup_at,
             "capture_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_external_pack_request_rejects_new_and_missing_directory() {
+        let demo =
+            CliConfig::parse_args(["--demo-external-pack", "tests/fixtures/packs/external-v3"]);
+        assert_eq!(
+            demo.demo_external_pack.as_deref(),
+            Some(Path::new("tests/fixtures/packs/external-v3"))
+        );
+        assert!(
+            !cli_has_world_intent(&demo),
+            "the headless pack proof is a launch switch, never a world intent"
+        );
+        assert_eq!(
+            external_pack_demo_request(&demo),
+            Ok(Some(Path::new("tests/fixtures/packs/external-v3")))
+        );
+
+        // A bare switch (or one followed by another switch) fails closed.
+        let empty = CliConfig::parse_args(["--demo-external-pack"]);
+        assert_eq!(empty.demo_external_pack, Some(PathBuf::new()));
+        assert_eq!(
+            external_pack_demo_request(&empty),
+            Err("--demo-external-pack requires a pack directory")
+        );
+
+        // The proof is one-shot: combining it with `--new` is rejected.
+        let with_new = CliConfig::parse_args([
+            "--demo-external-pack",
+            "tests/fixtures/packs/external-v3",
+            "--new",
+        ]);
+        assert!(with_new.force_new_world);
+        assert_eq!(
+            external_pack_demo_request(&with_new),
+            Err("--demo-external-pack cannot be combined with --new")
+        );
+    }
+
+    #[test]
+    fn main_demo_external_pack_short_circuit_precedes_world_startup() {
+        // The external pack proof must follow the validate branches and run
+        // before any startup content/session or settings read: no window, GPU,
+        // audio engine, event loop, pack stack or settings write is allowed.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let validate_worldgen_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_at = body
+            .find("external_pack_demo_request(")
+            .expect("fn main must consume cli.demo_external_pack through the guard");
+        let digest_at = body
+            .find("external_pack_demo_lines(")
+            .expect("fn main must call external_pack_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_pack_at < demo_at,
+            "the external pack demo must follow the validate-pack branch"
+        );
+        assert!(
+            validate_worldgen_at < demo_at,
+            "the external pack demo must follow the validate-worldgen branch"
+        );
+        assert!(
+            demo_at < startup_at,
+            "cli.demo_external_pack must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "external_pack_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn external_pack_demo_pins_the_external_v3_fixture_legs() {
+        fn copy_tree(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).expect("create fixture copy directory");
+            for entry in std::fs::read_dir(src).expect("read fixture directory") {
+                let entry = entry.expect("read fixture entry");
+                let to = dst.join(entry.file_name());
+                if entry.file_type().expect("fixture entry type").is_dir() {
+                    copy_tree(&entry.path(), &to);
+                } else {
+                    std::fs::copy(entry.path(), &to).expect("copy fixture file");
+                }
+            }
+        }
+
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs/external-v3");
+        assert!(
+            source.join("pack.toml").is_file(),
+            "the doc-authored fixture must be checked in at tests/fixtures/packs/external-v3"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("external-v3");
+        copy_tree(&source, &pack_dir);
+        let fixture = dir.path().join("external-pack-demo.mcvx");
+
+        let (lines, ok) = external_pack_demo_lines(&pack_dir, Some(&fixture));
+        assert!(
+            ok,
+            "the external v3 fixture must pass every leg: {lines:#?}"
+        );
+
+        // Deterministic legs measured from a real run against the checked-in
+        // fixture. The save path is the only machine-dependent token and is
+        // asserted by shape.
+        let expected = vec![
+            "external_pack_demo: leg=stack pack=external-v3 name=External Stoneworks entries=11 errors=0".to_string(),
+            "external_pack_demo: leg=sixface block=stone resolved=6 distinct=6".to_string(),
+            "external_pack_demo: leg=model name=external:reed model=cross alpha=cutout".to_string(),
+            "external_pack_demo: leg=crop name=external:wheat model=crop alpha=cutout stages=4"
+                .to_string(),
+            "external_pack_demo: leg=blend name=external:frosted_glass model=cube alpha=blend sorted=true"
+                .to_string(),
+            "external_pack_demo: leg=icon name=apple builtin=true match=true".to_string(),
+        ];
+        assert_eq!(&lines[..expected.len()], expected.as_slice());
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("external_pack_demo: leg=save path=")
+                    && line.ends_with(" entries=3 ok=true")
+            ),
+            "the save leg must name the fixture path and three edits: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("external_pack_demo: ok=true")
+        );
+        assert!(
+            fixture.is_file(),
+            "the explicit --save fixture must be written"
         );
     }
 

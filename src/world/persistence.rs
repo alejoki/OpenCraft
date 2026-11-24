@@ -350,6 +350,17 @@ pub struct CliConfig {
     /// stores an empty path so `main` can fail closed with a readable error
     /// instead of launching the game.
     pub demo_capture: Option<PathBuf>,
+    /// Pack directory requested by `--demo-external-pack <dir>` (M019/S05-T02).
+    /// A headless, pre-startup launch switch: `main` loads the directory
+    /// through the production pack loader and registry builder, exercises the
+    /// meshing and save/reload seams, and exits before any settings write,
+    /// window, GPU, audio engine, event loop or world startup. The argument is
+    /// a directory path (not a pack name under `packs/`), because the point is
+    /// to prove a pack installed from outside the repository still drives the
+    /// game. Never a world intent (it never affects `cli_has_world_intent`) and
+    /// never persisted. A missing value (or a following switch) stores an
+    /// empty path so `main` can fail closed with exit 2.
+    pub demo_external_pack: Option<PathBuf>,
     /// Whether the headless config audit (`--check-config`, M014/S01-T06) is
     /// requested. A bare launch switch: it takes no value, is deliberately NOT
     /// a world intent (so it never affects `cli_has_world_intent`), and is
@@ -404,6 +415,7 @@ impl CliConfig {
         let mut validate_pack = None;
         let mut validate_worldgen = None;
         let mut demo_capture = None;
+        let mut demo_external_pack = None;
         let mut check_config = false;
         let mut creator_trace = false;
         let mut mode = GameMode::Creative;
@@ -563,6 +575,19 @@ impl CliConfig {
                     };
                     demo_capture = Some(root);
                 }
+                "--demo-external-pack" => {
+                    // Required-value switch: consume the next token only when
+                    // it is not another switch. A missing value (or a
+                    // following `--new`) stores an empty path so `main` fails
+                    // closed with a readable error instead of launching.
+                    let dir = match iter.peek() {
+                        Some(next) if !next.as_ref().starts_with("--") => {
+                            PathBuf::from(iter.next().unwrap().as_ref())
+                        }
+                        _ => PathBuf::new(),
+                    };
+                    demo_external_pack = Some(dir);
+                }
                 "--check-config" => {
                     // Bare switch (no value to consume), mirroring `--new`:
                     // a stray following token stays an independent argument.
@@ -610,6 +635,7 @@ impl CliConfig {
             validate_pack,
             validate_worldgen,
             demo_capture,
+            demo_external_pack,
             check_config,
             creator_trace,
             mode,
