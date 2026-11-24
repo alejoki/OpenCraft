@@ -69,7 +69,10 @@ impl BlockModel {
     }
 
     /// Parse the exact lowercase token, or `None` for any other spelling.
-    pub fn from_str(value: &str) -> Option<BlockModel> {
+    ///
+    /// Deliberately not [`std::str::FromStr`]: the parser wants a cheap
+    /// `Option` token lookup, not the trait's error type.
+    pub fn parse_token(value: &str) -> Option<BlockModel> {
         match value {
             "cube" => Some(BlockModel::Cube),
             "cross" => Some(BlockModel::Cross),
@@ -105,7 +108,10 @@ impl BlockAlpha {
     }
 
     /// Parse the exact lowercase token, or `None` for any other spelling.
-    pub fn from_str(value: &str) -> Option<BlockAlpha> {
+    ///
+    /// Deliberately not [`std::str::FromStr`]: the parser wants a cheap
+    /// `Option` token lookup, not the trait's error type.
+    pub fn parse_token(value: &str) -> Option<BlockAlpha> {
         match value {
             "opaque" => Some(BlockAlpha::Opaque),
             "cutout" => Some(BlockAlpha::Cutout),
@@ -365,14 +371,14 @@ mod tests {
     #[test]
     fn block_model_tokens_round_trip_and_reject_other_spellings() {
         for model in [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop] {
-            assert_eq!(BlockModel::from_str(model.as_str()), Some(model));
+            assert_eq!(BlockModel::parse_token(model.as_str()), Some(model));
         }
         assert_eq!(
             [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop].map(BlockModel::as_str),
             ["cube", "cross", "crop"]
         );
         for unknown in ["", "Cube", "CUBE", "column", "cross "] {
-            assert_eq!(BlockModel::from_str(unknown), None, "{unknown:?}");
+            assert_eq!(BlockModel::parse_token(unknown), None, "{unknown:?}");
         }
         assert_eq!(BlockModel::default(), BlockModel::Cube);
     }
@@ -380,14 +386,14 @@ mod tests {
     #[test]
     fn block_alpha_tokens_round_trip_and_reject_other_spellings() {
         for alpha in [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend] {
-            assert_eq!(BlockAlpha::from_str(alpha.as_str()), Some(alpha));
+            assert_eq!(BlockAlpha::parse_token(alpha.as_str()), Some(alpha));
         }
         assert_eq!(
             [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend].map(BlockAlpha::as_str),
             ["opaque", "cutout", "blend"]
         );
         for unknown in ["", "Opaque", "translucent", "blend ", "cut_out"] {
-            assert_eq!(BlockAlpha::from_str(unknown), None, "{unknown:?}");
+            assert_eq!(BlockAlpha::parse_token(unknown), None, "{unknown:?}");
         }
         assert_eq!(BlockAlpha::default(), BlockAlpha::Opaque);
     }

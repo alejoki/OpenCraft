@@ -8902,6 +8902,8 @@ stack = 64
             "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
             "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
             "presentation_demo: leg=placeholder unresolved=3 face=27 icon=27 break=none mesh=27".to_string(),
+            "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true".to_string(),
+            "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -8930,6 +8932,8 @@ stack = 64
                 .to_string(),
             "presentation_demo: leg=placeholder unresolved=0 face=27 icon=27 break=none mesh=27"
                 .to_string(),
+            "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true".to_string(),
+            "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -17178,6 +17182,7 @@ stack = 64
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         std::fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
         let before = std::fs::read(&existing).expect("read renamed prefab");

@@ -266,7 +266,7 @@ pub fn generate_all_texture_layers_rgba() -> Vec<Vec<u8>> {
         // fully transparent holes so the cutout pass masks the gaps.
         make_layer_rgba(9, |x, y, j| {
             let dark = if (x + y) % 3 == 0 { -16 } else { 8 };
-            let hole = hash_pixel(x, y, 4_873) % 4 == 0;
+            let hole = hash_pixel(x, y, 4_873).is_multiple_of(4);
             [
                 clamp_u8(52 + dark + j),
                 clamp_u8(132 + dark + j * 2),

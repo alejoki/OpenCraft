@@ -1335,7 +1335,7 @@ mod tests {
 
         // Collision and raycast keep working; sky light passes through.
         assert!(glass.is_solid());
-        assert!(glass.is_light_opaque() == false);
+        assert!(!glass.is_light_opaque());
         assert_eq!(glass.kind(), BlockKind::Solid);
         assert!(!glass.is_liquid());
         assert!(!glass.is_plant());

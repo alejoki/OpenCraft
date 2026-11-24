@@ -214,7 +214,7 @@ install_ruby_pack() {
 # Copy the complete shipped default pack into a launch cwd.
 #
 # Production startup always ensures `packs/default`, so a fixture that omits it
-# would gain 75 files during the first bounded launch. Seeding the same bytes
+# would gain 76 files during the first bounded launch. Seeding the same bytes
 # makes the restore a strict no-op and keeps the tree byte-identity assertions
 # below focused on present bytes (the restore policy itself is proven by
 # pack_smoke scenario 3 and the server/startup tests).

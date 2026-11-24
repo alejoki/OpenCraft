@@ -135,6 +135,71 @@ pub fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16
     }
 }
 
+/// Mesh one isolated `block` cell in an otherwise air chunk through a real
+/// face table. Used by the presentation digest's models leg so wheat, leaves
+/// and glass are classified by the production mesher, not by a test stub.
+fn mesh_presentation_block(
+    block: BlockId,
+    faces: &crate::content::faces::BlockFaces,
+) -> crate::mesh::quad::ChunkMesh {
+    let mut chunk = Chunk::new_uniform(BlockId::Air);
+    chunk.set(5, 6, 7, block);
+    let padded = crate::mesh::greedy::PaddedChunk::from_center_only(&chunk);
+    crate::mesh::greedy::mesh_chunk_with(&padded, faces)
+}
+
+/// Parse a minimal v3 `mymod:reed` block through the neutral parser and fold
+/// it into a registry, proving authored `model`/`alpha` survive the whole
+/// neutral authoring path. Returns the resolved `(model, alpha)` tokens, or
+/// `None` when the snippet is rejected or the block does not resolve.
+fn parsed_cross_block_model() -> Option<(String, String)> {
+    use crate::content::spec::PackAsset;
+    use crate::content::{build_registry, ContentRegistry, PackIdentity};
+    use opencraft_content::manifest::PackFormat;
+    use opencraft_content::v3::parse_content;
+
+    let root: toml::Value = toml::from_str(
+        r#"
+[[blocks]]
+id = "mymod:reed"
+textures = { all = "reed.png" }
+hardness = 0.0
+model = "cross"
+alpha = "cutout"
+"#,
+    )
+    .ok()?;
+    let (mut spec, _warnings, diagnostics) = parse_content(&root, PackFormat::V3);
+    if !diagnostics.is_empty() {
+        return None;
+    }
+    spec.assets.insert(
+        "reed.png".to_string(),
+        PackAsset {
+            rgba: vec![0x6C; 1024],
+            source_side: 16,
+        },
+    );
+    let (registry, report) = build_registry(
+        ContentRegistry::builtin(),
+        &[(
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        )],
+    );
+    if report.errors() != 0 {
+        return None;
+    }
+    let def = registry.block_by_name("mymod:reed")?;
+    Some((
+        def.model.as_str().to_string(),
+        def.alpha.as_str().to_string(),
+    ))
+}
+
 /// Build the deterministic `--demo-presentation` digest.
 ///
 /// Every line is a structural fact (counts, resolved names, authored layers,
@@ -557,6 +622,92 @@ pub fn presentation_demo_lines(
         ));
         if !placeholder_ok {
             failed.get_or_insert("placeholder");
+        }
+    }
+
+    // (f) Model/alpha presentation surface. Wheat must be two crossed planes,
+    // leaves must be cutout faces in the opaque buckets, and glass must be six
+    // blend faces. All three meshes come from the real built-in face table and
+    // a real PaddedChunk. The sorted flag is only true when the pure
+    // translucent ordering proves farthest-first plus the ChunkPos tie-break.
+    {
+        use crate::content::{BlockAlpha, BlockModel};
+        use opencraft_gfx::pipeline::{translucent_draw_order, TranslucentChunk};
+
+        let faces = BlockFaces::builtin();
+        let wheat = mesh_presentation_block(BlockId::WheatStage3, &faces);
+        let leaves = mesh_presentation_block(BlockId::OakLeaves, &faces);
+        let glass = mesh_presentation_block(BlockId::Glass, &faces);
+
+        let wheat_cross = matches!(
+            faces.model(BlockId::WheatStage3),
+            BlockModel::Cross | BlockModel::Crop
+        ) && wheat.total_quads() == 0
+            && wheat.cross_quad_count() == 2
+            && wheat.blend_quad_count() == 0;
+        let leaves_cutout = faces.alpha(BlockId::OakLeaves) == BlockAlpha::Cutout
+            && leaves.total_quads() == 6
+            && leaves.blend_quad_count() == 0
+            && leaves.cross_quad_count() == 0
+            && leaves.buckets.iter().all(|bucket| bucket.len() == 1);
+        let glass_blend = faces.alpha(BlockId::Glass) == BlockAlpha::Blend
+            && glass.total_quads() == 0
+            && glass.blend_quad_count() == 6
+            && glass.cross_quad_count() == 0;
+
+        // Camera inside chunk (0,0,0): chunk (1,0,0) is farther, so it must be
+        // drawn first. Two chunks equidistant from the origin prove the
+        // lexical ChunkPos tie-break.
+        let near = TranslucentChunk {
+            pos: ChunkPos::new(0, 0, 0),
+            has_water: true,
+            has_blend: false,
+        };
+        let far = TranslucentChunk {
+            pos: ChunkPos::new(1, 0, 0),
+            has_water: false,
+            has_blend: true,
+        };
+        let farthest_first =
+            translucent_draw_order([8.0, 8.0, 8.0], &[near, far]) == vec![far.pos, near.pos];
+        let tie_a = TranslucentChunk {
+            pos: ChunkPos::new(0, 0, 1),
+            has_water: false,
+            has_blend: true,
+        };
+        let tie_b = TranslucentChunk {
+            pos: ChunkPos::new(0, 1, 0),
+            has_water: false,
+            has_blend: true,
+        };
+        let tie_break =
+            translucent_draw_order([0.0, 0.0, 0.0], &[tie_b, tie_a]) == vec![tie_a.pos, tie_b.pos];
+        let sorted = farthest_first && tie_break;
+
+        lines.push(format!(
+            "presentation_demo: leg=models wheat_cross={} leaves_cutout={} glass_blend={} sorted={}",
+            wheat_cross, leaves_cutout, glass_blend, sorted,
+        ));
+        if !wheat_cross || !leaves_cutout || !glass_blend || !sorted {
+            failed.get_or_insert("models");
+        }
+    }
+
+    // (g) Neutral parser round trip for authored model/alpha tokens.
+    {
+        let (model, alpha) = match parsed_cross_block_model() {
+            Some(tokens) => tokens,
+            None => {
+                failed.get_or_insert("model_metadata");
+                ("missing".to_string(), "missing".to_string())
+            }
+        };
+        lines.push(format!(
+            "presentation_demo: leg=model name=mymod:reed model={} alpha={}",
+            model, alpha,
+        ));
+        if model != "cross" || alpha != "cutout" {
+            failed.get_or_insert("model_metadata");
         }
     }
 

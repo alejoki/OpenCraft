@@ -34,7 +34,7 @@ Packs are folders under `packs/`, relative to the game's working directory — t
 
 The game ships one pack, `packs/default`, so a fresh install has a working presentation without any setup. It is generated from the same procedural art and synthesized sounds the engine uses as its built-in fallback, and the generator is deterministic, so the shipped bytes never drift from the live defaults.
 
-- It contains 75 files: `pack.toml`, the 25 block layers, the 13 mob layers, 27 built-in item icons under `icons/`, and the 9 sound files.
+- It contains 76 files: `pack.toml`, the 26 block layers, the 13 mob layers, 27 built-in item icons under `icons/`, and the 9 sound files.
 - It loads as the implicit first presentation entry on every launch, underneath whatever packs you select. It is not a row on the Packs screen and never appears in `settings.toml`; an explicit `default` entry in an old stack is folded into that implicit slot.
 - If the folder is missing, or its `pack.toml` is missing, unreadable, or not `format_version = 3`, the game restores it from the embedded master and shows one notice on the first Settings open. The restore only fills files that are absent; it never overwrites a file that is present, so an edited or corrupt-but-present image survives a relaunch.
 - Because it uses the ordinary pack format, you can copy `packs/default` to `packs/my-first-pack` as a starter pack and edit it like any other.
@@ -128,11 +128,11 @@ vein = 4
 attempts = 8
 ```
 
-A block needs `id`, a `textures` table that resolves one image for every face, and a finite `hardness` from 0 to 3600. `textures.all` is the fallback for every face; `textures.side` overrides the four side faces, `textures.top` and `textures.bottom` override those faces individually, and `textures.north`, `textures.south`, `textures.east` and `textures.west` override one side direction each. `name` is optional and a readable display name is derived from the id when it is absent. `drop` names the item produced on break and defaults to the block itself; `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) marks the block as efficiently broken by that tool kind; `stack` sets the block item's maximum stack from 1 to 999 (default 999).
+A block needs `id`, a `textures` table that resolves one image for every face, and a finite `hardness` from 0 to 3600. `textures.all` is the fallback for every face; `textures.side` overrides the four side faces, `textures.top` and `textures.bottom` override those faces individually, and `textures.north`, `textures.south`, `textures.east` and `textures.west` override one side direction each. `name` is optional and a readable display name is derived from the id when it is absent. `drop` names the item produced on break and defaults to the block itself; `tool` (`pickaxe`, `axe`, `shovel`, `hoe`) marks the block as efficiently broken by that tool kind; `stack` sets the block item's maximum stack from 1 to 999 (default 999). `model` (`cube`, `cross`, `crop`) and `alpha` (`opaque`, `cutout`, `blend`) are optional and select the block's geometry and transparency; see [Block models and alpha](#block-models-and-alpha).
 
 An item needs `id` and `icon`. `stack` defaults to 64; `nutrition` from 1 to 20 turns the item into food, and an optional `eat_seconds` (0.1 to 10, default 1.2) sets how long the hold-to-eat gesture takes. A tier needs `id`, `speed`, `durability` and `damage`; the tool's durability comes from the tier. A tool needs `kind` (`pickaxe`, `axe`, `shovel`, `hoe` or `sword`), `tier` and `icon`; `bow` is not authorable in this format. `name` is optional on items, tiers and tools.
 
-A recipe needs a 1-to-4-row `pattern` of 1-to-4 characters, a `key` mapping each pattern character to an item, an `output` and a `count` from 1 to 999. A `[[block_patches]]` entry changes one built-in block without redefining it: `id` is the built-in short name (`stone`, `iron_ore`, ...), and the entry must set at least one of `name`, `hardness`, `drop`, `tool` or `stack`. A patch can only set fields; it cannot clear a built-in value, create a block, change a block's identity, or target a pack-defined block. A `[[recipe_patches]]` entry takes a built-in recipe short name in `id` and an `enabled` boolean; `enabled = false` removes that recipe from crafting while the pack is active, and a later patch can turn it back on.
+A recipe needs a 1-to-4-row `pattern` of 1-to-4 characters, a `key` mapping each pattern character to an item, an `output` and a `count` from 1 to 999. A `[[block_patches]]` entry changes one built-in block without redefining it: `id` is the built-in short name (`stone`, `iron_ore`, ...), and the entry must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`, `model` or `alpha`. A patch can only set fields; it cannot clear a built-in value, create a block, change a block's identity, or target a pack-defined block. A `[[recipe_patches]]` entry takes a built-in recipe short name in `id` and an `enabled` boolean; `enabled = false` removes that recipe from crafting while the pack is active, and a later patch can turn it back on.
 
 Worldgen entries use `type = "ore"` (with `vein` 1 to 8 and `attempts` 1 to 32) or `type = "patch"` (with a non-empty `biomes` list of `plains`, `forest`, `mountains` or `ocean`, and a `chance` from 0 to 1). Both kinds need `block`, `replace`, and `min_y`/`max_y` within -64 to 128 with `min_y < max_y`. The schema is described here; [Declarative worldgen](#declarative-worldgen) explains what those rules do to a world.
 
@@ -280,10 +280,11 @@ Save each block texture directly inside the pack folder, using these exact file 
 23. `loot_chest.png`
 24. `crafting_table_top.png`
 25. `crafting_table_side.png`
+26. `glass.png`
 
-The texture array has 48 layers. Layers 0 to 24 are the twenty-five block names above, in the order listed. Layer 25 is built-in socket-marker art that a pack cannot override (there is no file name for it). Layers 26 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_26.png` or any other name that is not in one of the two lists is ignored.
+The texture array has 48 layers. Layers 0 to 25 are the twenty-six block names above, in the order listed. Layer 26 is built-in socket-marker art that a pack cannot override (there is no file name for it). Layers 27 to 31 are reserved block placeholders that cannot be overridden. Layers 32 to 44 are the thirteen mob part names in [Mob textures](#mob-textures) below. Layers 45 to 47 are reserved spare layers that cannot be overridden. A file named `reserved_27.png` or any other name that is not in one of the two lists is ignored.
 
-A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. The same is true for packs that shipped only the original 23 block names — `crafting_table_top.png` (layer 23) and `crafting_table_side.png` (layer 24) are optional additions, so such packs remain valid unchanged. Partial packs may add one texture or all twenty-five.
+A pack that authors only the original 16 names still loads: the newer blocks keep their built-in procedural art, and no warning is shown for the files a pack does not include. The same is true for packs that shipped only the original 23 block names — `crafting_table_top.png` (layer 23) and `crafting_table_side.png` (layer 24) are optional additions, so such packs remain valid unchanged. `glass.png` (layer 25) is likewise optional, so a pack that predates it keeps the built-in glass art. Partial packs may add one texture or all twenty-six.
 
 Image rules:
 
@@ -292,7 +293,7 @@ Image rules:
 - A missing file is fine and silently keeps the built-in texture for that block.
 - A corrupt, non-square, or out-of-range file also keeps the built-in texture, but the menu shows a warning that names the file.
 - Every PNG file and `pack.toml` is limited to 1 MiB (1048576 bytes). A larger file falls back with a warning that names the file and the limit.
-- Partial packs always work — add one texture or all twenty-five.
+- Partial packs always work — add one texture or all twenty-six.
 
 ### Six faces per built-in block
 
@@ -305,7 +306,48 @@ The names above are the legacy base-layer contract: `stone.png` still maps to la
 
 The block stem is usually the built-in short name. Exceptions: `oak_log` uses `log` (`log_top.png`, `log_side.png`, `log_east.png`, ...), `oak_leaves` uses `leaves`, `oak_planks` uses `planks`, and `wheat_stage_0` through `wheat_stage_3` use `wheat_stage0` through `wheat_stage3`. `air`, `water` and the socket marker have no authorable stem.
 
-A file that is already one of the 25 legacy names above (for example `stone.png`, `log_top.png`, or `grass_side.png`) reuses its existing fixed layer. Only new face files — for example `stone_top.png` next to `stone.png`, or `stone_east.png` — are decoded as content assets and allocated pack layers from layer 48, inside the same 160-layer pack budget described under [Format v3](#format-v3). A pack that authors only legacy names therefore allocates nothing and keeps every existing layer index.
+A file that is already one of the 26 legacy names above (for example `stone.png`, `log_top.png`, or `grass_side.png`) reuses its existing fixed layer. Only new face files — for example `stone_top.png` next to `stone.png`, or `stone_east.png` — are decoded as content assets and allocated pack layers from layer 48, inside the same 160-layer pack budget described under [Format v3](#format-v3). A pack that authors only legacy names therefore allocates nothing and keeps every existing layer index.
+
+## Block models and alpha
+
+`model` and `alpha` are optional per-block fields in `[[blocks]]` (and in `[[block_patches]]`, where they change a built-in block without redefining it). Both default to the plain full-cube look, so packs that do not author them are unchanged.
+
+- `model = "cube"` — the full solid cube of six faces. This is the default when `model` is absent.
+- `model = "cross"` — two diagonal quads crossed in the block cell, for plants. A pack cross block keeps its own block classification: its collision, targeting and light behaviour come from the block, not from the model.
+- `model = "crop"` — a crop plant, rendered like a cross as two diagonal quads.
+- `alpha = "opaque"` — every texel is drawn solid. This is the default when `alpha` is absent.
+- `alpha = "cutout"` — a texel whose alpha is below the cutout threshold is discarded instead of blended, so leaves and plants keep crisp holes.
+- `alpha = "blend"` — the authored alpha is blended with whatever is behind the block. Blend blocks draw in a deterministic back-to-front order after opaque and cutout geometry.
+
+Only the exact lowercase tokens above are accepted. An unknown value rejects only that one entry with a diagnostic that names the entry and the accepted tokens — `unknown model "column"; expected cube, cross, crop` or `unknown alpha "translucent"; expected opaque, cutout, blend` — while its valid siblings and the rest of the pack still load.
+
+The built-in wheat stages are non-colliding `BlockKind::Plant` blocks: you walk through them and they do not support the player. A pack block follows its own block classification, so a pack `model = "cross"` block uses its block's collision and targeting rules rather than inheriting wheat's. Cross and crop quads render in the cutout stage.
+
+A runnable v3 example:
+
+```toml
+format_version = 3
+name = "Reed Pack"
+
+[[blocks]]
+id = "mymod:reed"
+name = "Reed"
+textures = { all = "reed.png" }
+hardness = 0.2
+model = "cross"
+alpha = "cutout"
+```
+
+A translucent solid is the same surface with a cube model:
+
+```toml
+[[blocks]]
+id = "mymod:glass"
+name = "Glass"
+textures = { all = "glass.png" }
+hardness = 0.3
+alpha = "blend"
+```
 
 ## Mob textures
 
@@ -335,7 +377,7 @@ The committed `tests/fixtures/packs/uat-sound/` folder is the per-file layout ex
 - A missing file silently keeps the built-in procedural art for that part.
 - A corrupt, non-square, or out-of-range file also keeps the built-in art, but shows a warning that names the bare file name.
 - A pack may add one mob file or all thirteen. Mob files and block files are independent.
-- Layers 26 to 31 and 45 to 47 are reserved and cannot be overridden, and layer 25 is built-in socket-marker art that a pack cannot override. Files named after reserved layers, such as `reserved_45.png`, are ignored silently.
+- Layers 27 to 31 and 45 to 47 are reserved and cannot be overridden, and layer 26 is built-in socket-marker art that a pack cannot override. Files named after reserved layers, such as `reserved_45.png`, are ignored silently.
 
 ## Title logo and menu tint
 
@@ -485,9 +527,9 @@ Development builds watch the active pack stack while the game is running, so you
 
 **Applies live**
 
-- The 25 block textures and 13 mob textures listed above. A fixed-name file that was missing from a loaded pack can be created later and immediately replaces that layer. When the edited pack is the visible author of the layer, only that one texture-array layer is re-uploaded.
+- The 26 block textures and 13 mob textures listed above. A fixed-name file that was missing from a loaded pack can be created later and immediately replaces that layer. When the edited pack is the visible author of the layer, only that one texture-array layer is re-uploaded.
 - The block-face images that a `format_version = 3` stack loaded and allocated when it was applied. Each image keeps its allocated layer index and only its bytes are replaced, so the live path can never move allocation.
-- Deleting one of the 38 fixed-name files is live too: the layer falls back to the next pack in the stack that authors it, or to the built-in procedural art when no pack does.
+- Deleting one of the 39 fixed-name files is live too: the layer falls back to the next pack in the stack that authors it, or to the built-in procedural art when no pack does.
 - A corrupt, non-square, or out-of-range PNG (outside 16 to 256 pixels per side) is rejected. The layer keeps its last good image and the game shows one message naming the file and reason; a valid edit settling in the same poll still applies.
 - Built-in item sprites overridden by `[builtin_icons]`. Editing the authored PNG recomposes and re-uploads the single 256-layer item sprite atlas; only that name's pinned layer changes. The pinned layers are `apple` = 1, `wood_pickaxe` = 11 and `wood_bow` = 26; reserved layers 27–31 are never overridable, and pack-defined icons at layers 32 and above are untouched.
 - Adding, removing, or repointing a `[builtin_icons]` entry in `pack.toml` applies without a restart. A malformed PNG keeps the last good override, and deleting the authored file (or removing the entry) reveals the next lower pack's override or the procedural built-in sprite.

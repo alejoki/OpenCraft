@@ -811,7 +811,7 @@ fn parse_block_model(
     let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
         return Ok(BlockModel::default());
     };
-    match BlockModel::from_str(&name) {
+    match BlockModel::parse_token(&name) {
         Some(model) => Ok(model),
         None => {
             err(
@@ -833,7 +833,7 @@ fn parse_block_alpha(
     let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
         return Ok(BlockAlpha::default());
     };
-    match BlockAlpha::from_str(&name) {
+    match BlockAlpha::parse_token(&name) {
         Some(alpha) => Ok(alpha),
         None => {
             err(
@@ -855,7 +855,7 @@ fn parse_block_model_patch(
     let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
         return Ok(None);
     };
-    match BlockModel::from_str(&name) {
+    match BlockModel::parse_token(&name) {
         Some(model) => Ok(Some(model)),
         None => {
             err(
@@ -877,7 +877,7 @@ fn parse_block_alpha_patch(
     let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
         return Ok(None);
     };
-    match BlockAlpha::from_str(&name) {
+    match BlockAlpha::parse_token(&name) {
         Some(alpha) => Ok(Some(alpha)),
         None => {
             err(

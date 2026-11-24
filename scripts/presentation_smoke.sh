@@ -129,6 +129,8 @@ EXPECTED_LINES=(
     "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64"
     "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true"
     "presentation_demo: leg=placeholder unresolved=3 face=27 icon=27 break=none mesh=27"
+    "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true"
+    "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout"
     "presentation_demo: ok=true"
 )
 

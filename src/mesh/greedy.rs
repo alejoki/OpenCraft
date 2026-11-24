@@ -237,7 +237,7 @@ pub fn mesh_chunk_with(padded: &PaddedChunk, faces: &BlockFaces) -> ChunkMesh {
         // Process positive (is_pos = true -> face_dir = axis*2) and negative
         // (is_pos = false -> face_dir = axis*2 + 1).
         for is_pos in [true, false] {
-            let face_dir = (axis * 2 + usize::from(!is_pos)) as usize;
+            let face_dir = axis * 2 + usize::from(!is_pos);
 
             // Opaque: every face culls against another opaque face.
             emit_class_faces(

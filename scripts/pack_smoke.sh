@@ -12,7 +12,7 @@
 # settings.toml, and packs/ are never touched):
 #   0. Doc reader-test gate, no launch: docs/TEXTURE-PACKS.md exists, its
 #      `## Quickstart` ```toml block extracts non-empty with a
-#      `format_version = 3` line, `name =`, and `overlay_tint`, and all 25
+#      `format_version = 3` line, `name =`, and `overlay_tint`, and all 26
 #      block layer names, all 13 mob layer names, and all 9 sound stems appear
 #      in the guide.
 #   1. Selected pack + persistence: a `[packs]`-only settings.toml selects
@@ -31,7 +31,7 @@
 #      stays byte-identical.
 #   3. Missing pack: settings point at "ghost" with no packs/ directory —
 #      the launch survives on Default and restores the shipped packs/default
-#      (pack.toml plus all 75 shipped files) without creating any other pack
+#      (pack.toml plus all 76 shipped files) without creating any other pack
 #      folder.
 #
 # Dependencies: bash, timeout, cmp, mktemp, grep, awk, base64, find, wc. Missing layer
@@ -191,6 +191,7 @@ LAYERS=(
     loot_chest.png
     crafting_table_top.png
     crafting_table_side.png
+    glass.png
 )
 for layer in "${LAYERS[@]}"; do
     grep -Fq "$layer" "$DOC" || fail "scenario 0: guide does not document layer '$layer'"
@@ -232,7 +233,18 @@ for sound in "${SOUNDS[@]}"; do
     grep -Fq "$sound" "$DOC" || fail "scenario 0: guide does not document sound stem '$sound'"
 done
 
-echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with format_version = 3, name/overlay_tint, the shipped packs/default folder, all 25 block layer names, 13 mob layer names, and 9 sound stems documented"
+# The model/alpha surface is part of the authored-block contract, so the
+# guide must name its heading and every accepted token example.
+grep -Fq '## Block models and alpha' "$DOC" \
+    || fail "scenario 0: guide does not document '## Block models and alpha'"
+grep -Fq 'model = "cross"' "$DOC" \
+    || fail "scenario 0: guide does not document the cross model example"
+grep -Fq 'alpha = "cutout"' "$DOC" \
+    || fail "scenario 0: guide does not document the cutout alpha example"
+grep -Fq 'alpha = "blend"' "$DOC" \
+    || fail "scenario 0: guide does not document the blend alpha example"
+
+echo "PACK SMOKE PASS: scenario 0 (doc reader-test) — Quickstart TOML extracted with format_version = 3, name/overlay_tint, the shipped packs/default folder, all 26 block layer names, the model/alpha surface, 13 mob layer names, and 9 sound stems documented"
 
 # ---------------------------------------------------------------------------
 # Scenario 1: selected pack + persistence across relaunch.
@@ -341,15 +353,15 @@ run_bounded_launch "$TEMP_DIR_C" "$TEMP_DIR_C/output.log" "scenario 3" || exit 1
 [[ -f "$TEMP_DIR_C/packs/default/pack.toml" ]] \
     || fail "scenario 3: the shipped packs/default/pack.toml was not restored"
 SHIPPED_COUNT="$(find "$TEMP_DIR_C/packs/default" -type f | wc -l | tr -d '[:space:]')"
-[[ "$SHIPPED_COUNT" == "75" ]] \
-    || fail "scenario 3: restored packs/default has $SHIPPED_COUNT files (expected all 75 shipped files)"
+[[ "$SHIPPED_COUNT" == "76" ]] \
+    || fail "scenario 3: restored packs/default has $SHIPPED_COUNT files (expected all 76 shipped files)"
 for entry in "$TEMP_DIR_C/packs"/*; do
     [[ -e "$entry" ]] || continue
     [[ "${entry##*/}" == "default" ]] \
         || fail "scenario 3: unexpected pack folder created at $entry"
 done
 
-echo "PACK SMOKE PASS: scenario 3 (missing pack) — texture_pack = \"ghost\" with no packs/ root restored the shipped packs/default (pack.toml plus 75 files), created no other pack folder, exit 124, no panic"
+echo "PACK SMOKE PASS: scenario 3 (missing pack) — texture_pack = \"ghost\" with no packs/ root restored the shipped packs/default (pack.toml plus 76 files), created no other pack folder, exit 124, no panic"
 
 echo "PACK SMOKE: all scenarios passed"
 exit 0

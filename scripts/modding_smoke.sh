@@ -230,6 +230,10 @@ done
 for needle in \
     '[[worldgen]]' \
     '## Declarative worldgen' \
+    '## Block models and alpha' \
+    'model = "cross"' \
+    'alpha = "cutout"' \
+    'alpha = "blend"' \
     'tests/fixtures/packs/mymod-ruby' \
     'tests/fixtures/packs/ruby-overlay' \
     '--validate-pack' \

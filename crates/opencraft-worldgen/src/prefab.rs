@@ -162,11 +162,80 @@ pub struct PrefabSocket {
     pub direction: Direction,
 }
 
+/// What a marker attaches to a prefab cell.
+///
+/// Markers are additive metadata: the cell itself is still an ordinary entry in
+/// [`Prefab::blocks`]. Only the kinds that authored content uses today are
+/// representable; an unknown name is a parse error with a pinned reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerKind {
+    LootChest,
+}
+
+impl MarkerKind {
+    /// The stable lowercase name used by prefab TOML and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MarkerKind::LootChest => "loot_chest",
+        }
+    }
+
+    /// Parse the stable lowercase name, rejecting anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "loot_chest" => Some(MarkerKind::LootChest),
+            _ => None,
+        }
+    }
+}
+
+/// Which loot table a marker draws from.
+///
+/// Kept separate from [`MarkerKind`] so a future marker kind can reuse a table
+/// and a loot chest can later select another one without a format change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkerLootTable {
+    Ruin,
+}
+
+impl MarkerLootTable {
+    /// The stable lowercase name used by prefab TOML and diagnostics.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MarkerLootTable::Ruin => "ruin",
+        }
+    }
+
+    /// Parse the stable lowercase name, rejecting anything else.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "ruin" => Some(MarkerLootTable::Ruin),
+            _ => None,
+        }
+    }
+}
+
+/// One typed marker attached to a prefab cell, stored relative to
+/// [`Prefab::origin`] exactly like [`PrefabSocket`].
+///
+/// The addressed cell also appears in [`Prefab::blocks`]; markers add meaning
+/// to a block (a chest, a loot spawn) without replacing it. Because the origin
+/// is the anchor cell, a marker at the grid border on the negative side of the
+/// origin has a negative component.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefabMarker {
+    pub position: [i32; 3],
+    pub kind: MarkerKind,
+    pub table: MarkerLootTable,
+}
+
 /// A fully parsed prefab value.
 ///
 /// `blocks` contains every cell of the grid, air included, in `(y, z, x)`
-/// order. `sockets` is sorted by `(position.y, position.z, position.x)`, so
-/// two parses of equivalent documents compare equal.
+/// order. `sockets` is sorted by `(position.y, position.z, position.x)` and
+/// `markers` by the same `(y, z, x)` key, so two parses of equivalent
+/// documents compare equal. `markers` is additive to `format = 1`: a prefab
+/// without markers serializes exactly as it did before the section existed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Prefab {
     pub name: String,
@@ -174,6 +243,7 @@ pub struct Prefab {
     pub size: [u32; 3],
     pub blocks: Vec<PrefabBlock>,
     pub sockets: Vec<PrefabSocket>,
+    pub markers: Vec<PrefabMarker>,
 }
 
 /// One stable, one-line prefab reason.
@@ -224,6 +294,13 @@ pub enum PrefabError {
     SocketOutside([i64; 3]),
     UnknownSocketDirection(String),
     DuplicateSocket([i32; 3]),
+    InvalidMarkerPosition,
+    MarkerOutside([i64; 3]),
+    MissingMarkerKind,
+    UnknownMarkerKind(String),
+    MissingMarkerTable,
+    UnknownMarkerTable(String),
+    DuplicateMarker([i32; 3]),
     InvalidToml,
     FileTooLarge,
     CouldNotReadFile,
@@ -299,6 +376,23 @@ impl fmt::Display for PrefabError {
             PrefabError::DuplicateSocket([x, y, z]) => {
                 write!(f, "duplicate socket at [{x}, {y}, {z}]")
             }
+            PrefabError::InvalidMarkerPosition => {
+                write!(f, "marker position must be [x, y, z]")
+            }
+            PrefabError::MarkerOutside([x, y, z]) => {
+                write!(f, "marker position [{x}, {y}, {z}] is outside the prefab")
+            }
+            PrefabError::MissingMarkerKind => write!(f, "missing marker kind"),
+            PrefabError::UnknownMarkerKind(kind) => {
+                write!(f, "marker kind '{kind}' is unknown")
+            }
+            PrefabError::MissingMarkerTable => write!(f, "missing marker table"),
+            PrefabError::UnknownMarkerTable(table) => {
+                write!(f, "marker table '{table}' is unknown")
+            }
+            PrefabError::DuplicateMarker([x, y, z]) => {
+                write!(f, "duplicate marker at [{x}, {y}, {z}]")
+            }
             PrefabError::InvalidToml => write!(f, "invalid TOML"),
             PrefabError::FileTooLarge => write!(f, "file is larger than 1 MiB"),
             PrefabError::CouldNotReadFile => write!(f, "could not read file"),
@@ -312,7 +406,8 @@ impl std::error::Error for PrefabError {}
 ///
 /// Checks run in a fixed order so the first reported reason is stable:
 /// `format` → `name` → `size` → `origin` → `[palette]` → `layers` →
-/// `[[sockets]]`. Any TOML syntax error normalizes to [`PrefabError::InvalidToml`].
+/// `[[sockets]]` → `[[markers]]`. Any TOML syntax error normalizes to
+/// [`PrefabError::InvalidToml`].
 pub fn parse_prefab(text: &str) -> Result<Prefab, PrefabError> {
     parse_prefab_with(text, &BuiltinBlockNames)
 }
@@ -495,12 +590,61 @@ pub fn parse_prefab_with(
     }
     sockets.sort_by_key(|socket| (socket.position[1], socket.position[2], socket.position[0]));
 
+    let mut markers: Vec<PrefabMarker> = Vec::new();
+    if let Some(markers_value) = root.get("markers") {
+        let markers_array = markers_value.as_array().ok_or(PrefabError::InvalidToml)?;
+        for marker_value in markers_array {
+            let marker_table = marker_value.as_table().ok_or(PrefabError::InvalidToml)?;
+            let position = marker_table
+                .get("position")
+                .and_then(integer_triple_i32)
+                .ok_or(PrefabError::InvalidMarkerPosition)?;
+
+            let outside = (0..3).any(|axis| {
+                let cell = i64::from(origin[axis]) + i64::from(position[axis]);
+                cell < 0 || cell >= i64::from(size[axis])
+            });
+            if outside {
+                return Err(PrefabError::MarkerOutside([
+                    i64::from(position[0]),
+                    i64::from(position[1]),
+                    i64::from(position[2]),
+                ]));
+            }
+
+            let kind_name = marker_table
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                .ok_or(PrefabError::MissingMarkerKind)?;
+            let kind = MarkerKind::from_name(kind_name)
+                .ok_or_else(|| PrefabError::UnknownMarkerKind(kind_name.to_owned()))?;
+
+            let table_name = marker_table
+                .get("table")
+                .and_then(toml::Value::as_str)
+                .ok_or(PrefabError::MissingMarkerTable)?;
+            let table = MarkerLootTable::from_name(table_name)
+                .ok_or_else(|| PrefabError::UnknownMarkerTable(table_name.to_owned()))?;
+
+            if markers.iter().any(|marker| marker.position == position) {
+                return Err(PrefabError::DuplicateMarker(position));
+            }
+            markers.push(PrefabMarker {
+                position,
+                kind,
+                table,
+            });
+        }
+    }
+    markers.sort_by_key(|marker| (marker.position[1], marker.position[2], marker.position[0]));
+
     Ok(Prefab {
         name,
         origin,
         size,
         blocks,
         sockets,
+        markers,
     })
 }
 
@@ -510,9 +654,9 @@ impl Prefab {
     /// Delegates to [`Prefab::to_toml_string_with`] with [`BuiltinBlockNames`].
     /// Fixed header order, `layers` in `y` then `z` order, a `[palette]`
     /// assigned in ascending block-id order (so keys come out sorted by
-    /// character), and `[[sockets]]` sorted by `(y, z, x)`. `layers` precedes
-    /// the `[palette]` header because TOML scopes every key after a table
-    /// header to that table. `parse_prefab(&prefab.to_toml_string())`
+    /// character), `[[sockets]]` sorted by `(y, z, x)` and, only when present,
+    /// `[[markers]]` sorted by the same key. `layers` precedes the `[palette]`
+    /// header because TOML scopes every key after a table header to that table. `parse_prefab(&prefab.to_toml_string())`
     /// reproduces an equal value and serializing that value is byte-identical.
     ///
     /// Only built-in blocks are representable; a modded id is written as air
@@ -620,6 +764,21 @@ impl Prefab {
                 socket.position[0], socket.position[1], socket.position[2]
             ));
             output.push_str(&format!("direction = \"{}\"\n", socket.direction.as_str()));
+        }
+
+        if !self.markers.is_empty() {
+            let mut markers: Vec<&PrefabMarker> = self.markers.iter().collect();
+            markers
+                .sort_by_key(|marker| (marker.position[1], marker.position[2], marker.position[0]));
+            for marker in markers {
+                output.push_str("\n[[markers]]\n");
+                output.push_str(&format!("kind = \"{}\"\n", marker.kind.as_str()));
+                output.push_str(&format!("table = \"{}\"\n", marker.table.as_str()));
+                output.push_str(&format!(
+                    "position = [{}, {}, {}]\n",
+                    marker.position[0], marker.position[1], marker.position[2]
+                ));
+            }
         }
 
         output
@@ -1211,6 +1370,136 @@ direction = "west"
         assert_eq!(
             parse_prefab(&duplicate),
             Err(PrefabError::DuplicateSocket([0, 0, 0]))
+        );
+    }
+
+    #[test]
+    fn marker_less_prefabs_serialize_without_a_markers_section() {
+        let prefab = parse_prefab(MINIMAL).expect("tiny must parse");
+        assert!(prefab.markers.is_empty());
+        let serialized = prefab.to_toml_string();
+        assert!(
+            !serialized.contains("[[markers]]"),
+            "marker-less output must not grow a markers section:\n{serialized}"
+        );
+        assert_eq!(parse_prefab(&serialized), Ok(prefab));
+    }
+
+    #[test]
+    fn markers_parse_sort_serialize_and_stay_out_of_blocks() {
+        // Authored in reverse grid order so the sort is observable.
+        let text = format!(
+            "{MINIMAL}\n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [1, 0, 0]\n\
+             \n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n"
+        );
+        let prefab = parse_prefab(&text).expect("markers must parse");
+        assert_eq!(prefab.markers.len(), 2);
+        assert_eq!(prefab.markers[0].position, [0, 0, 0]);
+        assert_eq!(prefab.markers[1].position, [1, 0, 0]);
+        assert_eq!(prefab.markers[0].kind, MarkerKind::LootChest);
+        assert_eq!(prefab.markers[0].table, MarkerLootTable::Ruin);
+
+        // Markers are additive: the grid is identical to the marker-less parse.
+        let plain = parse_prefab(MINIMAL).expect("tiny must parse");
+        assert_eq!(prefab.blocks, plain.blocks);
+        assert_eq!(prefab.blocks.len(), 2);
+
+        let serialized = prefab.to_toml_string();
+        assert_eq!(serialized.matches("[[markers]]").count(), 2);
+        assert!(
+            serialized.contains("kind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]"),
+            "marker keys must keep kind, table, position order:\n{serialized}"
+        );
+        let reparsed = parse_prefab(&serialized).expect("canonical markers must parse");
+        assert_eq!(reparsed, prefab);
+        assert_eq!(
+            reparsed.to_toml_string(),
+            serialized,
+            "bytes must be idempotent"
+        );
+    }
+
+    #[test]
+    fn marker_errors_are_reported_with_pinned_text() {
+        let marker = |body: &str| format!("{MINIMAL}\n[[markers]]\n{body}");
+
+        assert_eq!(
+            parse_prefab(&marker(
+                "kind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0]\n"
+            )),
+            Err(PrefabError::InvalidMarkerPosition)
+        );
+        assert_eq!(
+            parse_prefab(&marker(
+                "kind = \"loot_chest\"\ntable = \"ruin\"\nposition = [2, 0, 0]\n"
+            )),
+            Err(PrefabError::MarkerOutside([2, 0, 0]))
+        );
+        assert_eq!(
+            parse_prefab(&marker("table = \"ruin\"\nposition = [0, 0, 0]\n")),
+            Err(PrefabError::MissingMarkerKind)
+        );
+        assert_eq!(
+            parse_prefab(&marker(
+                "kind = \"chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n"
+            )),
+            Err(PrefabError::UnknownMarkerKind("chest".to_owned()))
+        );
+        assert_eq!(
+            parse_prefab(&marker("kind = \"loot_chest\"\nposition = [0, 0, 0]\n")),
+            Err(PrefabError::MissingMarkerTable)
+        );
+        assert_eq!(
+            parse_prefab(&marker(
+                "kind = \"loot_chest\"\ntable = \"village\"\nposition = [0, 0, 0]\n"
+            )),
+            Err(PrefabError::UnknownMarkerTable("village".to_owned()))
+        );
+
+        let duplicate = format!(
+            "{MINIMAL}\n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n\
+             \n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n"
+        );
+        assert_eq!(
+            parse_prefab(&duplicate),
+            Err(PrefabError::DuplicateMarker([0, 0, 0]))
+        );
+
+        let non_array = MINIMAL.replace("size = [2, 1, 1]\n", "size = [2, 1, 1]\nmarkers = 3\n");
+        assert_eq!(parse_prefab(&non_array), Err(PrefabError::InvalidToml));
+        let non_table = MINIMAL.replace("size = [2, 1, 1]\n", "size = [2, 1, 1]\nmarkers = [3]\n");
+        assert_eq!(parse_prefab(&non_table), Err(PrefabError::InvalidToml));
+    }
+
+    #[test]
+    fn marker_error_display_texts_are_pinned() {
+        assert_eq!(
+            PrefabError::InvalidMarkerPosition.to_string(),
+            "marker position must be [x, y, z]"
+        );
+        assert_eq!(
+            PrefabError::MarkerOutside([1, -2, 3]).to_string(),
+            "marker position [1, -2, 3] is outside the prefab"
+        );
+        assert_eq!(
+            PrefabError::MissingMarkerKind.to_string(),
+            "missing marker kind"
+        );
+        assert_eq!(
+            PrefabError::UnknownMarkerKind("chest".to_owned()).to_string(),
+            "marker kind 'chest' is unknown"
+        );
+        assert_eq!(
+            PrefabError::MissingMarkerTable.to_string(),
+            "missing marker table"
+        );
+        assert_eq!(
+            PrefabError::UnknownMarkerTable("village".to_owned()).to_string(),
+            "marker table 'village' is unknown"
+        );
+        assert_eq!(
+            PrefabError::DuplicateMarker([1, -2, 3]).to_string(),
+            "duplicate marker at [1, -2, 3]"
         );
     }
 

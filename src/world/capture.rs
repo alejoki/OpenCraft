@@ -297,6 +297,8 @@ pub fn extract_prefab(
                 if !block.is_builtin() {
                     return Err(CaptureError::UnsupportedBlock { pos, block });
                 }
+                // A `LootChest` cell stays an ordinary grid block: capture never
+                // synthesizes a `[[markers]]` entry from it.
                 blocks.push(PrefabBlock {
                     position: [
                         (x - region.min.x) as u32,
@@ -315,6 +317,7 @@ pub fn extract_prefab(
         size,
         blocks,
         sockets,
+        markers: Vec::new(),
     })
 }
 
@@ -1025,6 +1028,7 @@ mod tests {
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         let existing = prefabs.join("renamed.toml");
         fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
@@ -1064,6 +1068,7 @@ mod tests {
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         fs::write(prefabs.join("renamed.toml"), declared.to_toml_string())
             .expect("write renamed prefab");

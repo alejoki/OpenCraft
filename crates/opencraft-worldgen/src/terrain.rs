@@ -4633,6 +4633,7 @@ mod tests {
             size: [5, 32, 5],
             blocks,
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         let definition = VillageDefinition {
             name: "tall".to_owned(),

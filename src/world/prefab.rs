@@ -52,4 +52,18 @@ layers = [
         );
         assert_eq!(parse_prefab(&text), Ok(prefab));
     }
+
+    #[test]
+    fn parse_prefab_exposes_markers_through_the_game_reexport() {
+        let text = format!(
+            "{STONE_PREFAB}\n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [1, 0, 0]\n"
+        );
+        let prefab = parse_prefab(&text).expect("marker prefab parses");
+        assert_eq!(prefab.markers.len(), 1);
+        assert_eq!(prefab.markers[0].position, [1, 0, 0]);
+        assert_eq!(prefab.markers[0].kind, MarkerKind::LootChest);
+        assert_eq!(prefab.markers[0].table, MarkerLootTable::Ruin);
+        assert_eq!(prefab.blocks.len(), 2, "markers stay out of the grid");
+        assert_eq!(parse_prefab(&prefab.to_toml_string()), Ok(prefab));
+    }
 }
