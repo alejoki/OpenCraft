@@ -112,7 +112,7 @@ use opencraft::settings::{
 use opencraft::startup::startup_session;
 use opencraft::startup::{
     build_session_registry, content_specs, effective_pack_stack, load_startup_stack,
-    reload_village_catalog, startup_session_with,
+    reload_worldgen_catalogs, startup_session_with,
 };
 use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
@@ -209,6 +209,7 @@ use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 use opencraft::world::terrain::{biome_at_seeded, generate_chunk_seeded_with, Biome};
 #[cfg(test)]
 use opencraft::world::terrain::{ruin_loot_chest_at, SEA_LEVEL};
+use opencraft::world::structure::StructureCatalog;
 use opencraft::world::village::VillageCatalog;
 use opencraft::world::vista;
 use opencraft::{random_seed, WorldSession};
@@ -313,14 +314,16 @@ fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
         .collect()
 }
 
-/// Render village/prefab catalog diagnostics as the same field/reason warning
+/// Render worldgen catalog diagnostics as the same field/reason warning
 /// shape every other startup problem uses.
 ///
 /// Every diagnostic is a logical `worldgen/<area>/<file>: <reason>` label, so
 /// the first `": "` separates the offending file (the warning's `field`) from
 /// the reason. A diagnostic that carries no separator still surfaces verbatim
-/// under the generic `worldgen` field rather than being dropped.
-fn village_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
+/// under the generic `worldgen` field rather than being dropped. The same
+/// split serves village and structure diagnostics: both label with
+/// `worldgen/<area>/<file>`.
+fn worldgen_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
     diagnostics
         .iter()
         .map(|diagnostic| match diagnostic.split_once(": ") {
@@ -1463,6 +1466,11 @@ struct StartupContent {
     /// opt-in `worldgen/` root; an empty catalog is generation-neutral, so a
     /// headless test that passes no root stays byte-identical.
     village_catalog: Arc<VillageCatalog>,
+    /// The runtime structure catalog (M019/S04). Loaded once from
+    /// `worldgen/structures`, overlaid by name on the compile-time builtin
+    /// master. `None` in a headless load (no `worldgen/` root): generation
+    /// then reaches the builtin master through the context's `None`.
+    structure_catalog: Option<Arc<StructureCatalog>>,
     /// The `worldgen/` root `village_catalog` was loaded from. `None` in
     /// headless tests (never read the repository tree); production keeps the
     /// real path so `attempt_create` can reload authored content without an
@@ -1543,19 +1551,21 @@ impl StartupContent {
         // join the same one-time warning path.
         let (base_registry, registry_report) = build_session_registry(&content_specs(&pack_specs));
         startup_warnings.extend(registry_warnings(&registry_report));
-        // Authored village/prefab catalog (M015/S03): fail-soft behind an
+        // Authored worldgen catalogs (M015/S03, M019/S04): fail-soft behind an
         // explicit opt-in root. A missing or broken tree degrades to an empty
-        // catalog plus data warnings, never a launch failure; diagnostics join
-        // the one-time warning path last, keeping the settings -> config ->
-        // packs -> sounds -> registry -> worldgen order.
-        let (village_catalog, village_diagnostics) = match worldgen_root {
+        // village catalog plus the structure builtin master, with data
+        // warnings, never a launch failure; diagnostics join the one-time
+        // warning path last, keeping the settings -> config -> packs -> sounds
+        // -> registry -> worldgen order. Both catalogs load in the same branch
+        // so a headless load reads no repository content at all.
+        let (village_catalog, structure_catalog, worldgen_diagnostics) = match worldgen_root {
             Some(root) => {
-                let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
-                (Arc::new(catalog), diagnostics)
+                let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+                (villages, Some(structures), diagnostics)
             }
-            None => (Arc::new(VillageCatalog::default()), Vec::new()),
+            None => (Arc::new(VillageCatalog::default()), None, Vec::new()),
         };
-        startup_warnings.extend(village_warnings(&village_diagnostics));
+        startup_warnings.extend(worldgen_warnings(&worldgen_diagnostics));
         StartupContent {
             settings,
             startup_warnings,
@@ -1570,6 +1580,7 @@ impl StartupContent {
             default_pack_enabled: restore_default,
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root: worldgen_root.map(Path::to_path_buf),
         }
     }
@@ -1802,6 +1813,11 @@ struct GameApp {
     /// generation-neutral, so a headless test that loads no `worldgen/` root
     /// keeps its pre-M015 witness bytes.
     village_catalog: Arc<VillageCatalog>,
+    /// The runtime structure catalog (M019/S04): installed on the startup
+    /// session and on every create/load swap alongside the village catalog.
+    /// `None` means generation falls through to the compile-time builtin
+    /// master, which is what a headless app with no `worldgen/` root runs.
+    structure_catalog: Option<Arc<StructureCatalog>>,
     /// The `worldgen/` root `village_catalog` was loaded from. `None` in
     /// headless tests (never read the repository tree); production keeps the
     /// real path so `attempt_create` can re-read authored content without an
@@ -1973,6 +1989,7 @@ impl GameApp {
             default_pack_enabled,
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root,
         } = content;
         // Effective gameplay rules apply before the first frame and are
@@ -1988,6 +2005,7 @@ impl GameApp {
         // playable session gets it; the menu background is scenery and keeps
         // none. An empty catalog (headless tests) is generation-neutral.
         session.set_village_catalog(Arc::clone(&village_catalog));
+        session.set_structure_catalog(structure_catalog.clone());
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -2230,6 +2248,7 @@ impl GameApp {
             creator_overlay_text: String::new(),
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -3337,6 +3356,7 @@ impl GameApp {
         // routes through the shared reset without this call, so installing
         // here (not in `on_session_installed`) keeps it village-free.
         session.set_village_catalog(Arc::clone(&self.village_catalog));
+        session.set_structure_catalog(self.structure_catalog.clone());
         // Settle the outgoing session's in-flight/pending streaming autosave
         // before the swap drops its state (M016/S02). Explicit saves keep
         // their own synchronous join-before-write path.
@@ -3883,15 +3903,17 @@ impl GameApp {
                 return;
             }
         };
-        // M015/S03: authored content is re-read on every create when
-        // production installed a `worldgen/` root, so a content edit lands
-        // without an app restart. A `None` root (headless tests) skips the
-        // reload entirely, keeping the suite isolated from the repository
-        // tree. Broken content degrades to one inline warning plus an empty
-        // catalog; it never blocks world creation.
+        // M015/S03 + M019/S04: authored content is re-read on every create
+        // when production installed a `worldgen/` root, so a village or
+        // structure edit lands without an app restart. A `None` root (headless
+        // tests) skips the reload entirely, keeping the suite isolated from the
+        // repository tree. Broken content degrades to one inline warning plus
+        // the fail-soft catalogs (empty villages, builtin structures); it never
+        // blocks world creation.
         if let Some(root) = self.worldgen_root.as_deref() {
-            let (catalog, diagnostics) = reload_village_catalog(root);
-            self.village_catalog = catalog;
+            let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+            self.village_catalog = villages;
+            self.structure_catalog = Some(structures);
             if !diagnostics.is_empty() {
                 self.new_game
                     .set_message(format!("worldgen: {}", diagnostics.join("; ")));
@@ -27558,6 +27580,10 @@ stack = 64
             "no opt-in root means no worldgen read"
         );
         assert!(
+            content.structure_catalog.is_none(),
+            "no opt-in root means generation reaches the builtin master via None"
+        );
+        assert!(
             content.worldgen_root.is_none(),
             "a headless load must not retain a reload root"
         );
@@ -27584,6 +27610,12 @@ stack = 64
 
         assert_eq!(content.village_catalog.len(), 1);
         assert_eq!(content.village_catalog.prefabs().len(), 3);
+        let structures = content
+            .structure_catalog
+            .as_ref()
+            .expect("the checked-in structures tree is opt-in content");
+        assert_eq!(structures.len(), 11, "eight oaks plus three ruins");
+        assert_eq!(structures.ruin(2).map(|prefab| prefab.name.as_str()), Some("ruin_wall_2"));
         assert_eq!(content.worldgen_root.as_deref(), Some(root));
         assert!(
             !content
@@ -27596,17 +27628,25 @@ stack = 64
     }
 
     #[test]
-    fn village_warnings_split_the_file_from_the_reason() {
-        let warnings = village_warnings(&[
+    fn worldgen_warnings_split_the_file_from_the_reason_for_both_families() {
+        let warnings = worldgen_warnings(&[
             "worldgen/villages/plains.toml: could not read file: boom".to_string(),
+            "worldgen/structures/ruin_wall_1.toml: ruin prefab size must be [5, 2, 5]"
+                .to_string(),
             "unlabelled diagnostic".to_string(),
         ]);
 
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 3);
         assert_eq!(warnings[0].field, "worldgen/villages/plains.toml");
         assert_eq!(warnings[0].reason, "could not read file: boom");
-        assert_eq!(warnings[1].field, "worldgen");
-        assert_eq!(warnings[1].reason, "unlabelled diagnostic");
+        assert_eq!(warnings[1].field, "worldgen/structures/ruin_wall_1.toml");
+        assert_eq!(
+            warnings[1].reason,
+            "ruin prefab size must be [5, 2, 5]",
+            "the same split serves structure labels"
+        );
+        assert_eq!(warnings[2].field, "worldgen");
+        assert_eq!(warnings[2].reason, "unlabelled diagnostic");
     }
 
     #[test]
@@ -27646,8 +27686,16 @@ stack = 64
             "the startup session must hold the launch catalog"
         );
         assert!(
+            app.session.world.structure_catalog().is_some_and(|catalog| catalog.len() == 11),
+            "the startup session must hold the runtime structure catalog"
+        );
+        assert!(
             app.background.world.village_catalog().is_none(),
             "the menu background is scenery and must never gain villages"
+        );
+        assert!(
+            app.background.world.structure_catalog().is_none(),
+            "the menu background must never gain structures either"
         );
     }
 
@@ -27683,38 +27731,69 @@ stack = 64
             Some(1),
             "every create/load swap must install the app catalog"
         );
+        assert!(
+            app.session
+                .world
+                .structure_catalog()
+                .is_some_and(|catalog| catalog.len() == 11),
+            "every create/load swap must install the structure catalog too"
+        );
     }
 
     #[test]
-    fn reload_village_catalog_reads_the_tree_each_call_and_never_caches() {
+    fn reload_worldgen_catalogs_reads_both_trees_each_call_and_never_caches() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
 
-        // Missing tree: valid empty content, no diagnostics.
-        let (catalog, diagnostics) = reload_village_catalog(root);
-        assert!(catalog.is_empty());
+        // Missing tree: valid empty village content, complete structure
+        // builtin master, no diagnostics.
+        let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+        assert!(villages.is_empty());
+        assert_eq!(structures.len(), 11, "the builtin master is always complete");
         assert!(diagnostics.is_empty(), "missing tree: {diagnostics:?}");
 
-        // One broken definition appears on disk: the next call sees it, which
-        // proves the reload is uncached and never blocks on bad content.
-        let villages = root.join("villages");
-        std::fs::create_dir_all(&villages).expect("create villages dir");
+        // One broken definition per family appears on disk: the next call sees
+        // both, proving the reload is uncached and never blocks on bad content.
+        let villages_dir = root.join("villages");
+        std::fs::create_dir_all(&villages_dir).expect("create villages dir");
         std::fs::write(
-            villages.join("broken.toml"),
+            villages_dir.join("broken.toml"),
             "format = 1\nname = \"broken\"\nbiomes = [\"plains\"]\nhub = \"missing_prefab\"\n",
         )
         .expect("write broken village");
+        let structures_dir = root.join("structures");
+        std::fs::create_dir_all(&structures_dir).expect("create structures dir");
+        std::fs::write(
+            structures_dir.join("ruin_wall_1.toml"),
+            "format = 1\nname = \"ruin_wall_1\"\norigin = [2, 0, 2]\nsize = [5, 2, 5]\n\nlayers = [\n  [ \"#####\", \".....\", \".....\", \".....\", \"#####\" ],\n  [ \".....\", \".....\", \".....\", \".....\", \".....\" ],\n]\n\n[palette]\n\"#\" = \"oak_log\"\n\n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n",
+        )
+        .expect("write broken structure");
 
-        let (catalog, diagnostics) = reload_village_catalog(root);
+        let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
         assert!(
-            catalog.is_empty(),
-            "broken content degrades to an empty catalog"
+            villages.is_empty(),
+            "broken village content degrades to an empty catalog"
         );
-        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(
+            structures.len(),
+            11,
+            "a rejected structure file keeps the builtin of that name"
+        );
+        assert_eq!(
+            structures.ruin(1).map(|prefab| prefab.size),
+            Some([5, 2, 5]),
+            "the builtin ruin_wall_1 still generates after the overlay rejection"
+        );
+        assert_eq!(diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
         assert!(
             diagnostics[0].starts_with("worldgen/villages/broken.toml: "),
-            "diagnostic keeps its logical label: {}",
+            "village diagnostics come first: {}",
             diagnostics[0]
+        );
+        assert!(
+            diagnostics[1].starts_with("worldgen/structures/ruin_wall_1.toml: "),
+            "structure diagnostics follow, labelled: {}",
+            diagnostics[1]
         );
     }
 
@@ -27731,18 +27810,22 @@ stack = 64
             .expect("attempt_create must precede confirm_pending_delete");
 
         let reload = body
-            .find("reload_village_catalog(")
+            .find("reload_worldgen_catalogs(")
             .expect("attempt_create must reload authored content");
         let build = body
             .find("WorldSession::new_session_with_mode_and_registry(")
             .expect("attempt_create must build the new session");
         assert!(
             reload < build,
-            "the reload must assign self.village_catalog before the session is built"
+            "the reload must assign both catalogs before the session is built"
         );
         assert!(
-            body.contains("self.village_catalog = catalog;"),
+            body.contains("self.village_catalog = villages;"),
             "the reload must replace the app catalog, not a local copy"
+        );
+        assert!(
+            body.contains("self.structure_catalog = Some(structures);"),
+            "the reload must reassign the structure catalog too"
         );
         assert!(
             body.contains("self.worldgen_root.as_deref()"),

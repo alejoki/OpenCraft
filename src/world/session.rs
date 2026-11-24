@@ -53,6 +53,7 @@ use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
 };
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
+use crate::world::structure::StructureCatalog;
 use crate::world::village::VillageCatalog;
 
 /// Maximum eye-to-block distance (blocks) at which a placed crafting table is
@@ -1192,6 +1193,18 @@ impl WorldSession {
             self.world_spawn.z.floor() as i32,
         );
         self.world.set_village_catalog(catalog, column);
+    }
+
+    /// Install the accepted structure catalog on this session's world.
+    ///
+    /// The structure catalog needs no derived state (unlike the village
+    /// catalog's spawn column), so this is a straight forwarding setter: every
+    /// create/load swap installs it next to [`Self::set_village_catalog`].
+    /// `None` returns generation to the compile-time builtin master; a
+    /// post-construction setter is safe because no chunk is generated before
+    /// the first `update_streaming`.
+    pub fn set_structure_catalog(&mut self, catalog: Option<Arc<StructureCatalog>>) {
+        self.world.set_structure_catalog(catalog);
     }
 
     /// Whether every chunk column that could hold a spawn candidate is
@@ -6316,6 +6329,35 @@ mod tests {
                 .village_catalog()
                 .is_some_and(|catalog| catalog.is_empty()),
             "the installed catalog is the one the caller passed"
+        );
+    }
+
+    #[test]
+    fn set_structure_catalog_forwards_to_the_world_and_none_stays_none() {
+        let mut session = WorldSession::new_session(
+            14,
+            PathBuf::from("/nonexistent/structure.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert!(
+            session.world.structure_catalog().is_none(),
+            "constructors stay on the builtin master path"
+        );
+
+        let installed = Arc::new(StructureCatalog::builtin().clone());
+        session.set_structure_catalog(Some(Arc::clone(&installed)));
+        assert!(
+            matches!(
+                session.world.structure_catalog(),
+                Some(current) if Arc::ptr_eq(current, &installed)
+            ),
+            "the session must install the exact handle it was given"
+        );
+
+        session.set_structure_catalog(None);
+        assert!(
+            session.world.structure_catalog().is_none(),
+            "clearing forwards None back to the builtin master"
         );
     }
 

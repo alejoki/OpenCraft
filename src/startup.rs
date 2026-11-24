@@ -18,6 +18,7 @@ use crate::settings::SettingsWarning;
 use crate::world::daycycle::GameClock;
 use crate::world::persistence::{load_world_from_path_with, CliConfig, DEFAULT_TIME_SCALE};
 use crate::world::session::WorldSession;
+use crate::world::structure::StructureCatalog;
 use crate::world::terrain::DEFAULT_WORLD_SEED;
 use crate::world::village::VillageCatalog;
 
@@ -105,12 +106,30 @@ pub fn build_session_registry(specs: &[PackSpec]) -> (Arc<ContentRegistry>, Cont
     (Arc::new(registry), report)
 }
 
-/// Re-read the authored village/prefab catalog from `root`.
+/// Re-read every authored worldgen catalog from `root`.
 ///
-/// Wraps [`VillageCatalog::load_sorted`] so `attempt_create` can pick up
-/// content edits without an app restart and tests can exercise the reload in
-/// isolation. Deliberately uncached: each call re-walks the tree, which is the
-/// point of the reload seam.
+/// Wraps [`VillageCatalog::load_sorted`] and [`StructureCatalog::load_sorted`]
+/// so `attempt_create` can pick up content edits without an app restart and
+/// tests can exercise the reload in isolation. Deliberately uncached: each
+/// call re-walks both trees, which is the point of the reload seam.
+///
+/// Diagnostics are returned village-first, then structure, so the warning list
+/// a caller renders from is stable across runs and catalog families. Both
+/// loaders are fail-soft: a broken tree degrades to the builtin master for
+/// structures and an empty catalog for villages, never an error.
+pub fn reload_worldgen_catalogs(
+    root: &Path,
+) -> (Arc<VillageCatalog>, Arc<StructureCatalog>, Vec<String>) {
+    let (villages, mut diagnostics) = VillageCatalog::load_sorted(root);
+    let (structures, structure_diagnostics) = StructureCatalog::load_sorted(root);
+    diagnostics.extend(structure_diagnostics);
+    (Arc::new(villages), Arc::new(structures), diagnostics)
+}
+
+/// Village-only reload retained for the capture digest demo
+/// (`crate::demo::digests`), which pins its own diagnostic count and
+/// deliberately never looks at the structure family. Production reload paths
+/// use [`reload_worldgen_catalogs`].
 pub fn reload_village_catalog(root: &Path) -> (Arc<VillageCatalog>, Vec<String>) {
     let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
     (Arc::new(catalog), diagnostics)

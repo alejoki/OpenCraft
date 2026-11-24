@@ -50,7 +50,9 @@ pub use opencraft_worldgen::tree::{
 /// pre-M015 generator byte-for-byte), `spawn_column` lets a caller that
 /// already knows the spawn skip the bounded [`find_spawn_column`] search when
 /// the village planner needs it, and `structures` is the optional accepted
-/// structure catalog (`None` means the compile-time builtin master).
+/// structure catalog: `None` reproduces the compile-time builtin master
+/// exactly (every headless call and every pre-M019 world), while `Some`
+/// overlays the runtime `worldgen/structures` content by name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorldGenContext<'a> {
     pub rules: &'a [WorldgenRule],
