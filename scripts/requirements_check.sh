@@ -4,7 +4,7 @@
 # Validates the checked-in REQUIREMENTS-REGISTRY.md:
 #   1. the registry file exists,
 #   2. every "### R### — ..." record parses into the nine contract bullets,
-#   3. exactly R001-R103 appear once each, with no duplicate or malformed IDs,
+#   3. exactly R001-R107 appear once each, with no duplicate or malformed IDs,
 #   4. required fields are non-empty and Status is exactly "active" or
 #      "superseded" with a Superseded by: M###/S## line; R005's deliberate
 #      M007/S01 supersession and R033's deliberate M008/S06 supersession are
@@ -14,7 +14,7 @@
 #      M004 for R016-R020, M005 for R021-R026, M007 for R027-R034,
 #      M008 for R035-R044, M009 for R045-R054, M013 for R055-R061,
 #      M010 for R062-R070, M014 for R071-R081, M015 for R082-R088,
-#      M017 for R089-R092, M018 for R093-R098, and M019 for R099-R103,
+#      M017 for R089-R092, M018 for R093-R098, and M019 for R099-R107,
 #   6. every M003, M004, M005, M007, M008, M009, M013, M010, M014, M015, M017,
 #      M018 and M019 slice is covered by at least one mapped record,
 #   7. the M003 (criteria 1-5), M004 (criteria 1-7), M005 (criteria 1-8),
@@ -43,8 +43,11 @@
 # cites R089 and R090 as the fixed prior support set, so the M018 ownership
 # assertion accepts those two prior rows in addition to M018-owned records.
 #
-# M019 likewise only appends: R099-R103 are owned by M019/S05 and its seven-row
-# trace cites only M019-owned records, so no prior support set is needed.
+# M019 likewise only appends: R099-R103 are owned by M019/S05 and R104-R107 by
+# M019/S02, M019/S04, M019/S01 and M019/S03 respectively; its seven-row trace
+# cites only M019-owned records, so no prior support set is needed. R063 and
+# R076/R077 are marked superseded by M019/S01 and M019/S03 because the shipped
+# v3 surface retires their v2 wording; D220 leaves their bodies byte-identical.
 #
 # REQUIREMENTS_FILE overrides the registry path (used by the negative-path
 # selftest). The default is <repo-root>/REQUIREMENTS-REGISTRY.md.
@@ -126,7 +129,7 @@ END { flush() }
 ' "$REGISTRY" > "$record_tmp"
 
 # ---------------------------------------------------------------------------
-# 3. Exactly 103 unique R001-R103 records.
+# 3. Exactly 107 unique R001-R107 records.
 # ---------------------------------------------------------------------------
 declare -A seen=()
 declare -A class_of=()
@@ -158,14 +161,14 @@ while IFS='|' read -r id class status desc why src own supp val supe; do
     record_count=$((record_count + 1))
 done < "$record_tmp"
 
-[[ "$record_count" -eq 103 ]] || fail "expected 103 requirement records, found $record_count"
+[[ "$record_count" -eq 107 ]] || fail "expected 107 requirement records, found $record_count"
 
-for n in $(seq 1 103); do
+for n in $(seq 1 107); do
     id="$(printf 'R%03d' "$n")"
     [[ -n "${seen[$id]:-}" ]] || fail "missing requirement record: $id"
 done
 
-pass "103 requirement records R001-R103 present exactly once with unique IDs"
+pass "107 requirement records R001-R107 present exactly once with unique IDs"
 
 # ---------------------------------------------------------------------------
 # 4. Required fields are non-empty; Status is exactly "active" or
@@ -220,6 +223,24 @@ for id in R091 R092; do
         || fail "$id must name M018/S08 as its superseding slice, got '${supe_of[$id]}'"
 done
 pass "R091/R092 record the deliberate M018/S08 supersessions"
+
+# M019 retires the v2 wording of three earlier records without editing their
+# bodies: R063 (v2 load path) is replaced by R106 and R076/R077 (v2 labels on
+# the live reload surfaces) by R107. Pin the supersessions so a silent revert
+# to active cannot resurrect a claim the shipped v3 gate refuses.
+for id in R063; do
+    [[ "${status_of[$id]}" == "superseded" ]] \
+        || fail "$id must record its deliberate M019/S01 supersession (got '${status_of[$id]}')"
+    [[ "${supe_of[$id]}" == "M019/S01" ]] \
+        || fail "$id must name M019/S01 as its superseding slice, got '${supe_of[$id]}'"
+done
+for id in R076 R077; do
+    [[ "${status_of[$id]}" == "superseded" ]] \
+        || fail "$id must record its deliberate M019/S03 supersession (got '${status_of[$id]}')"
+    [[ "${supe_of[$id]}" == "M019/S03" ]] \
+        || fail "$id must name M019/S03 as its superseding slice, got '${supe_of[$id]}'"
+done
+pass "R063/R076/R077 record the deliberate M019 v3 supersessions"
 
 # ---------------------------------------------------------------------------
 # 5. Ownership: R001-R004 -> M001 or M002; R005-R015 -> M003; R016-R020 -> M004;
@@ -318,13 +339,13 @@ for n in $(seq 93 98); do
         || fail "$id is not owned by M018 (owner/supporting: '$text')"
 done
 
-for n in $(seq 99 103); do
+for n in $(seq 99 107); do
     id="$(printf 'R%03d' "$n")"
     text="${owner_of[$id]} ${supp_of[$id]}"
     [[ "$text" == *"M019"* ]] \
         || fail "$id is not owned by M019 (owner/supporting: '$text')"
 done
-pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, M004 for R016-R020, M005 for R021-R026, M007 for R027-R034, M008 for R035-R044, M009 for R045-R054, M013 for R055-R061, M010 for R062-R070, M014 for R071-R081, M015 for R082-R088, M017 for R089-R092, M018 for R093-R098, and M019 for R099-R103"
+pass "ownership matches M001/M002 for R001-R004, M003 for R005-R015, M004 for R016-R020, M005 for R021-R026, M007 for R027-R034, M008 for R035-R044, M009 for R045-R054, M013 for R055-R061, M010 for R062-R070, M014 for R071-R081, M015 for R082-R088, M017 for R089-R092, M018 for R093-R098, and M019 for R099-R107"
 
 # ---------------------------------------------------------------------------
 # 6. M003 slice coverage. A mapping counts when the slice token appears in the
@@ -519,14 +540,16 @@ has_slice R098 M018/S08 || fail "no requirement maps to M018/S08 (expected R098)
 pass "M018 slices S01-S08 are each mapped to at least one requirement"
 
 # ---------------------------------------------------------------------------
-# 6m. M019 slice coverage. Assert a specific record per slice so R099-R103's
+# 6m. M019 slice coverage. Assert a specific record per slice so R099-R107's
 #     shared supporting lists cannot mask a broken row.
 # ---------------------------------------------------------------------------
 has_slice R099 M019/S01 || fail "no requirement maps to M019/S01 (expected R099)"
-has_slice R102 M019/S02 || fail "no requirement maps to M019/S02 (expected R102)"
+has_slice R104 M019/S02 || fail "no requirement maps to M019/S02 (expected R104)"
 has_slice R100 M019/S03 || fail "no requirement maps to M019/S03 (expected R100)"
-has_slice R102 M019/S04 || fail "no requirement maps to M019/S04 (expected R102)"
+has_slice R105 M019/S04 || fail "no requirement maps to M019/S04 (expected R105)"
 has_slice R099 M019/S05 || fail "no requirement maps to M019/S05 (expected R099)"
+has_slice R106 M019/S01 || fail "no requirement maps to M019/S01 (expected R106)"
+has_slice R107 M019/S03 || fail "no requirement maps to M019/S03 (expected R107)"
 pass "M019 slices S01-S05 are each mapped to at least one requirement"
 
 # ---------------------------------------------------------------------------
@@ -1383,11 +1406,11 @@ while IFS='|' read -r c r s e; do
 done < "$criteria_m19_tmp"
 
 declare -A expected_req_m19=(
-    [1]="R102"
-    [2]="R099,R100"
+    [1]="R104,R102"
+    [2]="R099,R100,R106"
     [3]="R100"
-    [4]="R103"
-    [5]="R102"
+    [4]="R103,R106"
+    [5]="R105,R102"
     [6]="R099,R100,R101"
     [7]="R102,R103"
 )

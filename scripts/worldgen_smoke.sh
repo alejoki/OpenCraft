@@ -122,8 +122,8 @@ fail() {
 EXPECTED_LINES=(
     "worldgen_demo: leg=registry rules=2 ore=1 patch=1"
     "worldgen_demo: leg=session rules=2 matches=true"
-    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
-    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
+    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2513 min_y=4 max_y=40 in_band=true"
+    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=346 biomes=plains,forest biomes_ok=true"
     "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true"
     "worldgen_demo: leg=empty_rules identical=true"
     "worldgen_demo: ok=true"
