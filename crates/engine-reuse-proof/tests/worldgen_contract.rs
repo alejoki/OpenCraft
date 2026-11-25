@@ -12,9 +12,10 @@ use opencraft_worldgen::prefab::PrefabError;
 
 /// The whole measured terrain line, not a substring: any generation drift is a
 /// contract break and must be re-pinned deliberately. Measured from a real
-/// `cargo run -q -p engine-reuse-proof --locked`.
+/// `cargo run -q -p engine-reuse-proof --locked`; re-pinned once by M019/S04
+/// when oak output moved to authored prefab cells (D351).
 const TERRAIN_LINE: &str =
-    "worldgen.terrain=chunks=4,uniform=1,non_air=53951,digest=0xa13b53f3403b98bf";
+    "worldgen.terrain=chunks=4,uniform=1,non_air=53962,digest=0x82d150a679497058";
 
 /// The whole measured village line, not a substring: any plan change is a
 /// contract break and must be re-pinned deliberately.
@@ -32,11 +33,11 @@ fn worldgen_proof_plans_a_linked_village() {
     assert_eq!(proof.terrain_chunks, 4, "four measured terrain chunks");
     assert_eq!(proof.terrain_uniform, 1, "only the sky chunk is uniform");
     assert_eq!(
-        proof.terrain_non_air, 53_951,
+        proof.terrain_non_air, 53_962,
         "pinned non-air cells across the four chunks"
     );
     assert_eq!(
-        proof.terrain_digest, 0xa13b_53f3_403b_98bf,
+        proof.terrain_digest, 0x82d1_50a6_7949_7058,
         "pinned terrain digest in game baseline order"
     );
 

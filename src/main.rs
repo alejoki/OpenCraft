@@ -54,8 +54,9 @@ use opencraft::demo::content::{content_demo_step, ContentDemo, CONTENT_DEMO_DEAD
 #[cfg(test)]
 use opencraft::demo::digests::crafting_demo_grid;
 use opencraft::demo::digests::{
-    capture_demo_lines, crafting_demo_lines, demo_restart_lines, demo_save_v10_lines,
-    palette_demo_lines, presentation_demo_lines, village_demo_lines, worldgen_demo_lines,
+    atlas_demo_lines, capture_demo_lines, crafting_demo_lines, demo_restart_lines,
+    demo_save_v10_lines, external_pack_demo_lines, palette_demo_lines, presentation_demo_lines,
+    village_demo_lines, worldgen_demo_lines,
 };
 #[cfg(test)]
 use opencraft::demo::survival::SurvivalStage;
@@ -111,7 +112,8 @@ use opencraft::settings::{
 #[cfg(test)]
 use opencraft::startup::startup_session;
 use opencraft::startup::{
-    build_session_registry, load_startup_stack, reload_village_catalog, startup_session_with,
+    build_session_registry, content_specs, effective_pack_stack, load_startup_stack,
+    reload_worldgen_catalogs, startup_session_with,
 };
 use opencraft::ui::capture::{capture_notice_line, CaptureKey, CornerOutcome, PrefabCapture};
 use opencraft::ui::chest::{
@@ -202,6 +204,7 @@ use opencraft::world::season::{season_of, weather_of_with, Weather};
 use opencraft::world::session::{BowFireError, ChestCommandError};
 #[cfg(test)]
 use opencraft::world::spawning::{SpawnReport, MAX_MOBS_TOTAL};
+use opencraft::world::structure::StructureCatalog;
 #[cfg(test)]
 use opencraft::world::terrain::DEFAULT_WORLD_SEED;
 #[cfg(test)]
@@ -312,14 +315,16 @@ fn registry_warnings(report: &ContentLoadReport) -> Vec<SettingsWarning> {
         .collect()
 }
 
-/// Render village/prefab catalog diagnostics as the same field/reason warning
+/// Render worldgen catalog diagnostics as the same field/reason warning
 /// shape every other startup problem uses.
 ///
 /// Every diagnostic is a logical `worldgen/<area>/<file>: <reason>` label, so
 /// the first `": "` separates the offending file (the warning's `field`) from
 /// the reason. A diagnostic that carries no separator still surfaces verbatim
-/// under the generic `worldgen` field rather than being dropped.
-fn village_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
+/// under the generic `worldgen` field rather than being dropped. The same
+/// split serves village and structure diagnostics: both label with
+/// `worldgen/<area>/<file>`.
+fn worldgen_warnings(diagnostics: &[String]) -> Vec<SettingsWarning> {
     diagnostics
         .iter()
         .map(|diagnostic| match diagnostic.split_once(": ") {
@@ -1449,6 +1454,11 @@ struct StartupContent {
     /// this bundle keeps one source of truth for production and tests.
     settings_path: PathBuf,
     packs_root: PathBuf,
+    /// Whether production startup owns the implicit shipped default pack.
+    /// When true, `GameApp::effective_stack` resolves the restore-aware
+    /// `["default", ..raw]` stack on every live apply; when false (headless
+    /// tests and demos) the raw persisted stack is used verbatim.
+    default_pack_enabled: bool,
     /// The launch pack-stack registry: the immutable base every loaded session
     /// and every newly created world is resolved against. It is replaced only
     /// by a pack-stack change, and then only for the NEXT load (MEM512).
@@ -1457,6 +1467,11 @@ struct StartupContent {
     /// opt-in `worldgen/` root; an empty catalog is generation-neutral, so a
     /// headless test that passes no root stays byte-identical.
     village_catalog: Arc<VillageCatalog>,
+    /// The runtime structure catalog (M019/S04). Loaded once from
+    /// `worldgen/structures`, overlaid by name on the compile-time builtin
+    /// master. `None` in a headless load (no `worldgen/` root): generation
+    /// then reaches the builtin master through the context's `None`.
+    structure_catalog: Option<Arc<StructureCatalog>>,
     /// The `worldgen/` root `village_catalog` was loaded from. `None` in
     /// headless tests (never read the repository tree); production keeps the
     /// real path so `attempt_create` can reload authored content without an
@@ -1476,6 +1491,7 @@ impl StartupContent {
         packs_root: PathBuf,
         config_dir: Option<&Path>,
         worldgen_root: Option<&Path>,
+        restore_default: bool,
     ) -> StartupContent {
         // Startup settings load: never blocks launch — a missing or corrupt
         // settings.toml yields defaults plus structured warnings, surfaced
@@ -1491,14 +1507,32 @@ impl StartupContent {
             None => ConfigRuntime::defaults(),
         };
         startup_warnings.extend(opencraft::config::startup_warnings(&config));
+        // Shipped default restore (M019/S02): production startup fills only
+        // absent files under `packs/default` and repairs only an unusable
+        // manifest, then resolves the implicit first presentation entry. The
+        // restore never overwrites present bytes, so an edited pack survives.
+        // Its notices join the same one-time first-Settings-open path as every
+        // other startup warning (MEM009). Headless tests and demos pass
+        // `false`, keeping their temp roots untouched and reading no
+        // repository pack tree beyond what they already inject.
+        if restore_default {
+            let restore = pack::defaults::ensure_default_pack(&packs_root);
+            startup_warnings.extend(restore.warnings);
+        }
         // Pack discovery and startup apply (M004/S03): the persisted choice
         // is re-applied on every launch. A missing/deleted pack folder still
         // yields a fully usable procedural pack plus one warning naming it,
         // surfaced through the existing first-Settings-open message path
-        // (D031/MEM121, MEM009: warnings are data, never logs).
+        // (D031/MEM121, MEM009: warnings are data, never logs). Discovery runs
+        // after the restore so the shipped default is never listed as a row.
         let available_packs = pack::available_pack_names(&packs_root);
+        let startup_stack = if restore_default {
+            effective_pack_stack(&packs_root, &settings.pack_stack)
+        } else {
+            settings.pack_stack.clone()
+        };
         let (current_pack, pack_specs, pack_warnings) =
-            load_startup_stack(&packs_root, &settings.pack_stack);
+            load_startup_stack(&packs_root, &startup_stack);
         startup_warnings.extend(pack_warnings);
         // Startup sound overrides (M005/S05): resolved independently of the
         // texture result, so a pack whose layers partially failed still
@@ -1512,22 +1546,27 @@ impl StartupContent {
         startup_warnings.extend(sound_warnings);
         // Session content registry (M010/S02): built once from the ordered
         // stack over the built-in table, then frozen for the whole session.
-        // Registry diagnostics join the same one-time warning path.
-        let (base_registry, registry_report) = build_session_registry(&pack_specs);
+        // The implicit shipped default is presentation-only and is excluded
+        // from save/registry identity (D340-D342), so `digest()` and `packs()`
+        // stay byte-identical to the built-in registry. Registry diagnostics
+        // join the same one-time warning path.
+        let (base_registry, registry_report) = build_session_registry(&content_specs(&pack_specs));
         startup_warnings.extend(registry_warnings(&registry_report));
-        // Authored village/prefab catalog (M015/S03): fail-soft behind an
+        // Authored worldgen catalogs (M015/S03, M019/S04): fail-soft behind an
         // explicit opt-in root. A missing or broken tree degrades to an empty
-        // catalog plus data warnings, never a launch failure; diagnostics join
-        // the one-time warning path last, keeping the settings -> config ->
-        // packs -> sounds -> registry -> worldgen order.
-        let (village_catalog, village_diagnostics) = match worldgen_root {
+        // village catalog plus the structure builtin master, with data
+        // warnings, never a launch failure; diagnostics join the one-time
+        // warning path last, keeping the settings -> config -> packs -> sounds
+        // -> registry -> worldgen order. Both catalogs load in the same branch
+        // so a headless load reads no repository content at all.
+        let (village_catalog, structure_catalog, worldgen_diagnostics) = match worldgen_root {
             Some(root) => {
-                let (catalog, diagnostics) = VillageCatalog::load_sorted(root);
-                (Arc::new(catalog), diagnostics)
+                let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+                (villages, Some(structures), diagnostics)
             }
-            None => (Arc::new(VillageCatalog::default()), Vec::new()),
+            None => (Arc::new(VillageCatalog::default()), None, Vec::new()),
         };
-        startup_warnings.extend(village_warnings(&village_diagnostics));
+        startup_warnings.extend(worldgen_warnings(&worldgen_diagnostics));
         StartupContent {
             settings,
             startup_warnings,
@@ -1539,8 +1578,10 @@ impl StartupContent {
             audio,
             settings_path: settings_path.to_path_buf(),
             packs_root,
+            default_pack_enabled: restore_default,
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root: worldgen_root.map(Path::to_path_buf),
         }
     }
@@ -1728,6 +1769,11 @@ struct GameApp {
     /// `saves/` and `settings.toml`. Injected by tests like
     /// `settings_path`.
     packs_root: PathBuf,
+    /// Whether production startup owns the implicit shipped default pack.
+    /// Enabled resolves `["default", ..raw]` on every live stack apply, so a
+    /// texture-only default edit can never make the presentation vanish;
+    /// disabled (headless tests and demos) uses the raw persisted stack.
+    default_pack_enabled: bool,
     /// Sorted pack names discovered under `packs_root` at startup. Cycling
     /// walks this list; a pack authored while the game is running appears
     /// on the next launch (no filesystem polling in the menu).
@@ -1768,6 +1814,11 @@ struct GameApp {
     /// generation-neutral, so a headless test that loads no `worldgen/` root
     /// keeps its pre-M015 witness bytes.
     village_catalog: Arc<VillageCatalog>,
+    /// The runtime structure catalog (M019/S04): installed on the startup
+    /// session and on every create/load swap alongside the village catalog.
+    /// `None` means generation falls through to the compile-time builtin
+    /// master, which is what a headless app with no `worldgen/` root runs.
+    structure_catalog: Option<Arc<StructureCatalog>>,
     /// The `worldgen/` root `village_catalog` was loaded from. `None` in
     /// headless tests (never read the repository tree); production keeps the
     /// real path so `attempt_create` can re-read authored content without an
@@ -1909,6 +1960,7 @@ impl GameApp {
             Path::new(pack::PACKS_DIR).to_path_buf(),
             None,
             None,
+            false,
         );
         Self::new_with_content(cli, session, content, background_path)
     }
@@ -1935,8 +1987,10 @@ impl GameApp {
             audio,
             settings_path,
             packs_root,
+            default_pack_enabled,
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root,
         } = content;
         // Effective gameplay rules apply before the first frame and are
@@ -1952,6 +2006,7 @@ impl GameApp {
         // playable session gets it; the menu background is scenery and keeps
         // none. An empty catalog (headless tests) is generation-neutral.
         session.set_village_catalog(Arc::clone(&village_catalog));
+        session.set_structure_catalog(structure_catalog.clone());
         // Startup screen (app-state routing): a CLI world intent — the
         // exact three-flag disjunction in `cli_has_world_intent` — enters
         // gameplay directly, bypassing every menu screen (preserving every
@@ -2113,10 +2168,15 @@ impl GameApp {
         // this instant so a launch-time edit is never re-applied.
         let pack_presentation =
             current_pack.map(|pack| PackPresentation::build(pack, pack_specs, &base_registry));
+        let startup_stack = if default_pack_enabled {
+            effective_pack_stack(&packs_root, &settings.pack_stack)
+        } else {
+            settings.pack_stack.clone()
+        };
         let pack_watch = build_pack_watch(
             pack_presentation.as_ref(),
             &packs_root,
-            &settings.pack_stack,
+            &startup_stack,
             Instant::now(),
         );
         let selection_seconds = config.rules().selection.selected_name_secs;
@@ -2173,6 +2233,7 @@ impl GameApp {
             message_tick_timer: Instant::now(),
             settings_path,
             packs_root,
+            default_pack_enabled,
             available_packs,
             pack_presentation,
             pack_watch,
@@ -2188,6 +2249,7 @@ impl GameApp {
             creator_overlay_text: String::new(),
             base_registry,
             village_catalog,
+            structure_catalog,
             worldgen_root,
             pack_presentation_dirty: false,
             packs_message: None,
@@ -2571,9 +2633,10 @@ impl GameApp {
         // installed spec so a folder that was missing at install cannot start
         // contributing content just because it exists now. Order is the
         // frozen stack order, which is what the registry digest encodes.
-        let mut candidate_specs = Vec::with_capacity(self.settings.pack_stack.len());
+        let effective_stack = self.effective_stack();
+        let mut candidate_specs = Vec::with_capacity(effective_stack.len());
         let mut found_target = false;
-        for folder in &self.settings.pack_stack {
+        for folder in &effective_stack {
             if folder == &entry.folder {
                 candidate_specs.push(pack::spec::load_spec_from_dir(
                     &self.packs_root.join(folder),
@@ -2588,7 +2651,7 @@ impl GameApp {
             return;
         }
 
-        let (candidate, _report) = build_session_registry(&candidate_specs);
+        let (candidate, _report) = build_session_registry(&content_specs(&candidate_specs));
         let candidate_fingerprint = ContentFingerprint::from_registry(&candidate);
         let changed = candidate_fingerprint != installed_fingerprint;
         if changed {
@@ -2671,10 +2734,11 @@ impl GameApp {
         // poll clock: the table update already consumed the current bytes, so
         // the next real edit — not this manifest write — settles.
         if paths_changed {
+            let effective_stack = self.effective_stack();
             self.pack_watch = build_pack_watch(
                 self.pack_presentation.as_ref(),
                 &self.packs_root,
-                &self.settings.pack_stack,
+                &effective_stack,
                 now,
             );
         }
@@ -2963,21 +3027,39 @@ impl GameApp {
         save_settings_or_warn(&mut self.menu, &self.settings, &self.settings_path);
     }
 
+    /// The resolved stack this app presents and watches.
+    ///
+    /// Production startup owns the shipped default (implicit, first, never in
+    /// `settings.pack_stack`); tests and demos that opted out use the raw
+    /// persisted stack verbatim. Readiness is re-checked on every call so a
+    /// deleted default folder stops contributing without leaving a phantom
+    /// entry behind.
+    fn effective_stack(&self) -> Vec<String> {
+        if self.default_pack_enabled {
+            effective_pack_stack(&self.packs_root, &self.settings.pack_stack)
+        } else {
+            self.settings.pack_stack.clone()
+        }
+    }
+
     /// Reload the ordered stack and apply every live surface: merged layers,
     /// logo, tunes, and the Packs screen's warning message. The session's
     /// content registry is deliberately NOT replaced (MEM512); the candidate
     /// becomes the new `base_registry` for the NEXT load, and a changed
     /// definition digest only warns that content applies on the next load.
     fn apply_pack_stack(&mut self) {
-        let (loaded, specs, mut warnings) =
-            load_startup_stack(&self.packs_root, &self.settings.pack_stack);
+        let stack = self.effective_stack();
+        let (loaded, specs, mut warnings) = load_startup_stack(&self.packs_root, &stack);
         // Sound resolution is independent of the texture result and applies
         // live: the never-fail resolver starts from the synthesized set and
         // overlays only authored slots in stack order.
         let (sounds, sound_warnings) = pack::sound::resolve_sounds(&specs);
         self.audio.set_buffers(sounds);
         warnings.extend(sound_warnings);
-        let (candidate, report) = build_session_registry(&specs);
+        // The implicit default is presentation-only: identity uses the
+        // remaining specs, so its digest and `packs()` never enter save or
+        // registry identity (D340-D342).
+        let (candidate, report) = build_session_registry(&content_specs(&specs));
         warnings.extend(registry_warnings(&report));
         let changed = candidate.digest() != self.base_registry.digest();
 
@@ -2994,7 +3076,7 @@ impl GameApp {
         self.pack_watch = build_pack_watch(
             self.pack_presentation.as_ref(),
             &self.packs_root,
-            &self.settings.pack_stack,
+            &stack,
             Instant::now(),
         );
         self.creator.pack_status = None;
@@ -3275,6 +3357,7 @@ impl GameApp {
         // routes through the shared reset without this call, so installing
         // here (not in `on_session_installed`) keeps it village-free.
         session.set_village_catalog(Arc::clone(&self.village_catalog));
+        session.set_structure_catalog(self.structure_catalog.clone());
         // Settle the outgoing session's in-flight/pending streaming autosave
         // before the swap drops its state (M016/S02). Explicit saves keep
         // their own synchronous join-before-write path.
@@ -3821,15 +3904,17 @@ impl GameApp {
                 return;
             }
         };
-        // M015/S03: authored content is re-read on every create when
-        // production installed a `worldgen/` root, so a content edit lands
-        // without an app restart. A `None` root (headless tests) skips the
-        // reload entirely, keeping the suite isolated from the repository
-        // tree. Broken content degrades to one inline warning plus an empty
-        // catalog; it never blocks world creation.
+        // M015/S03 + M019/S04: authored content is re-read on every create
+        // when production installed a `worldgen/` root, so a village or
+        // structure edit lands without an app restart. A `None` root (headless
+        // tests) skips the reload entirely, keeping the suite isolated from the
+        // repository tree. Broken content degrades to one inline warning plus
+        // the fail-soft catalogs (empty villages, builtin structures); it never
+        // blocks world creation.
         if let Some(root) = self.worldgen_root.as_deref() {
-            let (catalog, diagnostics) = reload_village_catalog(root);
-            self.village_catalog = catalog;
+            let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+            self.village_catalog = villages;
+            self.structure_catalog = Some(structures);
             if !diagnostics.is_empty() {
                 self.new_game
                     .set_message(format!("worldgen: {}", diagnostics.join("; ")));
@@ -7168,6 +7253,46 @@ impl ApplicationHandler for GameApp {
     }
 }
 
+/// Pre-flight guard for the `--demo-external-pack <dir>` launch switch.
+///
+/// Returns `Ok(None)` for every other launch, the directory when the demo is
+/// requested, and a user-facing error line when the request is malformed. The
+/// rule is deliberately strict: the demo is a one-shot headless proof, so it
+/// refuses a world intent (`--new`) and a missing directory instead of
+/// silently opening a window or falling through to a normal launch.
+fn external_pack_demo_request(cli: &CliConfig) -> Result<Option<&Path>, &'static str> {
+    let Some(dir) = cli.demo_external_pack.as_deref() else {
+        return Ok(None);
+    };
+    if cli.force_new_world {
+        return Err("--demo-external-pack cannot be combined with --new");
+    }
+    if dir.as_os_str().is_empty() {
+        return Err("--demo-external-pack requires a pack directory");
+    }
+    Ok(Some(dir))
+}
+
+/// Pre-flight guard for the `--demo-atlas <dir>` launch switch.
+///
+/// Returns `Ok(None)` for every other launch, the output directory when the
+/// atlas artifact is requested, and a user-facing error line when the request
+/// is malformed. Like the external-pack guard it is deliberately strict: the
+/// atlas is a one-shot headless artifact, so it refuses a world intent
+/// (`--new`) and a missing directory instead of silently opening a window.
+fn atlas_demo_request(cli: &CliConfig) -> Result<Option<&Path>, &'static str> {
+    let Some(dir) = cli.demo_atlas.as_deref() else {
+        return Ok(None);
+    };
+    if cli.force_new_world {
+        return Err("--demo-atlas cannot be combined with --new");
+    }
+    if dir.as_os_str().is_empty() {
+        return Err("--demo-atlas requires an output directory");
+    }
+    Ok(Some(dir))
+}
+
 fn main() {
     let cli = CliConfig::parse_args(std::env::args().skip(1));
 
@@ -7228,13 +7353,14 @@ fn main() {
     }
 
     // `--validate-worldgen [dir]` is a headless, pre-startup short-circuit:
-    // it walks the optional worldgen root (default `worldgen`), prints one
-    // stable per-prefab line plus a summary, and exits 0/1 without a session,
-    // event loop, window, GPU, save, settings file or pack stack. It is a
-    // release-facing launch switch (D245): unlike `--check-config` and
-    // `--creator-trace` it is deliberately not release-gated.
+    // it walks the optional worldgen root (default `worldgen`), prints stable
+    // per-prefab and per-structure lines plus one summary, and exits 0/1
+    // without a session, event loop, window, GPU, save, settings file or pack
+    // stack. It is a release-facing launch switch (D245): unlike
+    // `--check-config` and `--creator-trace` it is deliberately not
+    // release-gated.
     if let Some(root) = cli.validate_worldgen.as_deref() {
-        let (lines, ok) = opencraft::world::prefab::validate_worldgen_lines(root);
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(root);
         use std::io::Write as _;
         let mut stdout = std::io::stdout().lock();
         for line in lines {
@@ -7245,6 +7371,73 @@ fn main() {
             std::process::exit(1);
         }
         return;
+    }
+
+    // `--demo-external-pack <dir>` is the headless external v3 pack proof: it
+    // loads a pack directory installed outside `packs/` through the production
+    // loader and registry builder, then proves six faces, cross/crop/blend
+    // meshing, a built-in icon override, and a v10 save/reload before any
+    // settings, window, GPU, audio engine, event loop or world startup. It runs
+    // after the validate branches (so those keep priority) and rejects a
+    // combined `--new` or a missing directory with exit 2.
+    match external_pack_demo_request(&cli) {
+        Err(message) => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: {message}");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        Ok(Some(dir)) => {
+            let fixture = if cli.save_path != Path::new(DEFAULT_SAVE_PATH) {
+                Some(cli.save_path.as_path())
+            } else {
+                None
+            };
+            let (lines, ok) = external_pack_demo_lines(dir, fixture);
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            for line in lines {
+                let _ = writeln!(stdout, "{line}");
+            }
+            let _ = stdout.flush();
+            if !ok {
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+    }
+
+    // `--demo-atlas <dir>` is the headless deterministic atlas artifact: it
+    // composes the authored/procedural block-face layers on the CPU, writes
+    // `<dir>/atlas.png` through the shared PNG writer, and prints one pinned
+    // digest line before any settings read/write, window, GPU, audio engine,
+    // event loop, pack load or world startup. It runs after the external-pack
+    // proof (so pack demos keep priority) and rejects a combined `--new` or a
+    // missing directory with exit 2.
+    match atlas_demo_request(&cli) {
+        Err(message) => {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "error: {message}");
+            let _ = stdout.flush();
+            std::process::exit(2);
+        }
+        Ok(Some(dir)) => {
+            let (lines, ok) = atlas_demo_lines(dir);
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            for line in lines {
+                let _ = writeln!(stdout, "{line}");
+            }
+            let _ = stdout.flush();
+            if !ok {
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
     }
 
     // `--demo-capture <dir>` is the headless capture -> validate leg: it builds
@@ -7475,6 +7668,8 @@ fn main() {
         // Production is the one opt-in `worldgen/` reader: keep this literal
         // shape (several source pins locate `StartupContent::load(` here).
         Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+        // Only production restores and presents the shipped default pack.
+        true,
     );
     let session = startup_session_with(&cli, &content.base_registry, &content.config);
 
@@ -8047,6 +8242,64 @@ mod tests {
     }
 
     #[test]
+    fn combined_validator_names_broken_structure_files_and_falls_back_to_builtin() {
+        // Measured from the real combined report: a rejected runtime structure
+        // file contributes exactly one logical-path diagnostic, the builtin of
+        // that name keeps its `ok: structure` line, and the summary counts the
+        // error. A wrong stem is named for the stem mismatch, not for TOML.
+        const STRUCTURE_LINES: [&str; 11] = [
+            "ok: structure oak_t4_l0",
+            "ok: structure oak_t4_l1",
+            "ok: structure oak_t4_l2",
+            "ok: structure oak_t4_l3",
+            "ok: structure oak_t5_l0",
+            "ok: structure oak_t5_l1",
+            "ok: structure oak_t5_l2",
+            "ok: structure oak_t5_l3",
+            "ok: structure ruin_wall_1",
+            "ok: structure ruin_wall_2",
+            "ok: structure ruin_wall_3",
+        ];
+        fn expected(diagnostic: &str) -> Vec<String> {
+            let mut lines = vec![diagnostic.to_owned()];
+            lines.extend(STRUCTURE_LINES.iter().map(|line| (*line).to_owned()));
+            lines.push(
+                "validate-worldgen: 0 prefabs, 11 structures, 1 errors, 0 warnings".to_owned(),
+            );
+            lines
+        }
+
+        let broken = tempfile::tempdir().expect("broken tempdir");
+        std::fs::create_dir_all(broken.path().join("structures")).expect("create structures");
+        std::fs::write(
+            broken.path().join("structures/oak_t4_l0.toml"),
+            "format = [\n",
+        )
+        .expect("write broken structure");
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(broken.path());
+        assert!(!ok, "a rejected structure file must fail closed: {lines:?}");
+        assert_eq!(
+            lines,
+            expected("error: worldgen/structures/oak_t4_l0.toml: invalid TOML")
+        );
+
+        let wrong_stem = tempfile::tempdir().expect("wrong-stem tempdir");
+        std::fs::create_dir_all(wrong_stem.path().join("structures")).expect("create structures");
+        let oak = include_str!("../worldgen/structures/oak_t4_l0.toml")
+            .replace("name = \"oak_t4_l0\"", "name = \"oak_mystery\"");
+        std::fs::write(wrong_stem.path().join("structures/wrong_stem.toml"), oak)
+            .expect("write wrong-stem structure");
+        let (lines, ok) = opencraft::world::structure::validate_worldgen_lines(wrong_stem.path());
+        assert!(!ok, "a wrong-stem file must fail closed: {lines:?}");
+        assert_eq!(
+            lines,
+            expected(
+                "error: worldgen/structures/wrong_stem.toml: file name does not match prefab name 'oak_mystery'"
+            )
+        );
+    }
+
+    #[test]
     fn check_config_is_a_launch_switch_and_never_a_world_intent() {
         // The audit is a headless one-shot: asking for it must not bypass the
         // menu on a normal launch, exactly like the other launch switches.
@@ -8422,6 +8675,8 @@ mod tests {
                 "village_demo: leg=outside identical=true".to_string(),
                 "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true"
                     .to_string(),
+                "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true"
+                    .to_string(),
                 "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true"
                     .to_string(),
                 "village_demo: ok=true".to_string(),
@@ -8470,6 +8725,224 @@ mod tests {
         assert!(
             digest_at < startup_at,
             "capture_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn demo_external_pack_request_rejects_new_and_missing_directory() {
+        let demo =
+            CliConfig::parse_args(["--demo-external-pack", "tests/fixtures/packs/external-v3"]);
+        assert_eq!(
+            demo.demo_external_pack.as_deref(),
+            Some(Path::new("tests/fixtures/packs/external-v3"))
+        );
+        assert!(
+            !cli_has_world_intent(&demo),
+            "the headless pack proof is a launch switch, never a world intent"
+        );
+        assert_eq!(
+            external_pack_demo_request(&demo),
+            Ok(Some(Path::new("tests/fixtures/packs/external-v3")))
+        );
+
+        // A bare switch (or one followed by another switch) fails closed.
+        let empty = CliConfig::parse_args(["--demo-external-pack"]);
+        assert_eq!(empty.demo_external_pack, Some(PathBuf::new()));
+        assert_eq!(
+            external_pack_demo_request(&empty),
+            Err("--demo-external-pack requires a pack directory")
+        );
+
+        // The proof is one-shot: combining it with `--new` is rejected.
+        let with_new = CliConfig::parse_args([
+            "--demo-external-pack",
+            "tests/fixtures/packs/external-v3",
+            "--new",
+        ]);
+        assert!(with_new.force_new_world);
+        assert_eq!(
+            external_pack_demo_request(&with_new),
+            Err("--demo-external-pack cannot be combined with --new")
+        );
+    }
+
+    #[test]
+    fn main_demo_external_pack_short_circuit_precedes_world_startup() {
+        // The external pack proof must follow the validate branches and run
+        // before any startup content/session or settings read: no window, GPU,
+        // audio engine, event loop, pack stack or settings write is allowed.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let validate_worldgen_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let demo_at = body
+            .find("external_pack_demo_request(")
+            .expect("fn main must consume cli.demo_external_pack through the guard");
+        let digest_at = body
+            .find("external_pack_demo_lines(")
+            .expect("fn main must call external_pack_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_pack_at < demo_at,
+            "the external pack demo must follow the validate-pack branch"
+        );
+        assert!(
+            validate_worldgen_at < demo_at,
+            "the external pack demo must follow the validate-worldgen branch"
+        );
+        assert!(
+            demo_at < startup_at,
+            "cli.demo_external_pack must precede startup"
+        );
+        assert!(
+            digest_at < startup_at,
+            "external_pack_demo_lines must precede startup"
+        );
+    }
+
+    #[test]
+    fn external_pack_demo_pins_the_external_v3_fixture_legs() {
+        fn copy_tree(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).expect("create fixture copy directory");
+            for entry in std::fs::read_dir(src).expect("read fixture directory") {
+                let entry = entry.expect("read fixture entry");
+                let to = dst.join(entry.file_name());
+                if entry.file_type().expect("fixture entry type").is_dir() {
+                    copy_tree(&entry.path(), &to);
+                } else {
+                    std::fs::copy(entry.path(), &to).expect("copy fixture file");
+                }
+            }
+        }
+
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/packs/external-v3");
+        assert!(
+            source.join("pack.toml").is_file(),
+            "the doc-authored fixture must be checked in at tests/fixtures/packs/external-v3"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack_dir = dir.path().join("external-v3");
+        copy_tree(&source, &pack_dir);
+        let fixture = dir.path().join("external-pack-demo.mcvx");
+
+        let (lines, ok) = external_pack_demo_lines(&pack_dir, Some(&fixture));
+        assert!(
+            ok,
+            "the external v3 fixture must pass every leg: {lines:#?}"
+        );
+
+        // Deterministic legs measured from a real run against the checked-in
+        // fixture. The save path is the only machine-dependent token and is
+        // asserted by shape.
+        let expected = vec![
+            "external_pack_demo: leg=stack pack=external-v3 name=External Stoneworks entries=11 errors=0".to_string(),
+            "external_pack_demo: leg=sixface block=stone resolved=6 distinct=6".to_string(),
+            "external_pack_demo: leg=model name=external:reed model=cross alpha=cutout".to_string(),
+            "external_pack_demo: leg=crop name=external:wheat model=crop alpha=cutout stages=4"
+                .to_string(),
+            "external_pack_demo: leg=blend name=external:frosted_glass model=cube alpha=blend sorted=true"
+                .to_string(),
+            "external_pack_demo: leg=icon name=apple builtin=true match=true".to_string(),
+        ];
+        assert_eq!(&lines[..expected.len()], expected.as_slice());
+        assert!(
+            lines.iter().any(
+                |line| line.starts_with("external_pack_demo: leg=save path=")
+                    && line.ends_with(" entries=3 ok=true")
+            ),
+            "the save leg must name the fixture path and three edits: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("external_pack_demo: ok=true")
+        );
+        assert!(
+            fixture.is_file(),
+            "the explicit --save fixture must be written"
+        );
+    }
+
+    #[test]
+    fn demo_atlas_request_rejects_new_and_missing_directory() {
+        let demo = CliConfig::parse_args(["--demo-atlas", "out/atlas"]);
+        assert_eq!(demo.demo_atlas.as_deref(), Some(Path::new("out/atlas")));
+        assert!(
+            !cli_has_world_intent(&demo),
+            "the headless atlas artifact is a launch switch, never a world intent"
+        );
+        assert_eq!(atlas_demo_request(&demo), Ok(Some(Path::new("out/atlas"))));
+
+        // A bare switch (or one followed by another switch) fails closed.
+        let empty = CliConfig::parse_args(["--demo-atlas"]);
+        assert_eq!(empty.demo_atlas, Some(PathBuf::new()));
+        assert_eq!(
+            atlas_demo_request(&empty),
+            Err("--demo-atlas requires an output directory")
+        );
+
+        // The artifact is one-shot: combining it with `--new` is rejected.
+        let with_new = CliConfig::parse_args(["--demo-atlas", "out/atlas", "--new"]);
+        assert!(with_new.force_new_world);
+        assert_eq!(
+            atlas_demo_request(&with_new),
+            Err("--demo-atlas cannot be combined with --new")
+        );
+    }
+
+    #[test]
+    fn main_demo_atlas_short_circuit_precedes_world_startup() {
+        // The atlas artifact must follow the validate and external-pack
+        // branches and run before any startup content/session or settings
+        // read: no window, GPU, audio engine, event loop, pack load or
+        // settings write is allowed on this launch.
+        let source = include_str!("main.rs");
+        let body = source
+            .split("fn main()")
+            .nth(1)
+            .expect("main.rs must define fn main");
+        let validate_pack_at = body
+            .find("cli.validate_pack")
+            .expect("fn main must branch on cli.validate_pack");
+        let validate_worldgen_at = body
+            .find("cli.validate_worldgen")
+            .expect("fn main must branch on cli.validate_worldgen");
+        let external_pack_at = body
+            .find("external_pack_demo_request(")
+            .expect("fn main must consume cli.demo_external_pack through the guard");
+        let demo_at = body
+            .find("atlas_demo_request(")
+            .expect("fn main must consume cli.demo_atlas through the guard");
+        let digest_at = body
+            .find("atlas_demo_lines(")
+            .expect("fn main must call atlas_demo_lines");
+        let startup_at = body
+            .find("StartupContent::load(")
+            .expect("fn main must build StartupContent before starting a session");
+        assert!(
+            validate_pack_at < demo_at,
+            "the atlas artifact must follow the validate-pack branch"
+        );
+        assert!(
+            validate_worldgen_at < demo_at,
+            "the atlas artifact must follow the validate-worldgen branch"
+        );
+        assert!(
+            external_pack_at < demo_at,
+            "the atlas artifact must follow the external-pack proof"
+        );
+        assert!(demo_at < startup_at, "cli.demo_atlas must precede startup");
+        assert!(
+            digest_at < startup_at,
+            "atlas_demo_lines must precede startup"
         );
     }
 
@@ -8771,14 +9244,14 @@ mod tests {
         );
     }
 
-    /// A real v2 pack on disk (two blocks, one item, one distinct 16x16 PNG
+    /// A real v3 pack on disk (two blocks, one item, one distinct 16x16 PNG
     /// per entry) loaded through the production spec+registry path.
     fn presentation_demo_registry(root: &Path) -> Arc<ContentRegistry> {
         let dir = root.join("mymod-ruby");
         std::fs::create_dir_all(&dir).expect("create fixture pack");
         std::fs::write(
             dir.join("pack.toml"),
-            r#"format_version = 2
+            r#"format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -8816,6 +9289,50 @@ stack = 64
     }
 
     #[test]
+    fn atlas_demo_pins_the_builtin_artifact_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("atlas");
+        let (lines, ok) = atlas_demo_lines(&out);
+        assert!(ok, "a clean built-in atlas must succeed: {lines:#?}");
+
+        // Literals measured from a real `--demo-atlas <fresh-dir>` run. The
+        // output path is the only machine-dependent token and is asserted by
+        // construction.
+        let expected = format!(
+            "atlas: path={} width=128 height=96 layers=48 bytes=32465 digest=0xaa212bc3f53ce34c png=0x4a89e7b5ab337a8a",
+            out.join("atlas.png").display()
+        );
+        assert_eq!(
+            lines,
+            vec![expected, "atlas_demo: ok=true".to_string()],
+            "the pinned atlas line set drifted"
+        );
+
+        let png = std::fs::read(out.join("atlas.png")).expect("atlas.png must be written");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n", "atlas must be a PNG");
+    }
+
+    #[test]
+    fn atlas_demo_reports_a_write_failure_instead_of_panicking() {
+        // A regular file where the output directory should be is a realistic
+        // filesystem failure; the demo must latch ok=false rather than panic.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocker = dir.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let (lines, ok) = atlas_demo_lines(&blocker.join("atlas"));
+        assert!(!ok, "an unwritable output must fail closed: {lines:#?}");
+        assert!(
+            lines[0].starts_with("atlas: failed reason="),
+            "the failure must name the I/O reason: {lines:#?}"
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("atlas_demo: ok=false")
+        );
+    }
+
+    #[test]
     fn presentation_demo_pins_the_authored_line_set() {
         let dir = tempfile::tempdir().expect("tempdir");
         let registry = presentation_demo_registry(dir.path());
@@ -8825,19 +9342,21 @@ stack = 64
 
         // Literals measured from a real run, never derived from the fixture.
         let expected = vec![
-            "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
+            "presentation_demo: leg=registry blocks=27 items=1 pack_layers=2 pack_icons=1"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
             "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
                 .to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
-            "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_ore id=26 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64".to_string(),
+            "presentation_demo: leg=block name=mymod:ruby_block id=25 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64".to_string(),
             "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64".to_string(),
             "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49".to_string(),
             "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64".to_string(),
             "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true".to_string(),
-            "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26".to_string(),
+            "presentation_demo: leg=placeholder unresolved=3 face=27 icon=27 break=none mesh=27".to_string(),
+            "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true".to_string(),
+            "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -8856,7 +9375,7 @@ stack = 64
             "the built-in launch is a valid presentation: {lines:#?}"
         );
         let expected = vec![
-            "presentation_demo: leg=registry blocks=24 items=0 pack_layers=0 pack_icons=0"
+            "presentation_demo: leg=registry blocks=25 items=0 pack_layers=0 pack_icons=0"
                 .to_string(),
             "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
                 .to_string(),
@@ -8864,8 +9383,10 @@ stack = 64
                 .to_string(),
             "presentation_demo: leg=authored ruby_ore=absent ruby_block=absent ruby=absent"
                 .to_string(),
-            "presentation_demo: leg=placeholder unresolved=0 face=26 icon=27 break=none mesh=26"
+            "presentation_demo: leg=placeholder unresolved=0 face=27 icon=27 break=none mesh=27"
                 .to_string(),
+            "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true".to_string(),
+            "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout".to_string(),
             "presentation_demo: ok=true".to_string(),
         ];
         assert_eq!(lines, expected);
@@ -8909,7 +9430,7 @@ stack = 64
         );
         assert_eq!(
             reference_registry.digest(),
-            0xbacb_c160_bdf7_6d08,
+            0x0d8e_817f_10a2_2c47,
             "the reference pack digest is pinned"
         );
 
@@ -8922,7 +9443,7 @@ stack = 64
         );
         assert_eq!(
             stacked.digest(),
-            0xabb6_212a_d750_6661,
+            0x24fa_d295_7ad2_2dbe,
             "reference + texture overlay digest is pinned"
         );
 
@@ -9007,9 +9528,9 @@ stack = 64
         let expected = vec![
             "worldgen_demo: leg=registry rules=2 ore=1 patch=1".to_string(),
             "worldgen_demo: leg=session rules=2 matches=true".to_string(),
-            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
+            "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2513 min_y=4 max_y=40 in_band=true"
                 .to_string(),
-            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
+            "worldgen_demo: leg=patch block=mymod:ruby_ore cells=346 biomes=plains,forest biomes_ok=true"
                 .to_string(),
             "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true".to_string(),
             "worldgen_demo: leg=empty_rules identical=true".to_string(),
@@ -9065,11 +9586,11 @@ stack = 64
         // Literals measured from a real run of the checked-in pack, never
         // derived from the registry under test (D143/MEM368).
         let expected = vec![
-            "palette: leg=entries builtin_blocks=14 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=47".to_string(),
+            "palette: leg=entries builtin_blocks=15 builtin_items=11 builtin_tools=16 pack_blocks=2 pack_items=2 pack_tools=2 total=48".to_string(),
             "palette: leg=layout surface=1280x720 panel=428,158,424,404 slot0=444,242,40,40 slot53=796,462,40,40 quads=57 labels=4".to_string(),
             "palette: leg=filter query=rub matched=6 names=mymod:ruby,mymod:ruby_block,mymod:ruby_ore,mymod:ruby_pickaxe,mymod:ruby_stew,mymod:ruby_sword".to_string(),
             "palette: leg=filter query=mymod matched=6".to_string(),
-            "palette: leg=filter query=builtin matched=41".to_string(),
+            "palette: leg=filter query=builtin matched=42".to_string(),
             "palette: leg=grant slot=0 item=mymod:ruby_block count=64 tool=false placeable=true".to_string(),
             "palette: leg=grant slot=1 item=mymod:ruby_ore count=64 tool=false placeable=true".to_string(),
             "palette: leg=grant slot=2 item=mymod:ruby count=64 tool=false placeable=false".to_string(),
@@ -9077,7 +9598,7 @@ stack = 64
             "palette: leg=grant slot=4 item=mymod:ruby_pickaxe count=1 tool=true durability=900".to_string(),
             "palette: leg=grant slot=5 item=mymod:ruby_sword count=1 tool=true durability=900".to_string(),
             "palette: leg=use item=mymod:ruby_stew restored=7 hunger=19".to_string(),
-            "palette: leg=placeholder excluded=2 total=47".to_string(),
+            "palette: leg=placeholder excluded=2 total=48".to_string(),
             "palette: leg=key key=C creative=true survival=false".to_string(),
             "palette: ok".to_string(),
         ];
@@ -13433,7 +13954,7 @@ stack = 64
         std::fs::create_dir_all(dir).expect("create pack dir");
         std::fs::write(
             dir.join("pack.toml"),
-            format!("name = \"{manifest_name}\"\n"),
+            format!("format_version = 3\nname = \"{manifest_name}\"\n"),
         )
         .expect("write pack.toml");
     }
@@ -13637,7 +14158,7 @@ stack = 64
         std::fs::create_dir_all(&alpha).expect("create alpha");
         std::fs::write(
             alpha.join("pack.toml"),
-            "name = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
+            "format_version = 3\nname = \"Alpha Pack\"\n[menu]\nlogo = \"logo.png\"\n",
         )
         .expect("write alpha manifest");
         write_solid_png(&alpha.join("grass_top.png"), [200, 10, 20, 255]);
@@ -13648,7 +14169,7 @@ stack = 64
         std::fs::create_dir_all(&beta).expect("create beta");
         std::fs::write(
             beta.join("pack.toml"),
-            "description = \"a nameless partial pack\"\n",
+            "format_version = 3\ndescription = \"a nameless partial pack\"\n",
         )
         .expect("write beta manifest");
         write_solid_png(&beta.join("dirt.png"), [30, 220, 40, 255]);
@@ -13697,16 +14218,16 @@ stack = 64
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = app_with_packs(dir.path());
         let packs_root = app.packs_root.clone();
-        let v2 = packs_root.join("mod");
-        std::fs::create_dir_all(&v2).expect("create v2 pack");
+        let v3 = packs_root.join("mod");
+        std::fs::create_dir_all(&v3).expect("create v3 pack");
         std::fs::write(
-            v2.join("pack.toml"),
-            "format_version = 2\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            v3.join("pack.toml"),
+            "format_version = 3\nname = \"Ruby Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
-        write_solid_png(&v2.join("ruby.png"), [200, 10, 20, 255]);
+        .expect("write v3 manifest");
+        write_solid_png(&v3.join("ruby.png"), [200, 10, 20, 255]);
 
-        let spec = pack::spec::load_spec_from_dir(&v2);
+        let spec = pack::spec::load_spec_from_dir(&v3);
         let (registry, report) = build_session_registry(&[spec]);
         assert_eq!(report.errors(), 0, "fixture registry is clean: {report:?}");
         assert_ne!(
@@ -13937,7 +14458,7 @@ stack = 64
         write_pack_fixture(&broken, "Broken Pack");
         std::fs::write(
             broken.join("pack.toml"),
-            "name = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
+            "format_version = 3\nname = \"Broken Pack\"\n[menu]\nlogo = \"title.png\"\n",
         )
         .expect("write pack.toml");
         std::fs::write(broken.join("title.png"), b"not a png").expect("corrupt logo");
@@ -13968,7 +14489,7 @@ stack = 64
         write_pack_fixture(&branded, "Branded Pack");
         std::fs::write(
             branded.join("pack.toml"),
-            "name = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
+            "format_version = 3\nname = \"Branded Pack\"\n[menu]\nlogo = \"logo.png\"\noverlay_tint = [0, 0, 0, 120]\n",
         )
         .expect("write pack.toml");
         write_solid_png(&branded.join("logo.png"), [240, 20, 30, 255]);
@@ -14250,26 +14771,27 @@ stack = 64
             "leg=generate: the overlay alone loads without warnings: {overlay_only_warnings:?}"
         );
 
-        // (2) The checked-in overlay is a texture-only v1 pack: no
-        // format_version, no content, exactly LAYER_FILES[3], no menu art.
+        // (2) The checked-in overlay is a texture-only v3 pack: it declares
+        // format_version = 3, authors no content, exactly LAYER_FILES[3], and
+        // no menu art.
         let overlay = overlay_only_specs
             .first()
             .expect("leg=generate: the overlay pack loaded");
         assert_eq!(
             overlay.format_version,
-            PackFormat::V1,
-            "leg=generate: the overlay is a v1 pack"
+            PackFormat::V3,
+            "leg=generate: the overlay is a v3 pack"
         );
         assert_eq!(
             overlay.manifest.format_version,
-            PackFormat::V1,
-            "leg=generate: the overlay manifest defaults to v1"
+            PackFormat::V3,
+            "leg=generate: the overlay manifest declares v3"
         );
         let overlay_manifest = std::fs::read_to_string(root.join("ruby-overlay").join("pack.toml"))
             .expect("leg=generate: the overlay manifest is readable");
         assert!(
-            !overlay_manifest.contains("format_version"),
-            "leg=generate: the checked-in overlay authors no format_version"
+            overlay_manifest.contains("format_version = 3"),
+            "leg=generate: the checked-in overlay declares format_version = 3"
         );
         assert_eq!(
             overlay.content,
@@ -16434,7 +16956,7 @@ stack = 64
     }
 
     #[test]
-    fn socket_marker_meshes_opaque_quads_on_layer_25() {
+    fn socket_marker_meshes_opaque_quads_on_layer_26() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut session = WorldSession::new_session(
             34,
@@ -16460,8 +16982,8 @@ stack = 64
         for quad in mesh.buckets.iter().flat_map(|bucket| bucket.iter()) {
             assert_eq!(
                 quad.unpack().6,
-                25,
-                "every marker face samples the built-in layer-25 art"
+                26,
+                "every marker face samples the built-in layer-26 art"
             );
         }
     }
@@ -16487,8 +17009,8 @@ stack = 64
             .filter(|entry| matches!(entry.id, ItemId::Block(block) if block.is_builtin()))
             .count();
         assert_eq!(
-            builtin_blocks, 14,
-            "the built-in carryable count is unchanged"
+            builtin_blocks, 15,
+            "the built-in carryable count includes glass"
         );
     }
 
@@ -16611,6 +17133,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -16713,6 +17236,7 @@ stack = 64
             dir.join("packs"),
             None,
             Some(root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -16941,6 +17465,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -17011,6 +17536,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -17075,6 +17601,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(&root),
+            false,
         );
         let cli = CliConfig::parse_args(Vec::<String>::new());
         let mut session = WorldSession::new_session(
@@ -17108,6 +17635,7 @@ stack = 64
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         std::fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
         let before = std::fs::read(&existing).expect("read renamed prefab");
@@ -27040,7 +27568,9 @@ stack = 64
     /// A two-entry pack registry (one block, one item) with real, non-placeholder
     /// definitions, built from an inline spec rather than the crate's `packs/`.
     fn main_ruby_registry() -> Arc<ContentRegistry> {
-        use opencraft::content::spec::{BlockEntry, BlockTextures, ItemEntry, PackAsset};
+        use opencraft::content::spec::{
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset,
+        };
 
         let mut spec = PackContentSpec::default();
         spec.blocks.push(BlockEntry {
@@ -27054,6 +27584,9 @@ stack = 64
             drop: Some("mymod:ruby".to_string()),
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),
@@ -27089,7 +27622,8 @@ stack = 64
     /// and an altar block whose authored drop is the pack pickaxe itself.
     fn pack_tool_registry() -> Arc<ContentRegistry> {
         use opencraft::content::spec::{
-            BlockEntry, BlockTextures, ItemEntry, PackAsset, TierEntry, ToolEntry,
+            BlockAlpha, BlockEntry, BlockModel, BlockTextures, ItemEntry, PackAsset, TierEntry,
+            ToolEntry,
         };
 
         let mut spec = PackContentSpec::default();
@@ -27104,6 +27638,9 @@ stack = 64
             drop: Some("mymod:ruby".to_string()),
             tool: Some(ToolKind::Pickaxe),
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.blocks.push(BlockEntry {
             id: "mymod:tool_altar".to_string(),
@@ -27116,6 +27653,9 @@ stack = 64
             drop: Some("mymod:ruby_pickaxe".to_string()),
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.items.push(ItemEntry {
             id: "mymod:ruby".to_string(),
@@ -27319,6 +27859,7 @@ stack = 64
             dir.join("packs"),
             Some(&config_dir),
             None,
+            false,
         )
     }
 
@@ -27434,6 +27975,7 @@ stack = 64
             dir.path().join("packs"),
             Some(&dir.path().join("absent-config")),
             None,
+            false,
         );
 
         assert_eq!(content.config.rules(), RulesBundle::default());
@@ -27461,11 +28003,16 @@ stack = 64
             dir.path().join("packs"),
             None,
             None,
+            false,
         );
 
         assert!(
             content.village_catalog.is_empty(),
             "no opt-in root means no worldgen read"
+        );
+        assert!(
+            content.structure_catalog.is_none(),
+            "no opt-in root means generation reaches the builtin master via None"
         );
         assert!(
             content.worldgen_root.is_none(),
@@ -27489,10 +28036,20 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(root),
+            false,
         );
 
         assert_eq!(content.village_catalog.len(), 1);
         assert_eq!(content.village_catalog.prefabs().len(), 3);
+        let structures = content
+            .structure_catalog
+            .as_ref()
+            .expect("the checked-in structures tree is opt-in content");
+        assert_eq!(structures.len(), 11, "eight oaks plus three ruins");
+        assert_eq!(
+            structures.ruin(2).map(|prefab| prefab.name.as_str()),
+            Some("ruin_wall_2")
+        );
         assert_eq!(content.worldgen_root.as_deref(), Some(root));
         assert!(
             !content
@@ -27505,17 +28062,23 @@ stack = 64
     }
 
     #[test]
-    fn village_warnings_split_the_file_from_the_reason() {
-        let warnings = village_warnings(&[
+    fn worldgen_warnings_split_the_file_from_the_reason_for_both_families() {
+        let warnings = worldgen_warnings(&[
             "worldgen/villages/plains.toml: could not read file: boom".to_string(),
+            "worldgen/structures/ruin_wall_1.toml: ruin prefab size must be [5, 2, 5]".to_string(),
             "unlabelled diagnostic".to_string(),
         ]);
 
-        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings.len(), 3);
         assert_eq!(warnings[0].field, "worldgen/villages/plains.toml");
         assert_eq!(warnings[0].reason, "could not read file: boom");
-        assert_eq!(warnings[1].field, "worldgen");
-        assert_eq!(warnings[1].reason, "unlabelled diagnostic");
+        assert_eq!(warnings[1].field, "worldgen/structures/ruin_wall_1.toml");
+        assert_eq!(
+            warnings[1].reason, "ruin prefab size must be [5, 2, 5]",
+            "the same split serves structure labels"
+        );
+        assert_eq!(warnings[2].field, "worldgen");
+        assert_eq!(warnings[2].reason, "unlabelled diagnostic");
     }
 
     #[test]
@@ -27528,6 +28091,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+            false,
         );
         let cli = CliConfig::parse_args([
             "--new",
@@ -27554,8 +28118,19 @@ stack = 64
             "the startup session must hold the launch catalog"
         );
         assert!(
+            app.session
+                .world
+                .structure_catalog()
+                .is_some_and(|catalog| catalog.len() == 11),
+            "the startup session must hold the runtime structure catalog"
+        );
+        assert!(
             app.background.world.village_catalog().is_none(),
             "the menu background is scenery and must never gain villages"
+        );
+        assert!(
+            app.background.world.structure_catalog().is_none(),
+            "the menu background must never gain structures either"
         );
     }
 
@@ -27568,6 +28143,7 @@ stack = 64
             dir.path().join("packs"),
             None,
             Some(Path::new(opencraft::world::prefab::WORLDGEN_DIR)),
+            false,
         );
         let cli = CliConfig::parse_args(["--save", save_path.to_str().expect("utf8 path")]);
         let startup = WorldSession::new_session(3, save_path.clone(), DEFAULT_SEASON_LENGTH_DAYS);
@@ -27590,38 +28166,73 @@ stack = 64
             Some(1),
             "every create/load swap must install the app catalog"
         );
+        assert!(
+            app.session
+                .world
+                .structure_catalog()
+                .is_some_and(|catalog| catalog.len() == 11),
+            "every create/load swap must install the structure catalog too"
+        );
     }
 
     #[test]
-    fn reload_village_catalog_reads_the_tree_each_call_and_never_caches() {
+    fn reload_worldgen_catalogs_reads_both_trees_each_call_and_never_caches() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
 
-        // Missing tree: valid empty content, no diagnostics.
-        let (catalog, diagnostics) = reload_village_catalog(root);
-        assert!(catalog.is_empty());
+        // Missing tree: valid empty village content, complete structure
+        // builtin master, no diagnostics.
+        let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
+        assert!(villages.is_empty());
+        assert_eq!(
+            structures.len(),
+            11,
+            "the builtin master is always complete"
+        );
         assert!(diagnostics.is_empty(), "missing tree: {diagnostics:?}");
 
-        // One broken definition appears on disk: the next call sees it, which
-        // proves the reload is uncached and never blocks on bad content.
-        let villages = root.join("villages");
-        std::fs::create_dir_all(&villages).expect("create villages dir");
+        // One broken definition per family appears on disk: the next call sees
+        // both, proving the reload is uncached and never blocks on bad content.
+        let villages_dir = root.join("villages");
+        std::fs::create_dir_all(&villages_dir).expect("create villages dir");
         std::fs::write(
-            villages.join("broken.toml"),
+            villages_dir.join("broken.toml"),
             "format = 1\nname = \"broken\"\nbiomes = [\"plains\"]\nhub = \"missing_prefab\"\n",
         )
         .expect("write broken village");
+        let structures_dir = root.join("structures");
+        std::fs::create_dir_all(&structures_dir).expect("create structures dir");
+        std::fs::write(
+            structures_dir.join("ruin_wall_1.toml"),
+            "format = 1\nname = \"ruin_wall_1\"\norigin = [2, 0, 2]\nsize = [5, 2, 5]\n\nlayers = [\n  [ \"#####\", \".....\", \".....\", \".....\", \"#####\" ],\n  [ \".....\", \".....\", \".....\", \".....\", \".....\" ],\n]\n\n[palette]\n\"#\" = \"oak_log\"\n\n[[markers]]\nkind = \"loot_chest\"\ntable = \"ruin\"\nposition = [0, 0, 0]\n",
+        )
+        .expect("write broken structure");
 
-        let (catalog, diagnostics) = reload_village_catalog(root);
+        let (villages, structures, diagnostics) = reload_worldgen_catalogs(root);
         assert!(
-            catalog.is_empty(),
-            "broken content degrades to an empty catalog"
+            villages.is_empty(),
+            "broken village content degrades to an empty catalog"
         );
-        assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:?}");
+        assert_eq!(
+            structures.len(),
+            11,
+            "a rejected structure file keeps the builtin of that name"
+        );
+        assert_eq!(
+            structures.ruin(1).map(|prefab| prefab.size),
+            Some([5, 2, 5]),
+            "the builtin ruin_wall_1 still generates after the overlay rejection"
+        );
+        assert_eq!(diagnostics.len(), 2, "diagnostics: {diagnostics:?}");
         assert!(
             diagnostics[0].starts_with("worldgen/villages/broken.toml: "),
-            "diagnostic keeps its logical label: {}",
+            "village diagnostics come first: {}",
             diagnostics[0]
+        );
+        assert!(
+            diagnostics[1].starts_with("worldgen/structures/ruin_wall_1.toml: "),
+            "structure diagnostics follow, labelled: {}",
+            diagnostics[1]
         );
     }
 
@@ -27638,18 +28249,22 @@ stack = 64
             .expect("attempt_create must precede confirm_pending_delete");
 
         let reload = body
-            .find("reload_village_catalog(")
+            .find("reload_worldgen_catalogs(")
             .expect("attempt_create must reload authored content");
         let build = body
             .find("WorldSession::new_session_with_mode_and_registry(")
             .expect("attempt_create must build the new session");
         assert!(
             reload < build,
-            "the reload must assign self.village_catalog before the session is built"
+            "the reload must assign both catalogs before the session is built"
         );
         assert!(
-            body.contains("self.village_catalog = catalog;"),
+            body.contains("self.village_catalog = villages;"),
             "the reload must replace the app catalog, not a local copy"
+        );
+        assert!(
+            body.contains("self.structure_catalog = Some(structures);"),
+            "the reload must reassign the structure catalog too"
         );
         assert!(
             body.contains("self.worldgen_root.as_deref()"),
@@ -29334,6 +29949,7 @@ selected_name_secs = 0.5
             dir.path().join("packs"),
             Some(&config_dir),
             None,
+            false,
         );
         let session = startup_session_with(&cli, &content.base_registry, &content.config);
         let traced =
@@ -29575,8 +30191,13 @@ selected_name_secs = 0.5
     /// `settings.toml`.
     fn pack_app(dir: &Path) -> GameApp {
         std::fs::create_dir_all(dir.join("packs")).expect("create packs root");
-        let content =
-            StartupContent::load(&dir.join("settings.toml"), dir.join("packs"), None, None);
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            dir.join("packs"),
+            None,
+            None,
+            false,
+        );
         let save_path = dir.join("pack-app.mcvx");
         let cli =
             CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
@@ -29596,6 +30217,194 @@ selected_name_secs = 0.5
         app.available_packs = pack::available_pack_names(&app.packs_root);
         app.settings.pack_stack = stack.iter().map(|name| (*name).to_string()).collect();
         app.apply_pack_stack();
+    }
+
+    /// Recursively count regular files under `root`.
+    fn count_files_recursive(root: &Path) -> usize {
+        let mut count = 0;
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read restore dir") {
+                let path = entry.expect("restore dir entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Startup with `restore_default` and no config/worldgen roots, so the
+    /// only possible warnings are pack/restore notices.
+    fn default_pack_content(dir: &Path, restore_default: bool) -> (PathBuf, StartupContent) {
+        let packs_root = dir.join("packs");
+        let content = StartupContent::load(
+            &dir.join("settings.toml"),
+            packs_root.clone(),
+            None,
+            None,
+            restore_default,
+        );
+        (packs_root, content)
+    }
+
+    #[test]
+    fn default_pack_startup_restores_presents_and_stays_out_of_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+
+        let default_dir = packs_root.join(pack::defaults::DEFAULT_PACK_FOLDER);
+        assert_eq!(
+            count_files_recursive(&default_dir),
+            76,
+            "the shipped master restores exactly 76 files"
+        );
+        let pack = content
+            .current_pack
+            .as_ref()
+            .expect("the restored default is the first presentation entry");
+        assert_eq!(pack.display_name, "Default");
+        assert_eq!(content.pack_specs.len(), 1);
+        assert!(
+            content.base_registry.digest() == ContentRegistry::builtin().digest(),
+            "the implicit default must not change registry identity"
+        );
+        assert!(
+            content.base_registry.packs().is_empty(),
+            "the implicit default must never appear in packs()"
+        );
+        let restore_warnings: Vec<_> = content
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD)
+            .collect();
+        assert_eq!(restore_warnings.len(), 1);
+        assert!(restore_warnings[0].reason.contains("(76 files)"));
+        assert!(
+            content.settings.pack_stack.is_empty(),
+            "the implicit default never enters the persisted stack"
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_keeps_edits_and_restores_only_absent_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, first) = default_pack_content(dir.path(), true);
+        let original_dirt = first.pack_specs[0].block_layers[2]
+            .clone()
+            .expect("dirt art is authored");
+
+        // One edited file (present bytes must survive) and one deleted file
+        // (the only thing the second restore may write).
+        let edited = [250u8, 10, 20, 255];
+        write_solid_png(
+            &packs_root
+                .join(pack::defaults::DEFAULT_PACK_FOLDER)
+                .join("grass_top.png"),
+            edited,
+        );
+        std::fs::remove_file(
+            packs_root
+                .join(pack::defaults::DEFAULT_PACK_FOLDER)
+                .join("dirt.png"),
+        )
+        .expect("delete one shipped file");
+
+        let (_, second) = default_pack_content(dir.path(), true);
+        let layers = &second.pack_specs[0].block_layers;
+        let grass = layers[0].as_ref().expect("edited grass art loads");
+        assert_eq!(&grass[..4], &edited, "the edited layer bytes are applied");
+        assert_eq!(
+            layers[2].as_deref(),
+            Some(original_dirt.as_slice()),
+            "the deleted file is restored byte-for-byte"
+        );
+        assert!(packs_root
+            .join(pack::defaults::DEFAULT_PACK_FOLDER)
+            .join("dirt.png")
+            .is_file());
+
+        let restore_warnings: Vec<_> = second
+            .startup_warnings
+            .iter()
+            .filter(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD)
+            .collect();
+        assert_eq!(restore_warnings.len(), 1, "one notice per restore call");
+        assert!(
+            restore_warnings[0].reason.contains("(1 files)"),
+            "only the deleted file is written: {:?}",
+            restore_warnings[0].reason
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_disabled_leaves_the_root_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), false);
+
+        assert!(
+            !packs_root.exists(),
+            "disabled startup creates no packs dir"
+        );
+        assert!(content.current_pack.is_none());
+        assert!(content.pack_specs.is_empty());
+        assert!(
+            !content
+                .startup_warnings
+                .iter()
+                .any(|warning| warning.field == pack::defaults::DEFAULT_PACK_RESTORE_FIELD),
+            "a disabled restore reports no pack warning"
+        );
+    }
+
+    #[test]
+    fn default_pack_startup_survives_pack_toggles_and_never_enters_the_stack() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+        write_pack_fixture(&packs_root.join("alpha"), "Alpha Pack");
+
+        let save_path = dir.path().join("default-pack.mcvx");
+        let cli =
+            CliConfig::parse_args(["--new", "--save", save_path.to_str().expect("utf8 path")]);
+        let session = startup_session_with(&cli, &content.base_registry, &content.config);
+        let mut app =
+            GameApp::new_with_content(cli, session, content, dir.path().join("background.mcvx"));
+        app.available_packs = pack::available_pack_names(&app.packs_root);
+
+        app.toggle_pack_row("alpha");
+        assert_eq!(app.settings.pack_stack, vec!["alpha".to_string()]);
+        assert!(
+            app.pack_presentation.is_some(),
+            "enabling a user pack keeps the implicit default visible"
+        );
+
+        app.toggle_pack_row("alpha");
+        assert!(app.settings.pack_stack.is_empty());
+        assert!(
+            app.pack_presentation.is_some(),
+            "disabling the last user pack must not remove the default"
+        );
+        assert!(!app
+            .settings
+            .pack_stack
+            .iter()
+            .any(|folder| folder == pack::defaults::DEFAULT_PACK_FOLDER));
+    }
+
+    #[test]
+    fn default_pack_startup_hides_the_implicit_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (packs_root, content) = default_pack_content(dir.path(), true);
+
+        assert!(content.available_packs.is_empty());
+        assert!(
+            !pack::available_pack_names(&packs_root)
+                .iter()
+                .any(|name| name == pack::defaults::DEFAULT_PACK_FOLDER),
+            "the shipped default is implicit, never a Packs row"
+        );
     }
 
     /// First poll records the edit as pending; the second crosses the 250 ms
@@ -29811,14 +30620,14 @@ selected_name_secs = 0.5
         let pack = write_pack_manifest(&app, "mod");
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            "format_version = 3\nname = \"Mod\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
+        .expect("write v3 manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
         write_solid_png(&pack.join("unused.png"), [1, 1, 1, 255]);
         apply_pack_stack_of(&mut app, &["mod"]);
 
-        let watch = app.pack_watch.as_ref().expect("v2 stack has a watch list");
+        let watch = app.pack_watch.as_ref().expect("v3 stack has a watch list");
         assert!(watch
             .entries()
             .iter()
@@ -29856,25 +30665,25 @@ selected_name_secs = 0.5
     // M014/S07-T03: live built-in icon sprite overrides
     // -----------------------------------------------------------------------
 
-    /// Write a v2 manifest whose only content is a `[builtin_icons]` table.
+    /// Write a v3 manifest whose only content is a `[builtin_icons]` table.
     /// The paths are authored even when the PNGs do not exist yet.
-    fn write_v2_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
-        let mut text = String::from("format_version = 2\nname = \"icons\"\n\n[builtin_icons]\n");
+    fn write_v3_builtin_manifest(pack: &Path, overrides: &[(&str, &str)]) {
+        let mut text = String::from("format_version = 3\nname = \"icons\"\n\n[builtin_icons]\n");
         for (name, path) in overrides {
             text.push_str(&format!("{name} = \"{path}\"\n"));
         }
-        std::fs::write(pack.join("pack.toml"), text).expect("write v2 builtin manifest");
+        std::fs::write(pack.join("pack.toml"), text).expect("write v3 builtin manifest");
     }
 
-    /// Write a v2 manifest with no content arrays and no `[builtin_icons]`
-    /// table. Its pack identity matches [`write_v2_builtin_manifest`], so
+    /// Write a v3 manifest with no content arrays and no `[builtin_icons]`
+    /// table. Its pack identity matches [`write_v3_builtin_manifest`], so
     /// switching between the two never changes the content fingerprint.
-    fn write_v2_empty_manifest(pack: &Path) {
+    fn write_v3_empty_manifest(pack: &Path) {
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"icons\"\n",
+            "format_version = 3\nname = \"icons\"\n",
         )
-        .expect("write v2 empty manifest");
+        .expect("write v3 empty manifest");
     }
 
     #[test]
@@ -29882,7 +30691,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(
+        write_v3_builtin_manifest(
             &pack,
             &[
                 ("apple", "apple.png"),
@@ -29958,7 +30767,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["icons"]);
         let last_good = app
@@ -29994,7 +30803,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "bad");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         std::fs::write(pack.join("apple.png"), b"not a png").expect("corrupt at launch");
         apply_pack_stack_of(&mut app, &["bad"]);
 
@@ -30031,7 +30840,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "late");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         apply_pack_stack_of(&mut app, &["late"]);
 
         let presentation = app.pack_presentation.as_ref().expect("presentation");
@@ -30069,10 +30878,10 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let alpha = write_pack_manifest(&app, "alpha");
-        write_v2_builtin_manifest(&alpha, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&alpha, &[("apple", "apple.png")]);
         write_solid_png(&alpha.join("apple.png"), [1, 2, 3, 255]);
         let beta = write_pack_manifest(&app, "beta");
-        write_v2_builtin_manifest(&beta, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&beta, &[("apple", "apple.png")]);
         write_solid_png(&beta.join("apple.png"), [4, 5, 6, 255]);
         apply_pack_stack_of(&mut app, &["alpha", "beta"]);
 
@@ -30124,7 +30933,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["icons"]);
 
@@ -30170,7 +30979,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["icons"]);
         assert_eq!(app.creator.restart_required, None);
 
@@ -30194,7 +31003,7 @@ selected_name_secs = 0.5
         // Adding the override table and its PNG is one manifest edit that
         // must apply live: the table is presentation-only.
         let t0 = Instant::now();
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         write_solid_png(&pack.join("apple.png"), [11, 22, 33, 255]);
         settle_pack(&mut app, t0);
 
@@ -30251,7 +31060,7 @@ selected_name_secs = 0.5
         // from the watch list.
         app.pack_item_sprite_dirty = false;
         let t1 = t0 + Duration::from_secs(1);
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         settle_pack(&mut app, t1);
 
         assert_eq!(app.creator.restart_required, None);
@@ -30286,7 +31095,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "icons");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["icons"]);
         app.pack_item_sprite_dirty = false;
         let procedural = compose_item_sprite_layers(&[]);
@@ -30294,7 +31103,7 @@ selected_name_secs = 0.5
         // The manifest authors a path before the file exists: it must be
         // watched so the later write applies live.
         let t0 = Instant::now();
-        write_v2_builtin_manifest(&pack, &[("apple", "apple.png")]);
+        write_v3_builtin_manifest(&pack, &[("apple", "apple.png")]);
         settle_pack(&mut app, t0);
 
         assert_eq!(app.creator.restart_required, None);
@@ -30405,7 +31214,7 @@ selected_name_secs = 0.5
         let t0 = Instant::now();
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
+            "format_version = 3\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[builtin_icons]\napple = \"apple.png\"\n",
         )
         .expect("write combined manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
@@ -30771,41 +31580,41 @@ selected_name_secs = 0.5
     // M014/S03-T05: manifest content guard and restart-required
     // -----------------------------------------------------------------------
 
-    /// Rewrite `pack.toml` as a v2 manifest whose one block references a new
+    /// Rewrite `pack.toml` as a v3 manifest whose one block references a new
     /// PNG. This changes both the content digest and the pack-layer count, so
     /// every frozen-fingerprint comparison must report a restart.
-    fn write_v2_block_manifest(pack: &Path) {
+    fn write_v3_block_manifest(pack: &Path) {
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
+            "format_version = 3\nname = \"textures\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n",
         )
-        .expect("write v2 manifest");
+        .expect("write v3 manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
     }
 
-    /// Write a v2 manifest with one craftable item and one 1x1 recipe.
+    /// Write a v3 manifest with one craftable item and one 1x1 recipe.
     /// Changing `count` is a recipe-only edit: identity and allocation stay
     /// identical, only the recipe definition moves.
-    fn write_v2_recipe_manifest(pack: &Path, count: u16) {
+    fn write_v3_recipe_manifest(pack: &Path, count: u16) {
         std::fs::write(
             pack.join("pack.toml"),
             format!(
-                "format_version = 2\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
+                "format_version = 3\nname = \"recipes\"\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = {{ S = \"stone\" }}\noutput = \"mymod:gem\"\ncount = {count}\n"
             ),
         )
-        .expect("write v2 recipe manifest");
+        .expect("write v3 recipe manifest");
         write_solid_png(&pack.join("gem.png"), [40, 50, 60, 255]);
     }
 
-    /// Write a v2 manifest whose only content is one built-in recipe patch.
-    fn write_v2_recipe_patch_manifest(pack: &Path, enabled: bool) {
+    /// Write a v3 manifest whose only content is one built-in recipe patch.
+    fn write_v3_recipe_patch_manifest(pack: &Path, enabled: bool) {
         std::fs::write(
             pack.join("pack.toml"),
             format!(
-                "format_version = 2\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
+                "format_version = 3\nname = \"recipes\"\n\n[[recipe_patches]]\nid = \"planks\"\nenabled = {enabled}\n"
             ),
         )
-        .expect("write v2 recipe patch manifest");
+        .expect("write v3 recipe patch manifest");
     }
 
     /// Build a 1x1 stone grid through the production crafting seam so the
@@ -30835,7 +31644,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
         install_pack_session(&mut app, &dir.path().join("recipe-save.mcvx"));
 
@@ -30866,7 +31675,7 @@ selected_name_secs = 0.5
         app.pack_layer_uploads.clear();
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
 
         let reason = "demo: recipe changed; restart to apply";
@@ -30934,11 +31743,11 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_empty_manifest(&pack);
+        write_v3_empty_manifest(&pack);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_patch_manifest(&pack, false);
+        write_v3_recipe_patch_manifest(&pack, false);
         settle_pack(&mut app, t0);
 
         assert_eq!(
@@ -30960,13 +31769,13 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
         std::fs::write(
             pack.join("pack.toml"),
-            "format_version = 2\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
+            "format_version = 3\nname = \"recipes\"\n\n[[blocks]]\nid = \"mymod:ruby_ore\"\ntextures = { all = \"ruby.png\" }\nhardness = 3.0\n\n[[items]]\nid = \"mymod:gem\"\nicon = \"gem.png\"\nstack = 64\n\n[[recipes]]\nid = \"mymod:gem_recipe\"\npattern = [\"S\"]\nkey = { S = \"stone\" }\noutput = \"mymod:gem\"\ncount = 2\n",
         )
         .expect("write mixed manifest");
         write_solid_png(&pack.join("ruby.png"), [200, 10, 20, 255]);
@@ -30991,16 +31800,16 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
 
         let t1 = t0 + Duration::from_secs(1);
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         settle_pack(&mut app, t1);
 
         assert_eq!(app.creator.restart_required, None);
@@ -31019,12 +31828,12 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         write_solid_png(&pack.join("stone.png"), [10, 20, 30, 255]);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
         let reason = app
             .creator
@@ -31072,7 +31881,7 @@ selected_name_secs = 0.5
         let dir = tempfile::tempdir().expect("tempdir");
         let mut app = pack_app(dir.path());
         let pack = write_pack_manifest(&app, "demo");
-        write_v2_recipe_manifest(&pack, 1);
+        write_v3_recipe_manifest(&pack, 1);
         apply_pack_stack_of(&mut app, &["demo"]);
 
         let save_path = dir.path().join("pack-app.mcvx");
@@ -31097,7 +31906,7 @@ selected_name_secs = 0.5
         let base_digest = app.base_registry.digest();
 
         let t0 = Instant::now();
-        write_v2_recipe_manifest(&pack, 2);
+        write_v3_recipe_manifest(&pack, 2);
         settle_pack(&mut app, t0);
 
         let reason = "demo: recipe changed; restart to apply";
@@ -31155,6 +31964,7 @@ selected_name_secs = 0.5
             dir.path().join("packs"),
             None,
             None,
+            false,
         );
         assert_eq!(
             content
@@ -31255,7 +32065,7 @@ selected_name_secs = 0.5
         let base_digest = app.base_registry.digest();
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
 
         let reason = app
@@ -31332,7 +32142,7 @@ selected_name_secs = 0.5
             .clone();
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
         assert_eq!(
@@ -31388,7 +32198,7 @@ selected_name_secs = 0.5
             .clone();
 
         let t0 = Instant::now();
-        std::fs::write(pack.join("pack.toml"), "format_version = 2\n[[blocks]\n")
+        std::fs::write(pack.join("pack.toml"), "format_version = 3\n[[blocks]\n")
             .expect("write corrupt manifest");
         settle_pack(&mut app, t0);
 
@@ -31432,7 +32242,7 @@ selected_name_secs = 0.5
         app.pack_item_sprite_dirty = false;
 
         let t0 = Instant::now();
-        write_v2_block_manifest(&pack);
+        write_v3_block_manifest(&pack);
         settle_pack(&mut app, t0);
         assert!(app.creator.restart_required.is_some());
         assert!(

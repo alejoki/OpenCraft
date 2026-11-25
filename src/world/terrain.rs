@@ -21,6 +21,8 @@ use crate::world::chunk::{Chunk, ChunkPos, ChunkStorage};
 use crate::world::season::Season;
 use crate::world::village::VillageCatalog;
 
+use opencraft_worldgen::structure::StructureCatalog;
+
 pub use opencraft_worldgen::biome::{
     biome_at_seeded, biome_for_height, forest_noise, Biome, BEACH_BAND, MOUNTAIN_HEIGHT_THRESHOLD,
     SEA_LEVEL,
@@ -45,14 +47,18 @@ pub use opencraft_worldgen::tree::{
 ///
 /// `rules` is the pack worldgen stack (empty for vanilla worlds), `villages`
 /// is the optional accepted village catalog (empty/`None` reproduces the
-/// pre-M015 generator byte-for-byte) and `spawn_column` lets a caller that
+/// pre-M015 generator byte-for-byte), `spawn_column` lets a caller that
 /// already knows the spawn skip the bounded [`find_spawn_column`] search when
-/// the village planner needs it.
+/// the village planner needs it, and `structures` is the optional accepted
+/// structure catalog: `None` reproduces the compile-time builtin master
+/// exactly (every headless call and every pre-M019 world), while `Some`
+/// overlays the runtime `worldgen/structures` content by name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WorldGenContext<'a> {
     pub rules: &'a [WorldgenRule],
     pub villages: Option<&'a VillageCatalog>,
     pub spawn_column: Option<(i32, i32)>,
+    pub structures: Option<&'a StructureCatalog>,
 }
 
 /// Maps the game calendar season onto the neutral crate season.
@@ -158,6 +164,7 @@ pub fn generate_chunk_seeded_with(
             rules,
             villages: None,
             spawn_column: None,
+            structures: None,
         },
     )
 }
@@ -185,6 +192,7 @@ pub fn generate_chunk_with_context(
         rules: rules.as_ref(),
         villages: ctx.villages,
         spawn_column: ctx.spawn_column,
+        structures: ctx.structures,
     };
     chunk_from_buffer(opencraft_worldgen::terrain::generate_chunk_with_context(
         pos,
@@ -358,6 +366,7 @@ mod tests {
                 rules: &rules,
                 villages: None,
                 spawn_column: None,
+                structures: None,
             },
         );
 
@@ -371,6 +380,7 @@ mod tests {
                 rules: &neutral,
                 villages: None,
                 spawn_column: None,
+                structures: None,
             },
         ));
         assert!(
@@ -538,12 +548,13 @@ mod tests {
             (ChunkPos::new(-1, 1, 2), 424_242, Season::Summer),
         ];
         // (uniform, non_air_cells, FNV-1a 64 digest) captured from the
-        // unmodified pre-M010 generator. These are the behavior-preservation
-        // gate for S01: any terrain drift must fail here, not merely differ
-        // from a second run of the same code.
+        // unmodified pre-M010 generator, except the Winter case re-pinned by
+        // M019/S04 when oak output moved to authored prefab cells (D351). These
+        // are the behavior-preservation gate for S01: any other terrain drift
+        // must fail here, not merely differ from a second run of the same code.
         let expected: [(Option<BlockId>, usize, u64); 3] = [
             (None, 26_913, 5_429_992_561_724_371_152),
-            (None, 20_878, 8_773_073_591_056_755_479),
+            (None, 20_889, 3_148_434_793_551_996_225),
             (Some(BlockId::Air), 0, 16_934_947_671_703_429_925),
         ];
 

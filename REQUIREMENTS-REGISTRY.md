@@ -631,7 +631,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R063 — Pack format v2, ordered stack merge and --validate-pack
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M019/S01
 - Description: A v1 texture-only pack still loads unchanged while a format v2 pack declares blocks, items, tiers, tools, recipes, block/recipe patches and worldgen; entries fall back individually with warnings, the ordered stack merges per authored file and field with later packs winning, ids are deterministic namespaced names, and `--validate-pack` prints per-entry results and exits 0 for a clean pack and nonzero for broken or missing packs without opening a window, GPU or save.
 - Why it matters: Content packs are only authorable and stackable if parsing, merge precedence and a strict offline validator agree on the same rules.
 - Source: M010 / S02 pack format and validation
@@ -761,7 +762,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R076 — Live block/mob texture reload with frozen allocation
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M019/S03
 - Description: In a dev build, the 25 block and 13 mob fixed-name textures and the allocated v2 block-face assets re-decode and re-upload only changed array layers at frozen indices; corrupt/non-square/out-of-range PNGs keep the last good layer; deletion reveals the lower pack or procedural art; manifest content/allocation changes set restart-required without moving a layer or touching the live registry.
 - Why it matters: Visual tuning is the core loop, and allocation drift would render the wrong texture.
 - Source: M014 / S03 live texture reload
@@ -771,7 +773,8 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 
 ### R077 — Live built-in item sprite overrides
 - Class: core-capability
-- Status: active
+- Status: superseded
+- Superseded by: M019/S03
 - Description: A v2 `[builtin_icons]` table maps frozen built-in material/tool names to pack-relative PNGs; later packs win per name; overrides target fixed base layers 0..=26 and never pack icons; malformed/missing art keeps the last good override or procedural sprite; add/remove/repoint edits apply live through the item-sprite atlas without moving the content digest or requiring restart.
 - Why it matters: Built-in item art is a visible tuning surface and must be overrideable without identity churn.
 - Source: M014 / S07 built-in item overrides
@@ -993,6 +996,96 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 - Supporting slices: M018/S08
 - Validation: `bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo test --workspace --locked; bash scripts/check_engine_boundaries.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu; WORKFLOW=ci.yml bash scripts/ci_gate.sh; git diff --exit-code -- tests/fixtures/packs worldgen tests/fixtures/saves`
 
+### R099 — External doc-authored v3 fixture validates clean and drives the headless demo
+- Class: integration
+- Status: active
+- Description: `tests/fixtures/packs/external-v3` is a complete v3 pack authored from docs/TEXTURE-PACKS.md alone (14 files, 11 validated entries): six distinct `stone` faces through the documented flat direction overrides, a cross/cutout plant, a crop/cutout wheat, a cube/blend glass and a `[builtin_icons]` apple override. `--validate-pack external-v3` run from a tree that contains only the copied fixture prints exactly `validate-pack: external-v3: 11 entries, 0 errors, 0 warnings`, and `--demo-external-pack` loads the out-of-tree directory through the real loader and registry without touching `settings.pack_stack`.
+- Why it matters: A doc-only author reproducing the shipped surface is the M019 differentiator; a validator summary alone would not prove the pack reaches the game.
+- Source: M019 / S05 external fixture
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S05
+- Validation: bash scripts/external_pack_smoke.sh; bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --bin opencraft -- external_pack; cargo run -p opencraft --locked -- --demo-external-pack tests/fixtures/packs/external-v3
+
+### R100 — Six-face plus cross/crop/blend material surface proven from an out-of-tree pack
+- Class: core-capability
+- Status: active
+- Description: One block resolves six distinct faces by resolved layer index (not filename), the cross and crop entries carry cutout alpha with crop stage count taken from the loaded stage table, the cube blend entry reaches the sorted translucent draw path, and a `[builtin_icons]` override matches its built-in sprite; every leg is proven through the production loader/registry/mesher from a pack installed outside `packs/`.
+- Why it matters: Six faces and the model/alpha surface are M019's visible payoff, so they must survive a real out-of-tree pack rather than only in-repo fixtures.
+- Source: M019 / S05 material surface proof
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S03
+- Validation: cargo test -p opencraft --locked --bin opencraft -- external_pack; cargo test -p opencraft --locked --lib -- render::texture; bash scripts/external_pack_smoke.sh; bash scripts/presentation_smoke.sh
+
+### R101 — Deterministic GPU-free atlas artifact with pinned RGBA and PNG digests
+- Class: quality-attribute
+- Status: active
+- Description: `--demo-atlas <dir>` composes the 48 built-in base layers row-major into a 128x96 8-column sheet, encodes a timestamp-free `atlas.png` (32,465 bytes) and prints the pinned FNV-1a composed-RGBA digest `0xaa212bc3f53ce34c` and PNG digest `0x4a89e7b5ab337a8a`; two runs into separate directories are byte-identical, and unit tests fail by name (`composed atlas pixels drifted from the pinned digest`, `atlas.png bytes drifted from the pinned digest`) on any drift. The artifact depends on no GPU, window, settings file or pack stack.
+- Why it matters: A pinned byte hash is the only falsifiable proof that composed block-face layers stay stable without a GPU.
+- Source: M019 / S05 atlas artifact
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S02, M019/S03, M019/S05
+- Validation: cargo test -p opencraft --locked --lib -- atlas; cargo test -p opencraft --locked --bin opencraft -- atlas; bash scripts/external_pack_smoke.sh
+
+### R102 — M019 closure surface: standing external smoke, local gate, Linux package rehearsal and honest Windows/CI gaps
+- Class: launchability
+- Status: active
+- Description: Closeout requires `bash scripts/external_pack_smoke.sh` as the standing gate, the existing pack/modding smokes tracking the fixture, `cargo fmt --all -- --check`, the engine boundary gate, `cargo clippy --workspace --locked --all-targets -- -D warnings`, `cargo test --workspace --locked`, `cargo test -p engine-reuse-proof --locked`, the requirements checker plus selftest at R001-R107, `cargo build --release --locked` and `bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu` with `packs/default` staged. Windows installer smoke and the three-asset release verifier are recorded as documented environment gaps and are never claimed as observed; any digest re-pin happens once with explanatory evidence.
+- Why it matters: M019 must close on a reproducible Linux gate while stating plainly which CI/Windows limbs were not observed locally.
+- Source: M019 / S05 closeout
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S02, M019/S03, M019/S04, M019/S05
+- Validation: bash scripts/external_pack_smoke.sh; bash scripts/check_engine_boundaries.sh; bash scripts/pack_smoke.sh; bash scripts/modding_smoke.sh; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu
+
+### R103 — M019 scope guardrail
+- Class: constraint
+- Status: active
+- Description: M019 changes only the documented v3 pack surface, model/alpha materials, prefab-backed trees/ruins with decay markers, the shipped default pack and the external fixture/atlas artifacts. v1/v2 packs remain rejected with a named format error and every fixture, demo and doc is v3; `.mcvx` stays v10 with no added field; A* stays unwired; no new dependency is added; no digest, atlas hash, budget threshold or prior pin is re-pinned without a decision and recorded evidence; no Windows or CI leg is claimed from a local run.
+- Why it matters: The deliberate v3 surface must not smuggle in an unplanned format, gameplay or threshold change.
+- Source: M019 / S05 scope guardrail
+- Primary owning slice: M019/S05
+- Supporting slices: M019/S01, M019/S02, M019/S03, M019/S04, M019/S05
+- Validation: bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --lib -- pack::; cargo test -p opencraft --locked --test save_v10_cli; bash scripts/requirements_check.sh; bash scripts/requirements_check_selftest.sh
+
+### R104 — Shipped default pack with compile-time embedded restore
+- Class: core-capability
+- Status: active
+- Description: `packs/default` ships as a normal v3 pack (75 files: 25 block layers, 13 mob layers, 27 item icons and 9 WAVs) generated deterministically from the procedural art, and the same bytes are embedded at compile time as the master. Production startup restores only absent files with `pack.toml` written last, reports exactly one `SettingsWarning` naming the failing path, and never overwrites a present file, so edited or corrupt art survives relaunches. The default pack is presentation-only for identity: it reaches presentation, sound resolution and pack watch but is filtered out of every session-registry and save-identity path.
+- Why it matters: The game's own art must be the reference mod a pack author can read, and a deleted or unreadable default must self-heal without destroying edits.
+- Source: M019 / S02 default pack
+- Primary owning slice: M019/S02
+- Supporting slices: M019/S01, M019/S03, M019/S05
+- Validation: cargo test -p opencraft --locked --lib -- pack::defaults; cargo test -p opencraft --locked --bin opencraft -- default_pack_startup; bash scripts/pack_smoke.sh
+
+### R105 — Typed prefab loot markers and prefab-backed oak/ruin worldgen
+- Class: core-capability
+- Status: active
+- Description: Prefabs gain an additive `format = 1` `[[markers]]` section with typed `loot_chest` markers and a `ruin` loot table, validated with named errors for bad position, out-of-bounds, unknown kind or table and duplicates. Eight oak and three ruin prefabs live in `worldgen/structures/` as both checked-in files and a compile-time builtin master with a runtime overlay and one diagnostic plus per-name builtin fallback per rejected file. Oak and ruin placement stay in code and bind prefab cells per column, exactly one loot marker produces the single `BLOCK_LOOT_CHEST` at the unchanged position, and every worldgen, village and demo digest is re-pinned once with recorded evidence.
+- Why it matters: Authored layout must be data an author can edit without changing generation code or save identity, and a broken file must degrade to the builtin rather than delete trees or ruins.
+- Source: M019 / S04 prefab structures
+- Primary owning slice: M019/S04
+- Supporting slices: M019/S01, M019/S05
+- Validation: cargo test -p opencraft-worldgen --locked -- ruin; cargo test -p opencraft-worldgen --locked -- structure; cargo test --locked --test worldgen_cli; bash scripts/village_smoke.sh
+
+### R106 — Pack format v3: six-face authoring, models/alpha and --validate-pack
+- Class: core-capability
+- Status: active
+- Description: Every pack must declare `format_version = 3`; v1, v2, absent and future versions are rejected whole by one named pack-level error and nothing from that pack is applied. A v3 pack may give one block up to six authored faces through the documented flat-stem overrides (all, top, bottom, side, east, west, south, north) resolved direction then side then all then built-in default, and may declare `model = cube, cross or crop` with `alpha = opaque, cutout or blend`; an unknown token rejects only that entry with a named error while absent tokens default to Cube and Opaque. The ordered stack merges per authored file and field with later packs winning, and `--validate-pack` prints per-entry results and exits 0 for a clean pack and nonzero for broken or missing packs without opening a window, GPU or save. This record replaces the retired v2 wording of R063.
+- Why it matters: Content packs are only authorable and stackable if parsing, merge precedence and a strict offline validator agree on one versioned rule set.
+- Source: M019 / S01 pack format v3
+- Primary owning slice: M019/S01
+- Supporting slices: M019/S02, M019/S03, M019/S05
+- Validation: cargo test -p opencraft-content --locked -- v2_content_arrays_are_rejected_with_one_pack_error; cargo test -p opencraft-content --locked -- format_version; cargo test --locked --lib -- pack::spec; cargo test --locked --lib -- pack::validate; bash scripts/validate_pack_smoke.sh; bash scripts/pack_smoke.sh
+
+### R107 — v3 live texture reload and built-in icon overrides
+- Class: core-capability
+- Status: active
+- Description: In a dev build, the 25 block and 13 mob fixed-name textures and the authored v3 block-face layers re-decode and re-upload only changed array layers at frozen indices; corrupt, non-square or out-of-range PNGs keep the last good layer; deletion reveals the lower pack or procedural art; manifest content or allocation changes set restart-required without moving a layer or touching the live registry. A v3 `[builtin_icons]` table maps frozen built-in material and tool names to pack-relative PNGs, later packs win per name, overrides target fixed base layers 0..=26 and never pack icons, malformed or missing art keeps the last good override or procedural sprite, and add, remove or repoint edits apply live through the item-sprite atlas without moving the content digest or requiring restart. This record replaces the retired v2 wording of R076 and R077; their mechanisms are unchanged.
+- Why it matters: Visual tuning is the core creator loop, and the live surfaces must describe the shipped v3 format rather than the retired v2 one.
+- Source: M019 / S03 model and alpha materials
+- Primary owning slice: M019/S03
+- Supporting slices: M019/S01, M014/S03, M014/S07
+- Validation: cargo test --locked --bin opencraft pack_texture; cargo test --locked --bin opencraft pack_builtin_icon; bash scripts/pack_smoke.sh; bash scripts/ui_smoke.sh
+
 ## M003 Criterion Trace
 
 | Criterion | Requirements | Slices | Evidence |
@@ -1157,3 +1250,15 @@ IDs are stable and follow the D022 inventory order. Do not renumber R### records
 | 8 | R098 | S08 | 23 debug smoke scripts and nine release-profile legs recorded in docs/RELEASE.md |
 | 9 | R098 | S08 | cargo fmt --all -- --check && cargo clippy --workspace --locked --all-targets -- -D warnings && cargo build --release --locked && bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu |
 | 10 | R089, R090, R093, R094, R095, R096, R097, R098 | S08 | bash scripts/requirements_check.sh && bash scripts/requirements_check_selftest.sh && WORKFLOW=ci.yml bash scripts/ci_gate.sh |
+
+## M019 Criterion Trace
+
+| Criterion | Requirements | Slices | Evidence |
+| --- | --- | --- | --- |
+| 1 | R104, R102 | S02 | cargo test -p opencraft --locked --lib -- pack::defaults; cargo test -p opencraft --locked --bin opencraft -- default_pack_startup; bash scripts/pack_smoke.sh |
+| 2 | R099, R100, R106 | S01, S03, S05 | bash scripts/external_pack_smoke.sh |
+| 3 | R100 | S03 | cargo test -p opencraft --locked --lib -- render::texture; bash scripts/presentation_smoke.sh |
+| 4 | R103, R106 | S01, S02, S05 | bash scripts/validate_pack_smoke.sh; cargo test -p opencraft --locked --lib -- pack:: |
+| 5 | R105, R102 | S04 | cargo test -p opencraft --locked --test worldgen_cli; bash scripts/worldgen_smoke.sh; bash scripts/village_smoke.sh |
+| 6 | R099, R100, R101 | S05 | bash scripts/external_pack_smoke.sh |
+| 7 | R102, R103 | S05 | cargo fmt --all -- --check; bash scripts/check_engine_boundaries.sh; cargo build --release --locked; bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu |

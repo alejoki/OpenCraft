@@ -1,4 +1,4 @@
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 description = "M010 reference pack: ruby ore, ruby block, ruby tools, ruby stew and a disabled shortbow recipe"
 version = "1.0.0"

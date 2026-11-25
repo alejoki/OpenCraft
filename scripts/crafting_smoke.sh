@@ -37,8 +37,9 @@
 #   pack from blocking startup.
 #
 #   Throughout: every copied pack file and the settings file must stay
-#   byte-identical while the pack is present (the game is read-only on packs/
-#   and settings.toml here).
+#   byte-identical while the pack is present. The shipped default is restored
+#   from embedded bytes, so a launch may only add absent `packs/default` files
+#   here; it never rewrites an existing pack byte or settings.toml.
 #
 # The pinned digest lines live in two places on purpose: here and in
 # `src/main.rs::crafting_demo_pins_the_checked_in_reference_pack_line_set`.
@@ -301,5 +302,5 @@ echo "CRAFTING SMOKE PASS [profile=$PROFILE]: --demo-crafting crafted mymod:ruby
 for line in "${EXPECTED_LINES[@]}"; do
     echo "CRAFTING SMOKE EVIDENCE: $line"
 done
-echo "CRAFTING SMOKE EVIDENCE: authored launch exit=124 missing-pack launch exit=124 broken-pack launch exit=124 panic=none pack+settings byte-identical while present"
+echo "CRAFTING SMOKE EVIDENCE: authored launch exit=124 missing-pack launch exit=124 broken-pack launch exit=124 panic=none present pack+settings byte-identical (shipped-default restore only fills absent files)"
 exit 0

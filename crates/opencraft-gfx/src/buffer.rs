@@ -22,11 +22,26 @@ pub fn water_buffer_bytes(mesh: &ChunkMesh) -> usize {
     mesh.water_quad_count() * PACKED_QUAD_BYTES
 }
 
-/// Total GPU vertex bytes a chunk's mesh occupies: opaque plus water. This is
-/// what `GpuChunk::byte_size` (and therefore `total_vram_bytes`) must count so
-/// the title-bar VRAM readout stays honest once water is uploaded.
+/// Crossed-plant vertex-buffer bytes for a mesh; zero when the mesh has no
+/// cross/crop geometry.
+pub fn cross_buffer_bytes(mesh: &ChunkMesh) -> usize {
+    mesh.cross_quad_count() * PACKED_QUAD_BYTES
+}
+
+/// Alpha-blended cube-face vertex-buffer bytes (glass); zero when the mesh has
+/// no blend geometry.
+pub fn blend_buffer_bytes(mesh: &ChunkMesh) -> usize {
+    mesh.blend_quad_count() * PACKED_QUAD_BYTES
+}
+
+/// Total GPU vertex bytes a chunk's mesh occupies: opaque, water, cross and
+/// blend. This is what `GpuChunk::byte_size` (and therefore
+/// `total_vram_bytes`) must count so the title-bar VRAM readout stays honest.
 pub fn chunk_vram_bytes(mesh: &ChunkMesh) -> usize {
-    opaque_buffer_bytes(mesh) + water_buffer_bytes(mesh)
+    opaque_buffer_bytes(mesh)
+        + water_buffer_bytes(mesh)
+        + cross_buffer_bytes(mesh)
+        + blend_buffer_bytes(mesh)
 }
 
 /// Vertex range covered by the water quads: six vertices per quad. The water
@@ -36,17 +51,36 @@ pub fn water_vertex_range(mesh: &ChunkMesh) -> Range<u32> {
     0..(mesh.water_quad_count() as u32) * QUAD_VERTICES
 }
 
+/// Vertex range covered by the crossed-plant quads: six vertices per quad.
+pub fn cross_vertex_range(mesh: &ChunkMesh) -> Range<u32> {
+    0..(mesh.cross_quad_count() as u32) * QUAD_VERTICES
+}
+
+/// Vertex range covered by the alpha-blended cube faces: six vertices per quad.
+pub fn blend_vertex_range(mesh: &ChunkMesh) -> Range<u32> {
+    0..(mesh.blend_quad_count() as u32) * QUAD_VERTICES
+}
+
 pub struct GpuChunk {
     pub vertex_buffer: wgpu::Buffer,
     /// Translucent water geometry, intentionally a separate buffer from
     /// `vertex_buffer` so water can never enter the opaque draw path (D070).
     /// `None` when the mesh carries no water.
     pub water_vertex_buffer: Option<wgpu::Buffer>,
+    /// Crossed-plant geometry (`face_dir` 6/7), drawn with the voxel pipeline
+    /// between the mob batch and the translucent stage. `None` when the mesh
+    /// carries no cross/crop quads.
+    pub cross_vertex_buffer: Option<wgpu::Buffer>,
+    /// Alpha-blended cube faces (glass), drawn with the blend pipeline in the
+    /// sorted translucent stage. `None` when the mesh carries no blend quads.
+    pub blend_vertex_buffer: Option<wgpu::Buffer>,
     pub bind_group: wgpu::BindGroup,
     pub bucket_ranges: [Range<u32>; 6],
     pub pos: ChunkPos,
     pub quad_count: usize,
     pub water_quad_count: usize,
+    pub cross_quad_count: usize,
+    pub blend_quad_count: usize,
     pub byte_size: usize,
 }
 
@@ -54,9 +88,11 @@ pub struct GpuChunk {
 pub struct ChunkRenderStore {
     pub chunks: FxHashMap<ChunkPos, GpuChunk>,
     pub total_vram_bytes: usize,
-    /// Opaque quads only; water is tracked separately in `total_water_quads`.
+    /// Opaque quads only; water/cross/blend are tracked separately.
     pub total_quads: usize,
     pub total_water_quads: usize,
+    pub total_cross_quads: usize,
+    pub total_blend_quads: usize,
 }
 
 impl ChunkRenderStore {
@@ -69,6 +105,8 @@ impl ChunkRenderStore {
             self.total_vram_bytes = self.total_vram_bytes.saturating_sub(old.byte_size);
             self.total_quads = self.total_quads.saturating_sub(old.quad_count);
             self.total_water_quads = self.total_water_quads.saturating_sub(old.water_quad_count);
+            self.total_cross_quads = self.total_cross_quads.saturating_sub(old.cross_quad_count);
+            self.total_blend_quads = self.total_blend_quads.saturating_sub(old.blend_quad_count);
         }
     }
 
@@ -84,6 +122,8 @@ impl ChunkRenderStore {
         self.total_vram_bytes = 0;
         self.total_quads = 0;
         self.total_water_quads = 0;
+        self.total_cross_quads = 0;
+        self.total_blend_quads = 0;
     }
 
     pub fn upload_mesh(
@@ -96,7 +136,9 @@ impl ChunkRenderStore {
         self.remove_chunk(pos);
         let total = mesh.total_quads();
         let water_count = mesh.water_quad_count();
-        if total == 0 && water_count == 0 {
+        let cross_count = mesh.cross_quad_count();
+        let blend_count = mesh.blend_quad_count();
+        if total == 0 && water_count == 0 && cross_count == 0 && blend_count == 0 {
             return;
         }
 
@@ -133,6 +175,30 @@ impl ChunkRenderStore {
             )
         };
 
+        let cross_vertex_buffer = if cross_count == 0 {
+            None
+        } else {
+            Some(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("chunk_cross_buffer"),
+                    contents: bytemuck::cast_slice(&mesh.cross_quads),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            )
+        };
+
+        let blend_vertex_buffer = if blend_count == 0 {
+            None
+        } else {
+            Some(
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("chunk_blend_buffer"),
+                    contents: bytemuck::cast_slice(&mesh.blend_quads),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }),
+            )
+        };
+
         let origin = [
             (pos.x * CHUNK_SIZE as i32) as f32,
             (pos.y * CHUNK_SIZE as i32) as f32,
@@ -158,17 +224,23 @@ impl ChunkRenderStore {
         self.total_vram_bytes += byte_size;
         self.total_quads += total;
         self.total_water_quads += water_count;
+        self.total_cross_quads += cross_count;
+        self.total_blend_quads += blend_count;
 
         self.chunks.insert(
             pos,
             GpuChunk {
                 vertex_buffer,
                 water_vertex_buffer,
+                cross_vertex_buffer,
+                blend_vertex_buffer,
                 bind_group,
                 bucket_ranges,
                 pos,
                 quad_count: total,
                 water_quad_count: water_count,
+                cross_quad_count: cross_count,
+                blend_quad_count: blend_count,
                 byte_size,
             },
         );
@@ -230,6 +302,94 @@ mod tests {
         mesh
     }
 
+    /// Synthetic mesh carrying every quad class, so one fixture can pin all
+    /// four buffers independently. Cross plants emit `face_dir` 6/7 and blend
+    /// faces are plain cube quads, matching what the mesher produces.
+    fn synthetic_full_mesh(
+        opaque_per_bucket: usize,
+        water: usize,
+        cross: usize,
+        blend: usize,
+    ) -> ChunkMesh {
+        let mut mesh = synthetic_mesh(opaque_per_bucket, water);
+        for n in 0..cross {
+            mesh.cross_quads.push(PackedQuad::new(
+                [(n % 32) as u32, 5, 6],
+                [1, 1],
+                6 + (n as u32 % 2),
+                19,
+                0xFF,
+                0xFFFF,
+            ));
+        }
+        for n in 0..blend {
+            mesh.blend_quads.push(PackedQuad::new(
+                [(n % 32) as u32, 7, 8],
+                [1, 1],
+                (n as u32) % 6,
+                25,
+                0xFF,
+                0xFFFF,
+            ));
+        }
+        mesh
+    }
+
+    #[test]
+    fn cross_and_blend_buffer_sizing_and_vertex_ranges() {
+        // Cross-only chunk: the opaque upload stays empty while the cross
+        // buffer gets its own size and vertex range.
+        let cross_only = synthetic_full_mesh(0, 0, 2, 0);
+        assert_eq!(cross_only.total_quads(), 0);
+        assert_eq!(cross_only.cross_quad_count(), 2);
+        assert_eq!(cross_buffer_bytes(&cross_only), 16);
+        assert_eq!(cross_vertex_range(&cross_only), 0..12);
+        assert_eq!(blend_buffer_bytes(&cross_only), 0);
+        assert_eq!(blend_vertex_range(&cross_only), 0..0);
+        assert_eq!(chunk_vram_bytes(&cross_only), 16);
+
+        // Blend-only chunk (glass): same rule, separate buffer.
+        let blend_only = synthetic_full_mesh(0, 0, 0, 3);
+        assert_eq!(blend_only.total_quads(), 0);
+        assert_eq!(blend_only.blend_quad_count(), 3);
+        assert_eq!(blend_buffer_bytes(&blend_only), 24);
+        assert_eq!(blend_vertex_range(&blend_only), 0..18);
+        assert_eq!(cross_buffer_bytes(&blend_only), 0);
+        assert_eq!(chunk_vram_bytes(&blend_only), 24);
+
+        // Empty mesh: every buffer is zero-sized and no range is non-empty.
+        let empty = synthetic_full_mesh(0, 0, 0, 0);
+        for bytes in [
+            opaque_buffer_bytes(&empty),
+            water_buffer_bytes(&empty),
+            cross_buffer_bytes(&empty),
+            blend_buffer_bytes(&empty),
+            chunk_vram_bytes(&empty),
+        ] {
+            assert_eq!(bytes, 0);
+        }
+        assert_eq!(cross_vertex_range(&empty), 0..0);
+        assert_eq!(blend_vertex_range(&empty), 0..0);
+    }
+
+    #[test]
+    fn mixed_mesh_counts_every_class_and_sums_its_bytes_into_vram() {
+        let mixed = synthetic_full_mesh(1, 2, 3, 4);
+        assert_eq!(mixed.total_quads(), 6, "six buckets x one opaque quad");
+        assert_eq!(mixed.water_quad_count(), 2);
+        assert_eq!(mixed.cross_quad_count(), 3);
+        assert_eq!(mixed.blend_quad_count(), 4);
+        assert_eq!(mixed.total_quads_including_water(), 15);
+
+        assert_eq!(opaque_buffer_bytes(&mixed), 48);
+        assert_eq!(water_buffer_bytes(&mixed), 16);
+        assert_eq!(cross_buffer_bytes(&mixed), 24);
+        assert_eq!(blend_buffer_bytes(&mixed), 32);
+        assert_eq!(chunk_vram_bytes(&mixed), 48 + 16 + 24 + 32);
+        assert_eq!(cross_vertex_range(&mixed), 0..18);
+        assert_eq!(blend_vertex_range(&mixed), 0..24);
+    }
+
     #[test]
     fn water_buffer_sizing_and_vertex_range_for_water_only_opaque_only_and_mixed_meshes() {
         assert_eq!(
@@ -289,11 +449,13 @@ mod tests {
     }
 
     #[test]
-    fn clear_zeroes_total_water_quads() {
+    fn clear_zeroes_every_quad_counter() {
         let mut store = ChunkRenderStore::new();
         store.total_quads = 2;
         store.total_water_quads = 4;
-        store.total_vram_bytes = 48;
+        store.total_cross_quads = 6;
+        store.total_blend_quads = 8;
+        store.total_vram_bytes = 160;
 
         store.clear();
 
@@ -301,6 +463,8 @@ mod tests {
         assert_eq!(store.total_vram_bytes, 0);
         assert_eq!(store.total_quads, 0);
         assert_eq!(store.total_water_quads, 0);
+        assert_eq!(store.total_cross_quads, 0);
+        assert_eq!(store.total_blend_quads, 0);
     }
 
     #[test]
@@ -308,13 +472,17 @@ mod tests {
         let mut store = ChunkRenderStore::new();
         store.total_quads = 2;
         store.total_water_quads = 4;
-        store.total_vram_bytes = 48;
+        store.total_cross_quads = 6;
+        store.total_blend_quads = 8;
+        store.total_vram_bytes = 160;
 
         store.remove_chunk(ChunkPos { x: -9, y: 1, z: 5 });
 
         assert!(store.chunks.is_empty());
-        assert_eq!(store.total_vram_bytes, 48);
+        assert_eq!(store.total_vram_bytes, 160);
         assert_eq!(store.total_quads, 2);
         assert_eq!(store.total_water_quads, 4);
+        assert_eq!(store.total_cross_quads, 6);
+        assert_eq!(store.total_blend_quads, 8);
     }
 }

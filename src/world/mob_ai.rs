@@ -261,7 +261,11 @@ pub fn step_hostile(
                 eye.y.floor() as i32,
                 eye.z.floor() as i32,
             );
-            let eye_open = !world.block(eye_cell.x, eye_cell.y, eye_cell.z).is_solid();
+            // A window pane is see-through: only light-opaque cells close the
+            // eye this tick.
+            let eye_open = !world
+                .block(eye_cell.x, eye_cell.y, eye_cell.z)
+                .is_light_opaque();
             if mob.cooldown <= MOB_FIRE_COOLDOWN_EPS
                 && visible
                 && vertical.abs() <= MOB_FIRE_VERTICAL

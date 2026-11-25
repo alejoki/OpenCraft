@@ -7,10 +7,12 @@
 //! manager owns when it runs, where the grids live, and how they reach the
 //! mesher.
 //!
-//! S01 opacity rule: a block is opaque exactly when `BlockId::is_solid()`; Water
-//! and Air are transparent, so a water column never stops the sky shaft. (A
-//! dedicated water/glass opacity predicate was not needed: the solid/liquid
-//! split already lives in `BlockId`.)
+//! S03 opacity rule: a block stops sky light exactly when
+//! `BlockId::is_light_opaque()`, which is `is_solid() && self != Glass`. Air,
+//! Water and the non-solid wheat plants are transparent, so a water column or
+//! a crop row never stops the sky shaft. Glass is the one collision-solid id
+//! that passes sky light: a window lights the room behind it. Leaves and
+//! ordinary terrain stay opaque.
 
 use std::collections::VecDeque;
 
@@ -168,7 +170,7 @@ where
             let mut level = MAX_SKY_LIGHT;
             for wy in (min_wy..max_wy).rev() {
                 let idx = index(wx, wy, wz);
-                if get_block(wx, wy, wz).is_solid() {
+                if get_block(wx, wy, wz).is_light_opaque() {
                     solid[idx] = true;
                     level = 0;
                 } else {
@@ -355,6 +357,60 @@ mod tests {
         );
     }
 
+    /// Glass is collision-solid but light-transparent: a window roof must let
+    /// the full sky shaft through instead of occluding like stone.
+    #[test]
+    fn glass_roof_passes_sky_light_like_a_window() {
+        let get_block = |x: i32, y: i32, _z: i32| {
+            if y <= 0 {
+                BlockId::Stone
+            } else if y == 4 && x <= 15 {
+                BlockId::Glass
+            } else {
+                BlockId::Air
+            }
+        };
+        let grids = compute_region_light(get_block, 0, 0, 0, 0);
+        let grid = chunk_grid(&grids, 0, 0, 0);
+
+        assert_eq!(
+            grid.get(8, 3, 8),
+            MAX_SKY_LIGHT,
+            "the cells under a glass roof stay fully sky lit"
+        );
+        assert_eq!(
+            grid.get(8, 4, 8),
+            MAX_SKY_LIGHT,
+            "the glass cell itself is transparent to light"
+        );
+    }
+
+    /// Wheat is a non-solid plant, so a crop row must not stop the sky shaft
+    /// the way an opaque block does.
+    #[test]
+    fn wheat_plants_do_not_block_sky_light() {
+        let get_block = |_x: i32, y: i32, _z: i32| {
+            if y <= 0 {
+                BlockId::Farmland
+            } else if (1..=3).contains(&y) {
+                BlockId::WheatStage3
+            } else {
+                BlockId::Air
+            }
+        };
+        let grids = compute_region_light(get_block, 0, 0, 0, 0);
+        let grid = chunk_grid(&grids, 0, 0, 0);
+
+        for y in 1..=3 {
+            assert_eq!(
+                grid.get(5, y, 5),
+                MAX_SKY_LIGHT,
+                "wheat at y={y} must not occlude sky light"
+            );
+        }
+        assert_eq!(grid.get(5, 4, 5), MAX_SKY_LIGHT);
+    }
+
     #[test]
     fn sealed_cave_is_completely_dark() {
         // Ground, plus a 5x5x5 solid cube holding one enclosed air cell.
@@ -450,8 +506,8 @@ mod tests {
     /// Sky-light site of the S03 water mobility matrix: `compute_region_light`
     /// treats a non-solid block as transparent, so a Water column must stay
     /// fully sky lit instead of occluding like a solid roof. Water is
-    /// passable-not-walkable here because `BlockId::is_solid()` (the opacity
-    /// predicate used by this module) excludes Water.
+    /// passable-not-walkable here because `BlockId::is_light_opaque()` (the
+    /// opacity predicate used by this module) excludes Water.
     #[test]
     fn water_column_is_sky_lit_like_air_and_never_occludes_like_a_solid_roof() {
         // Air control: seabed at y <= 0, open sky above.

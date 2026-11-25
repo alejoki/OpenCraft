@@ -42,6 +42,85 @@ impl ToolKind {
     }
 }
 
+/// Render model authored for a block.
+///
+/// The neutral authored model owns the enum so a pack never names a render
+/// type; the game maps it onto its own render class. The lowercase token is
+/// the only spelling a pack may author.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlockModel {
+    /// Full solid cube; the default for every block that omits `model`.
+    #[default]
+    Cube,
+    /// Two crossed quads, used for plants such as tall grass and wheat.
+    Cross,
+    /// A cross plant whose growth stage selects the quad, for crops.
+    Crop,
+}
+
+impl BlockModel {
+    /// Exact lowercase token authored in `model =`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BlockModel::Cube => "cube",
+            BlockModel::Cross => "cross",
+            BlockModel::Crop => "crop",
+        }
+    }
+
+    /// Parse the exact lowercase token, or `None` for any other spelling.
+    ///
+    /// Deliberately not [`std::str::FromStr`]: the parser wants a cheap
+    /// `Option` token lookup, not the trait's error type.
+    pub fn parse_token(value: &str) -> Option<BlockModel> {
+        match value {
+            "cube" => Some(BlockModel::Cube),
+            "cross" => Some(BlockModel::Cross),
+            "crop" => Some(BlockModel::Crop),
+            _ => None,
+        }
+    }
+}
+
+/// Alpha mode authored for a block's faces.
+///
+/// The neutral authored model owns the enum so the parser is the single place
+/// an unknown token is rejected; the game maps it onto its own alpha class.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum BlockAlpha {
+    /// Fully opaque faces; the default for every block that omits `alpha`.
+    #[default]
+    Opaque,
+    /// Binary transparency: alpha below the cutout threshold is discarded.
+    Cutout,
+    /// Sorted translucency blended over the opaque scene.
+    Blend,
+}
+
+impl BlockAlpha {
+    /// Exact lowercase token authored in `alpha =`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BlockAlpha::Opaque => "opaque",
+            BlockAlpha::Cutout => "cutout",
+            BlockAlpha::Blend => "blend",
+        }
+    }
+
+    /// Parse the exact lowercase token, or `None` for any other spelling.
+    ///
+    /// Deliberately not [`std::str::FromStr`]: the parser wants a cheap
+    /// `Option` token lookup, not the trait's error type.
+    pub fn parse_token(value: &str) -> Option<BlockAlpha> {
+        match value {
+            "opaque" => Some(BlockAlpha::Opaque),
+            "cutout" => Some(BlockAlpha::Cutout),
+            "blend" => Some(BlockAlpha::Blend),
+            _ => None,
+        }
+    }
+}
+
 /// Severity of a pack-content diagnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Severity {
@@ -64,7 +143,45 @@ pub struct ContentDiagnostic {
     pub reason: String,
 }
 
-/// Everything a v2 pack authors, before registry allocation.
+/// Frozen face index → direction label.
+///
+/// Matches the game's `src/world/block.rs` and `prefab::Direction` order:
+/// 0=+X/east, 1=-X/west, 2=+Y/top, 3=-Y/bottom, 4=+Z/south, 5=-Z/north.
+pub const FACE_DIRECTIONS: [&str; 6] = ["east", "west", "top", "bottom", "south", "north"];
+
+/// Direction label for a face index, or `None` when the index is out of range.
+pub fn face_direction(face: usize) -> Option<&'static str> {
+    FACE_DIRECTIONS.get(face).copied()
+}
+
+/// Where a built-in block face's texture bytes come from.
+///
+/// `Layer` means the bytes already live in a fixed base layer (for example a
+/// legacy `<stem>_top.png` file that is still a built-in layer). `Authored`
+/// names a pack-relative file that the loader decoded into
+/// [`PackContentSpec::assets`] and that the catalog allocates at `48 + i`.
+/// `None` on [`BuiltinFaceEntry::faces`] means keep the built-in
+/// `face_tex_layer` default.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FaceSource {
+    Layer(u8),
+    Authored(String),
+}
+
+/// One loader-synthesized per-direction face plan for a built-in block.
+///
+/// The neutral crate never synthesizes these itself: the game loader inspects
+/// a pack folder and fills the table, so built-in blocks can point at new
+/// per-direction PNGs without changing their raw ids.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct BuiltinFaceEntry {
+    /// Built-in block short name, for example `stone`.
+    pub block: String,
+    /// Per-face sources in the frozen [`FACE_DIRECTIONS`] order.
+    pub faces: [Option<FaceSource>; 6],
+}
+
+/// Everything a v3 pack authors, before registry allocation.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PackContentSpec {
     pub blocks: Vec<BlockEntry>,
@@ -84,6 +201,11 @@ pub struct PackContentSpec {
     pub builtin_icons: BTreeMap<String, String>,
     /// Resampled 16x16 RGBA assets keyed by pack-relative authored path.
     pub assets: BTreeMap<String, PackAsset>,
+    /// Per-direction face overrides for built-in blocks, synthesized by the
+    /// loader from the pack folder. Empty means every built-in block keeps its
+    /// `face_tex_layer` default, so the plan never enters the digest until a
+    /// new authored face file exists.
+    pub builtin_faces: Vec<BuiltinFaceEntry>,
 }
 
 /// One authored block definition.
@@ -103,17 +225,27 @@ pub struct BlockEntry {
     pub tool: Option<ToolKind>,
     /// Maximum stack size of the block item.
     pub stack_limit: u16,
+    /// Authored render model; `Cube` when the pack omits `model`.
+    pub model: BlockModel,
+    /// Authored alpha mode; `Opaque` when the pack omits `alpha`.
+    pub alpha: BlockAlpha,
 }
 
 /// Authored block face texture file names.
 ///
-/// `all` supplies every face; a specific face overrides `all` for that face.
+/// Resolution precedence is fixed per face: the four sides (`east`, `west`,
+/// `south`, `north`) fall back through `side` and then `all`; `top` and
+/// `bottom` fall back directly to `all` and never consult `side`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlockTextures {
     pub all: Option<String>,
     pub top: Option<String>,
     pub bottom: Option<String>,
     pub side: Option<String>,
+    pub north: Option<String>,
+    pub south: Option<String>,
+    pub east: Option<String>,
+    pub west: Option<String>,
 }
 
 /// One authored generic item (also the carrier of pack food data).
@@ -209,6 +341,10 @@ pub struct BlockPatch {
     pub drop: Option<String>,
     pub tool: Option<ToolKind>,
     pub stack_limit: Option<u16>,
+    /// Patch over the built-in render model; `None` leaves it untouched.
+    pub model: Option<BlockModel>,
+    /// Patch over the built-in alpha mode; `None` leaves it untouched.
+    pub alpha: Option<BlockAlpha>,
 }
 
 /// Enable/disable a built-in recipe.
@@ -226,4 +362,39 @@ pub struct PackAsset {
     pub rgba: Vec<u8>,
     /// Authored side length before resampling.
     pub source_side: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn block_model_tokens_round_trip_and_reject_other_spellings() {
+        for model in [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop] {
+            assert_eq!(BlockModel::parse_token(model.as_str()), Some(model));
+        }
+        assert_eq!(
+            [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop].map(BlockModel::as_str),
+            ["cube", "cross", "crop"]
+        );
+        for unknown in ["", "Cube", "CUBE", "column", "cross "] {
+            assert_eq!(BlockModel::parse_token(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(BlockModel::default(), BlockModel::Cube);
+    }
+
+    #[test]
+    fn block_alpha_tokens_round_trip_and_reject_other_spellings() {
+        for alpha in [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend] {
+            assert_eq!(BlockAlpha::parse_token(alpha.as_str()), Some(alpha));
+        }
+        assert_eq!(
+            [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend].map(BlockAlpha::as_str),
+            ["opaque", "cutout", "blend"]
+        );
+        for unknown in ["", "Opaque", "translucent", "blend ", "cut_out"] {
+            assert_eq!(BlockAlpha::parse_token(unknown), None, "{unknown:?}");
+        }
+        assert_eq!(BlockAlpha::default(), BlockAlpha::Opaque);
+    }
 }

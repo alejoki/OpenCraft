@@ -1,9 +1,13 @@
-//! v2 content-array parsing with per-entry diagnostics.
+//! v3 content-array parsing with per-entry diagnostics.
 //!
 //! A pack must never fail to load because one entry is wrong. Each authored
 //! array entry is validated independently and either accepted into
 //! [`PackContentSpec`] or rejected with a [`ContentDiagnostic`] naming
 //! `"<kind> <id>"`; valid siblings are kept.
+//!
+//! Format version 3 is the only accepted format. V1, V2 and future versions are
+//! rejected by exactly one pack-level error from
+//! [`crate::manifest::format_gate_error`] and no content is parsed.
 //!
 //! Parsing is filesystem-free except for [`load_content_assets`], which reads
 //! already-validated relative paths through [`crate::asset`]. Cross-pack
@@ -18,9 +22,9 @@ use crate::decode::{self, MAX_LAYER_SIDE, MIN_LAYER_SIDE};
 use crate::manifest::PackFormat;
 use crate::resample;
 use crate::spec::{
-    BlockEntry, BlockPatch, BlockTextures, ContentDiagnostic, FoodSpec, ItemEntry, PackAsset,
-    PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry, ToolEntry, ToolKind,
-    WorldgenEntry, WorldgenKind,
+    BlockAlpha, BlockEntry, BlockModel, BlockPatch, BlockTextures, ContentDiagnostic, FoodSpec,
+    ItemEntry, PackAsset, PackContentSpec, RecipeEntry, RecipePatch, Severity, TierEntry,
+    ToolEntry, ToolKind, WorldgenEntry, WorldgenKind,
 };
 use crate::vocabulary as names;
 use crate::warning::PackWarning;
@@ -31,26 +35,13 @@ const MAX_ARRAY_ENTRIES: usize = 256;
 /// Presentation-only table of built-in item sprite overrides.
 const BUILTIN_ICON_TABLE: &str = "builtin_icons";
 
-/// Arrays that only exist in format version 2.
-const CONTENT_ARRAY_KEYS: [&str; 8] = [
-    "blocks",
-    "items",
-    "tiers",
-    "tools",
-    "recipes",
-    "worldgen",
-    "block_patches",
-    "recipe_patches",
-];
-
-/// Parse the v2 content arrays out of an already-parsed manifest root.
+/// Parse the v3 content arrays out of an already-parsed manifest root.
 ///
 /// Version gating happens here:
-/// - [`PackFormat::V1`] ignores content arrays entirely and emits exactly one
-///   warning when any array is present.
-/// - [`PackFormat::Future`] always warns once that the format is newer than
-///   this build and ignores content; textures and sounds still load.
-/// - [`PackFormat::V2`] parses every array.
+/// - [`PackFormat::V3`] parses every array.
+/// - [`PackFormat::V1`], [`PackFormat::V3`] and [`PackFormat::Future`] return an
+///   empty spec plus exactly one pack-level error naming the single supported
+///   format. They emit no warnings.
 ///
 /// Entry-scoped problems become [`ContentDiagnostic`] values; they never
 /// propagate as an error.
@@ -58,39 +49,12 @@ pub fn parse_content(
     root: &toml::Value,
     format: PackFormat,
 ) -> (PackContentSpec, Vec<PackWarning>, Vec<ContentDiagnostic>) {
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     let mut diagnostics = Vec::new();
 
-    match format {
-        PackFormat::V1 => {
-            if CONTENT_ARRAY_KEYS
-                .iter()
-                .any(|key| root.get(*key).is_some())
-            {
-                warnings.push(PackWarning {
-                    field: "pack.toml".to_string(),
-                    reason: "content arrays require format_version = 2".to_string(),
-                });
-            } else if root.get(BUILTIN_ICON_TABLE).is_some() {
-                // Separate text from the array warning so existing pinned
-                // messages stay byte-identical; a pack with both warns once.
-                warnings.push(PackWarning {
-                    field: "pack.toml".to_string(),
-                    reason: "builtin icon overrides require format_version = 2".to_string(),
-                });
-            }
-            return (PackContentSpec::default(), warnings, diagnostics);
-        }
-        PackFormat::Future(version) => {
-            warnings.push(PackWarning {
-                field: "pack.toml".to_string(),
-                reason: format!(
-                    "format_version {version} is newer than 2; content arrays are ignored"
-                ),
-            });
-            return (PackContentSpec::default(), warnings, diagnostics);
-        }
-        PackFormat::V2 => {}
+    if let Some(reason) = crate::manifest::format_gate_error(format) {
+        err(&mut diagnostics, "pack", reason);
+        return (PackContentSpec::default(), warnings, diagnostics);
     }
 
     let mut spec = PackContentSpec::default();
@@ -274,6 +238,10 @@ fn collect_asset_paths(spec: &PackContentSpec) -> BTreeSet<&str> {
             &block.textures.top,
             &block.textures.bottom,
             &block.textures.side,
+            &block.textures.north,
+            &block.textures.south,
+            &block.textures.east,
+            &block.textures.west,
         ]
         .into_iter()
         .flatten()
@@ -300,7 +268,7 @@ fn collect_asset_paths(spec: &PackContentSpec) -> BTreeSet<&str> {
 ///
 /// Every accepted entry is a built-in material/tool short name mapped to a
 /// pack-relative authored PNG path. The table never feeds registry allocation
-/// or the content digest: it is validated here, its paths join the normal v2
+/// or the content digest: it is validated here, its paths join the normal v3
 /// asset pipeline, and presentation applies the loaded bytes later.
 fn parse_builtin_icons(
     root: &toml::Value,
@@ -807,6 +775,8 @@ fn parse_block(
     let drop = optional_string(table, "drop", &entry, diagnostics).ok()?;
     let tool = parse_block_tool(table, &entry, diagnostics).ok()?;
     let stack_limit = integer_in(table, "stack", 1, 999, 999, &entry, diagnostics).ok()? as u16;
+    let model = parse_block_model(table, &entry, diagnostics).ok()?;
+    let alpha = parse_block_alpha(table, &entry, diagnostics).ok()?;
     if !content_ids.insert(id.clone()) {
         err(
             diagnostics,
@@ -824,7 +794,100 @@ fn parse_block(
         drop,
         tool,
         stack_limit,
+        model,
+        alpha,
     })
+}
+
+/// Parse the optional `model` field, defaulting to `Cube` when absent.
+///
+/// Only the exact lowercase tokens are accepted; an unknown value names the
+/// entry and rejects just that entry.
+fn parse_block_model(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<BlockModel> {
+    let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
+        return Ok(BlockModel::default());
+    };
+    match BlockModel::parse_token(&name) {
+        Some(model) => Ok(model),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown model `{name}`; expected cube, cross, crop"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `alpha` field, defaulting to `Opaque` when absent.
+fn parse_block_alpha(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<BlockAlpha> {
+    let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
+        return Ok(BlockAlpha::default());
+    };
+    match BlockAlpha::parse_token(&name) {
+        Some(alpha) => Ok(alpha),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown alpha `{name}`; expected opaque, cutout, blend"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `model` patch field.
+fn parse_block_model_patch(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<Option<BlockModel>> {
+    let Some(name) = optional_string(table, "model", entry, diagnostics)? else {
+        return Ok(None);
+    };
+    match BlockModel::parse_token(&name) {
+        Some(model) => Ok(Some(model)),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown model `{name}`; expected cube, cross, crop"),
+            );
+            Err(())
+        }
+    }
+}
+
+/// Parse the optional `alpha` patch field.
+fn parse_block_alpha_patch(
+    table: &toml::Table,
+    entry: &str,
+    diagnostics: &mut Vec<ContentDiagnostic>,
+) -> Parsed<Option<BlockAlpha>> {
+    let Some(name) = optional_string(table, "alpha", entry, diagnostics)? else {
+        return Ok(None);
+    };
+    match BlockAlpha::parse_token(&name) {
+        Some(alpha) => Ok(Some(alpha)),
+        None => {
+            err(
+                diagnostics,
+                entry,
+                format!("unknown alpha `{name}`; expected opaque, cutout, blend"),
+            );
+            Err(())
+        }
+    }
 }
 
 fn parse_block_textures(
@@ -857,17 +920,25 @@ fn parse_block_textures(
         top: optional_string(textures, "top", entry, diagnostics)?,
         bottom: optional_string(textures, "bottom", entry, diagnostics)?,
         side: optional_string(textures, "side", entry, diagnostics)?,
+        north: optional_string(textures, "north", entry, diagnostics)?,
+        south: optional_string(textures, "south", entry, diagnostics)?,
+        east: optional_string(textures, "east", entry, diagnostics)?,
+        west: optional_string(textures, "west", entry, diagnostics)?,
     };
 
     if block_textures.all.is_none()
         && block_textures.top.is_none()
         && block_textures.bottom.is_none()
         && block_textures.side.is_none()
+        && block_textures.north.is_none()
+        && block_textures.south.is_none()
+        && block_textures.east.is_none()
+        && block_textures.west.is_none()
     {
         err(
             diagnostics,
             entry,
-            "`textures` must set at least one of `all`, `top`, `bottom`, `side`",
+            "`textures` must set at least one of `all`, `top`, `bottom`, `side`, `north`, `south`, `east`, `west`",
         );
         return Err(());
     }
@@ -877,6 +948,10 @@ fn parse_block_textures(
         ("textures.top", &block_textures.top),
         ("textures.bottom", &block_textures.bottom),
         ("textures.side", &block_textures.side),
+        ("textures.north", &block_textures.north),
+        ("textures.south", &block_textures.south),
+        ("textures.east", &block_textures.east),
+        ("textures.west", &block_textures.west),
     ] {
         if let Some(path) = path {
             validate_asset_path(path, field, entry, diagnostics)?;
@@ -1077,7 +1152,7 @@ fn parse_tool(
             err(
                 diagnostics,
                 entry,
-                "`kind = \"bow\"` is not authorable in format v2".to_string(),
+                "`kind = \"bow\"` is not authorable in format v3".to_string(),
             );
             return None;
         }
@@ -1413,14 +1488,16 @@ fn parse_block_patch(
         err(diagnostics, entry, format!("unknown built-in block `{id}`"));
         return None;
     }
-    let has_field = ["name", "hardness", "drop", "tool", "stack"]
-        .iter()
-        .any(|key| table.contains_key(*key));
+    let has_field = [
+        "name", "hardness", "drop", "tool", "stack", "model", "alpha",
+    ]
+    .iter()
+    .any(|key| table.contains_key(*key));
     if !has_field {
         err(
             diagnostics,
             entry,
-            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`",
+            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`, `model`, `alpha`",
         );
         return None;
     }
@@ -1442,6 +1519,8 @@ fn parse_block_patch(
     };
     let drop = optional_string(table, "drop", &entry, diagnostics).ok()?;
     let tool = parse_block_tool(table, &entry, diagnostics).ok()?;
+    let model = parse_block_model_patch(table, &entry, diagnostics).ok()?;
+    let alpha = parse_block_alpha_patch(table, &entry, diagnostics).ok()?;
     let stack_limit = match optional_integer(table, "stack", &entry, diagnostics).ok()? {
         Some(stack) => {
             if !(1..=999).contains(&stack) {
@@ -1473,6 +1552,8 @@ fn parse_block_patch(
         drop,
         tool,
         stack_limit,
+        model,
+        alpha,
     })
 }
 
@@ -1681,7 +1762,7 @@ mod tests {
     use crate::spec::WorldgenKind;
 
     const VALID_PACK: &str = r#"
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -1754,9 +1835,9 @@ id = "planks"
 enabled = false
 "#;
 
-    fn parse_v2(text: &str) -> (PackContentSpec, Vec<PackWarning>, Vec<ContentDiagnostic>) {
+    fn parse_v3(text: &str) -> (PackContentSpec, Vec<PackWarning>, Vec<ContentDiagnostic>) {
         let root: toml::Value = toml::from_str(text).expect("fixture TOML must parse");
-        parse_content(&root, PackFormat::V2)
+        parse_content(&root, PackFormat::V3)
     }
 
     fn parse_format(
@@ -1826,7 +1907,7 @@ enabled = false
     }
 
     fn load_assets(text: &str, dir: &std::path::Path) -> (PackContentSpec, Vec<ContentDiagnostic>) {
-        let (mut spec, warnings, mut diagnostics) = parse_v2(text);
+        let (mut spec, warnings, mut diagnostics) = parse_v3(text);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         load_content_assets(dir, &mut spec, &mut diagnostics);
         (spec, diagnostics)
@@ -1834,7 +1915,7 @@ enabled = false
 
     #[test]
     fn valid_full_pack_parses_without_diagnostics() {
-        let (spec, warnings, diagnostics) = parse_v2(VALID_PACK);
+        let (spec, warnings, diagnostics) = parse_v3(VALID_PACK);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(
             diagnostics.is_empty(),
@@ -1965,6 +2046,103 @@ enabled = false
     }
 
     #[test]
+    fn directional_texture_keys_parse_into_their_own_fields() {
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = { all = "all.png", top = "top.png", bottom = "bottom.png", side = "side.png", north = "north.png", south = "south.png", east = "east.png", west = "west.png" }
+hardness = 1.0
+"#;
+        let (spec, warnings, diagnostics) = parse_v3(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+        let textures = &spec.blocks[0].textures;
+        assert_eq!(textures.all.as_deref(), Some("all.png"));
+        assert_eq!(textures.top.as_deref(), Some("top.png"));
+        assert_eq!(textures.bottom.as_deref(), Some("bottom.png"));
+        assert_eq!(textures.side.as_deref(), Some("side.png"));
+        assert_eq!(textures.north.as_deref(), Some("north.png"));
+        assert_eq!(textures.south.as_deref(), Some("south.png"));
+        assert_eq!(textures.east.as_deref(), Some("east.png"));
+        assert_eq!(textures.west.as_deref(), Some("west.png"));
+    }
+
+    #[test]
+    fn only_a_directional_texture_satisfies_the_required_textures_table() {
+        let text = r#"
+[[blocks]]
+id = "mymod:north_only"
+textures = { north = "n.png" }
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.blocks.len(), 1);
+        assert_eq!(spec.blocks[0].textures.north.as_deref(), Some("n.png"));
+        assert!(spec.blocks[0].textures.all.is_none());
+    }
+
+    #[test]
+    fn directional_texture_assets_are_collected_and_validated() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root);
+        write_png(&dir.join("a.png"), 16);
+        write_png(&dir.join("n.png"), 16);
+
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = { all = "a.png", north = "n.png" }
+hardness = 1.0
+"#;
+        let (spec, diagnostics) = load_assets(text, &dir);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.assets.len(), 2, "all and north both load once");
+        assert!(spec.assets.contains_key("a.png"));
+        assert!(spec.assets.contains_key("n.png"));
+    }
+
+    #[test]
+    fn directional_texture_path_escapes_are_rejected() {
+        for key in ["north", "south", "east", "west"] {
+            let text = format!(
+                "[[blocks]]\nid = \"mymod:cube\"\ntextures = {{ {key} = \"/etc/passwd\" }}\nhardness = 1.0\n"
+            );
+            let (spec, _, diagnostics) = parse_v3(&text);
+            assert!(spec.blocks.is_empty(), "{key} block should be rejected");
+            assert_eq!(diagnostics.len(), 1, "{key}: {diagnostics:?}");
+            assert!(
+                diagnostics[0].reason.contains(&format!("textures.{key}")),
+                "{key}: {diagnostics:?}"
+            );
+            assert_has_reason(&diagnostics, "must be relative");
+        }
+    }
+
+    #[test]
+    fn empty_textures_table_names_every_accepted_key() {
+        let text = r#"
+[[blocks]]
+id = "mymod:cube"
+textures = {}
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(spec.blocks.is_empty());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        for key in [
+            "all", "top", "bottom", "side", "north", "south", "east", "west",
+        ] {
+            assert!(
+                diagnostics[0].reason.contains(key),
+                "`{key}` missing from: {}",
+                diagnostics[0].reason
+            );
+        }
+    }
+
+    #[test]
     fn duplicate_asset_paths_load_once() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root);
@@ -1987,7 +2165,7 @@ hardness = 1.0
     }
 
     #[test]
-    fn v1_content_arrays_warn_once_and_are_ignored() {
+    fn v1_content_arrays_are_rejected_with_one_pack_error() {
         let text = r#"
 [[blocks]]
 id = "mymod:ruby"
@@ -1996,30 +2174,54 @@ hardness = 1.0
 "#;
         let (spec, warnings, diagnostics) = parse_format(text, PackFormat::V1);
         assert_eq!(spec, PackContentSpec::default());
-        assert!(diagnostics.is_empty());
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].field, "pack.toml");
-        assert!(warnings[0]
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
             .reason
-            .contains("content arrays require format_version = 2"));
+            .contains("format_version 1 is not supported"));
+        assert!(diagnostics[0].reason.contains("format_version = 3"));
     }
 
     #[test]
-    fn v1_without_content_arrays_is_silent() {
+    fn v1_without_content_arrays_is_still_rejected() {
         let (spec, warnings, diagnostics) = parse_format("name = \"Plain\"\n", PackFormat::V1);
-        assert!(spec.blocks.is_empty());
-        assert!(warnings.is_empty());
-        assert!(diagnostics.is_empty());
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
+            .reason
+            .contains("format_version 1 is not supported"));
     }
 
     #[test]
-    fn future_format_warns_once_and_ignores_content() {
-        let (spec, warnings, diagnostics) = parse_format(VALID_PACK, PackFormat::Future(3));
-        assert!(spec.blocks.is_empty());
-        assert!(diagnostics.is_empty());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].reason.contains("newer than 2"));
-        assert!(warnings[0].reason.contains("ignored"));
+    fn v2_content_arrays_are_rejected_with_one_pack_error() {
+        let (spec, warnings, diagnostics) = parse_format(VALID_PACK, PackFormat::V2);
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
+            .reason
+            .contains("format_version 2 is not supported"));
+    }
+
+    #[test]
+    fn future_format_is_rejected_with_one_pack_error() {
+        let (spec, warnings, diagnostics) = parse_format(VALID_PACK, PackFormat::Future(4));
+        assert_eq!(spec, PackContentSpec::default());
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
+            .reason
+            .contains("format_version 4 is newer than this build"));
+        assert!(diagnostics[0].reason.contains("format_version = 3"));
     }
 
     #[test]
@@ -2034,7 +2236,7 @@ id = "mymod:valid"
 textures = { all = "b.png" }
 hardness = 1.0
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].id, "mymod:valid");
         assert_has_reason(&diagnostics, "missing required field `id`");
@@ -2051,7 +2253,7 @@ icon = "ruby.png"
 id = "mymod:ruby"
 icon = "ruby2.png"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.items.len(), 1);
         assert_eq!(spec.items[0].icon, "ruby.png");
         assert_has_reason(&diagnostics, "duplicate content id");
@@ -2081,7 +2283,7 @@ id = "mymod:valid"
 textures = { all = "a.png" }
 hardness = 1.0
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].id, "mymod:valid");
         assert_eq!(diagnostics.len(), 3);
@@ -2104,7 +2306,7 @@ id = "mymod:valid"
 icon = "b.png"
 "#
         );
-        let (spec, _, diagnostics) = parse_v2(&text);
+        let (spec, _, diagnostics) = parse_v3(&text);
         assert_eq!(spec.items.len(), 1);
         assert_eq!(spec.items[0].id, "mymod:valid");
         assert_has_reason(&diagnostics, "content name limit");
@@ -2129,7 +2331,7 @@ kind = "pickaxe"
 tier = "wood"
 icon = "pick.png"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.blocks.len(), 1);
         assert!(spec.items.is_empty());
         assert!(spec.tools.is_empty());
@@ -2156,7 +2358,7 @@ key = { R = "stick" }
 output = "stick"
 count = 1
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(spec.tiers.len(), 1);
         assert_eq!(spec.recipes.len(), 1);
@@ -2177,7 +2379,7 @@ textures = { all = "a.png" }
 hardness = 1.0
 drop = "stone"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.blocks.len(), 1);
         assert_eq!(spec.blocks[0].id, "mymod:good");
         assert_eq!(entries(&diagnostics), vec!["block mymod:bad"]);
@@ -2195,7 +2397,7 @@ key = { R = "mymod:dust" }
 output = "mymod:missing"
 count = 1
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.recipes.is_empty());
         assert_has_reason(&diagnostics, "unknown ingredient `mymod:dust`");
         assert_has_reason(&diagnostics, "unknown output `mymod:missing`");
@@ -2211,7 +2413,7 @@ key = { S = "stick" }
 output = "stick"
 count = 1
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.recipes.is_empty());
         assert_has_reason(&diagnostics, "pattern character `R` has no `key` entry");
     }
@@ -2228,7 +2430,7 @@ count = 1
             let text = format!(
                 "[[recipes]]\nid = \"mymod:r\"\npattern = {pattern}\nkey = {{ R = \"stick\" }}\noutput = \"stick\"\ncount = {count}\n"
             );
-            let (spec, _, diagnostics) = parse_v2(&text);
+            let (spec, _, diagnostics) = parse_v3(&text);
             assert!(spec.recipes.is_empty(), "pattern {pattern} count {count}");
             assert!(
                 !diagnostics.is_empty(),
@@ -2246,7 +2448,7 @@ kind = "pickaxe"
 tier = "mymod:ghost"
 icon = "pick.png"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.tools.is_empty());
         assert_has_reason(&diagnostics, "unknown tier `mymod:ghost`");
     }
@@ -2260,7 +2462,7 @@ kind = "bow"
 tier = "wood"
 icon = "bow.png"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.tools.is_empty());
         assert_has_reason(&diagnostics, "not authorable");
     }
@@ -2286,7 +2488,7 @@ min_y = 0
 max_y = 16
 chance = 0.1
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.worldgen.is_empty());
         assert_has_reason(&diagnostics, "unknown block reference `mymod:ghost`");
         assert_has_reason(&diagnostics, "unknown replace reference `mymod:ghost`");
@@ -2298,7 +2500,7 @@ chance = 0.1
             let text = format!(
                 "[[blocks]]\nid = \"mymod:r\"\ntextures = {{ all = \"a.png\" }}\nhardness = {hardness}\n"
             );
-            let (spec, _, diagnostics) = parse_v2(&text);
+            let (spec, _, diagnostics) = parse_v3(&text);
             assert!(spec.blocks.is_empty(), "hardness {hardness}");
             assert!(!diagnostics.is_empty(), "hardness {hardness} should fail");
         }
@@ -2361,7 +2563,7 @@ min_y = 0
 max_y = 16
 chance = 2.0
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.worldgen.is_empty());
         assert_eq!(diagnostics.len(), 6, "{diagnostics:?}");
         assert_has_reason(&diagnostics, "`vein` must be in 1..=8");
@@ -2384,7 +2586,7 @@ max_y = 16
 vein = 4
 attempts = 4
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.worldgen.is_empty());
         assert_has_reason(&diagnostics, "must be less than");
     }
@@ -2415,7 +2617,7 @@ tool = "sword"
 id = "sand"
 hardness = 2.0
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert_eq!(spec.block_patches.len(), 1);
         assert_eq!(spec.block_patches[0].id, "sand");
         assert_eq!(spec.block_patches[0].hardness, Some(2.0));
@@ -2435,7 +2637,7 @@ id = "mymod:food"
 icon = "food.png"
 nutrition = 4
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(
             spec.items[0].food,
@@ -2449,7 +2651,7 @@ nutrition = 4
             let text = format!(
                 "[[items]]\nid = \"mymod:food\"\nicon = \"food.png\"\nnutrition = {nutrition}\n"
             );
-            let (spec, _, diagnostics) = parse_v2(&text);
+            let (spec, _, diagnostics) = parse_v3(&text);
             assert!(spec.items.is_empty(), "nutrition {nutrition}");
             assert!(!diagnostics.is_empty());
         }
@@ -2473,7 +2675,7 @@ kind = "pickaxe"
 tier = "wood"
 icon = "./inside.png"
 "#;
-        let (spec, _, diagnostics) = parse_v2(text);
+        let (spec, _, diagnostics) = parse_v3(text);
         assert!(spec.blocks.is_empty());
         assert!(spec.items.is_empty());
         assert!(spec.tools.is_empty());
@@ -2647,7 +2849,7 @@ apple = "textures/apple.png"
 wood_pickaxe = "textures/pickaxe.png"
 wood_bow = "textures/bow.png"
 "#;
-        let (spec, warnings, diagnostics) = parse_v2(text);
+        let (spec, warnings, diagnostics) = parse_v3(text);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(
             diagnostics.is_empty(),
@@ -2663,7 +2865,7 @@ wood_bow = "textures/bow.png"
 
     #[test]
     fn builtin_icon_table_must_be_a_table() {
-        let (spec, _, diagnostics) = parse_v2("builtin_icons = 3\n");
+        let (spec, _, diagnostics) = parse_v3("builtin_icons = 3\n");
         assert!(spec.builtin_icons.is_empty());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Severity::Error);
@@ -2677,7 +2879,7 @@ wood_bow = "textures/bow.png"
         for index in 0..=MAX_ARRAY_ENTRIES {
             text.push_str(&format!("key_{index} = \"p{index}.png\"\n"));
         }
-        let (spec, _, diagnostics) = parse_v2(&text);
+        let (spec, _, diagnostics) = parse_v3(&text);
         assert!(spec.builtin_icons.is_empty());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].entry, "builtin_icons");
@@ -2693,7 +2895,7 @@ diamond = "diamond.png"
 apple = 3
 wood_axe = "../escaped.png"
 "#;
-        let (spec, warnings, diagnostics) = parse_v2(text);
+        let (spec, warnings, diagnostics) = parse_v3(text);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(spec.builtin_icons.is_empty());
         assert_eq!(
@@ -2718,21 +2920,21 @@ wood_axe = "../escaped.png"
     }
 
     #[test]
-    fn v1_builtin_icon_table_warns_and_is_ignored() {
+    fn v1_builtin_icon_table_is_rejected_with_one_pack_error() {
         let text = "[builtin_icons]\napple = \"apple.png\"\n";
         let (spec, warnings, diagnostics) = parse_format(text, PackFormat::V1);
         assert_eq!(spec, PackContentSpec::default());
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert_eq!(warnings[0].field, "pack.toml");
-        assert_eq!(
-            warnings[0].reason,
-            "builtin icon overrides require format_version = 2"
-        );
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert_eq!(diagnostics[0].severity, Severity::Error);
+        assert!(diagnostics[0]
+            .reason
+            .contains("format_version 1 is not supported"));
     }
 
     #[test]
-    fn v1_content_arrays_win_over_the_builtin_icon_warning() {
+    fn v1_emits_only_the_pack_gate_error() {
         let text = r#"
 [[blocks]]
 id = "mymod:ruby"
@@ -2744,30 +2946,30 @@ apple = "apple.png"
 "#;
         let (spec, warnings, diagnostics) = parse_format(text, PackFormat::V1);
         assert_eq!(spec, PackContentSpec::default());
-        assert!(diagnostics.is_empty());
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
         assert_eq!(
-            warnings.len(),
+            diagnostics.len(),
             1,
-            "only the array warning fires: {warnings:?}"
+            "only the pack gate error fires: {diagnostics:?}"
         );
-        assert_eq!(
-            warnings[0].reason,
-            "content arrays require format_version = 2"
-        );
+        assert_eq!(diagnostics[0].entry, "pack");
     }
 
     #[test]
-    fn future_format_ignores_builtin_icons_with_the_existing_warning() {
+    fn future_format_rejects_builtin_icons_with_one_pack_error() {
         let text = "[builtin_icons]\napple = \"apple.png\"\n";
-        let (spec, warnings, diagnostics) = parse_format(text, PackFormat::Future(3));
+        let (spec, warnings, diagnostics) = parse_format(text, PackFormat::Future(4));
         assert_eq!(spec, PackContentSpec::default());
-        assert!(diagnostics.is_empty());
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].reason.contains("newer than 2"));
+        assert!(warnings.is_empty(), "no warnings: {warnings:?}");
+        assert_eq!(diagnostics.len(), 1, "one pack error: {diagnostics:?}");
+        assert_eq!(diagnostics[0].entry, "pack");
+        assert!(diagnostics[0]
+            .reason
+            .contains("format_version 4 is newer than this build"));
     }
 
     #[test]
-    fn builtin_icon_assets_load_through_the_v2_asset_pipeline() {
+    fn builtin_icon_assets_load_through_the_v3_asset_pipeline() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root);
         write_png(&dir.join("apple.png"), 32);
@@ -2779,7 +2981,7 @@ apple = "apple.png"
         let asset = spec
             .assets
             .get("apple.png")
-            .expect("override PNG loads like any other v2 asset");
+            .expect("override PNG loads like any other v3 asset");
         assert_eq!(asset.source_side, 32);
         assert_eq!(asset.rgba, resample::resample_to_16(&gradient(32, 32), 32));
     }
@@ -2796,5 +2998,112 @@ apple = "apple.png"
         assert_eq!(entries(&diagnostics), vec!["asset missing.png"]);
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_has_reason(&diagnostics, "missing.png");
+    }
+
+    #[test]
+    fn block_model_and_alpha_default_and_parse_exact_tokens() {
+        let text = r#"
+[[blocks]]
+id = "mymod:wheat"
+textures = { all = "wheat.png" }
+hardness = 0.5
+model = "cross"
+alpha = "cutout"
+
+[[blocks]]
+id = "mymod:glass"
+textures = { all = "glass.png" }
+hardness = 0.3
+alpha = "blend"
+
+[[blocks]]
+id = "mymod:plain"
+textures = { all = "plain.png" }
+hardness = 1.0
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(spec.blocks.len(), 3);
+        assert_eq!(spec.blocks[0].model, BlockModel::Cross);
+        assert_eq!(spec.blocks[0].alpha, BlockAlpha::Cutout);
+        assert_eq!(spec.blocks[1].model, BlockModel::Cube);
+        assert_eq!(spec.blocks[1].alpha, BlockAlpha::Blend);
+        assert_eq!(spec.blocks[2].model, BlockModel::Cube);
+        assert_eq!(spec.blocks[2].alpha, BlockAlpha::Opaque);
+    }
+
+    #[test]
+    fn unknown_model_and_alpha_name_the_entry_and_keep_the_sibling() {
+        let text = r#"
+[[blocks]]
+id = "mymod:bad_model"
+textures = { all = "bad.png" }
+hardness = 1.0
+model = "column"
+
+[[blocks]]
+id = "mymod:bad_alpha"
+textures = { all = "bad.png" }
+hardness = 1.0
+alpha = "translucent"
+
+[[blocks]]
+id = "mymod:good"
+textures = { all = "good.png" }
+hardness = 1.0
+model = "crop"
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert_eq!(spec.blocks.len(), 1, "only the valid sibling survives");
+        assert_eq!(spec.blocks[0].id, "mymod:good");
+        assert_eq!(spec.blocks[0].model, BlockModel::Crop);
+        assert_eq!(spec.blocks[0].alpha, BlockAlpha::Opaque);
+        assert_eq!(
+            entries(&diagnostics),
+            vec!["block mymod:bad_model", "block mymod:bad_alpha"]
+        );
+        assert_has_reason(
+            &diagnostics,
+            "unknown model `column`; expected cube, cross, crop",
+        );
+        assert_has_reason(
+            &diagnostics,
+            "unknown alpha `translucent`; expected opaque, cutout, blend",
+        );
+    }
+
+    #[test]
+    fn block_patch_accepts_model_and_alpha_only_fields() {
+        let text = r#"
+[[block_patches]]
+id = "grass"
+model = "cross"
+
+[[block_patches]]
+id = "water"
+alpha = "blend"
+
+[[block_patches]]
+id = "oak_leaves"
+model = "cube"
+
+alpha = "bad"
+
+[[block_patches]]
+id = "stone"
+"#;
+        let (spec, _, diagnostics) = parse_v3(text);
+        assert_eq!(spec.block_patches.len(), 2);
+        assert_eq!(spec.block_patches[0].id, "grass");
+        assert_eq!(spec.block_patches[0].model, Some(BlockModel::Cross));
+        assert_eq!(spec.block_patches[0].alpha, None);
+        assert_eq!(spec.block_patches[1].id, "water");
+        assert_eq!(spec.block_patches[1].model, None);
+        assert_eq!(spec.block_patches[1].alpha, Some(BlockAlpha::Blend));
+        assert_has_reason(&diagnostics, "unknown alpha `bad`");
+        assert_has_reason(
+            &diagnostics,
+            "block patch must set at least one of `name`, `hardness`, `drop`, `tool`, `stack`, `model`, `alpha`",
+        );
     }
 }

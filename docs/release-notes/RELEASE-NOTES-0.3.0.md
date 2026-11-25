@@ -37,12 +37,37 @@ are upgraded on the next save.
   pack catalog, four-chunk terrain pass and a village plan without a GPU,
   window, filesystem, clock or thread; its deterministic report is 22 lines.
 - **No gameplay change.** Movement, combat, crafting, survival, worldgen
-  content and the config schema are the same as 0.2.2. Pack and worldgen
-  formats are byte-identical: v10 changes only `.mcvx`. A* pathfinding remains
+  content and the config schema are the same as 0.2.2. `.mcvx` stays at
+  version 10; the pack manifest moves to version 3 as deliberate authored
+  content (v1/v2 are rejected by name), and the prefab-backed trees and ruins
+  re-pinned the worldgen/village/demo digests once. A* pathfinding remains
   unwired.
 - **Budgets stay green.** Autosave frame p95 is 0.095 ms against the 16.6 ms
   gate, village streaming p95 is 2.488 ms with a 3.651 ms max against 8/16 ms,
   and the windowed village frame p95 is 7.289 ms against 16.6 ms.
+- **Texture packs move to format v3.** A v3 pack can give one block six
+  different faces through flat overrides such as `stone_top.png`,
+  `stone_side.png` and the four directional files, and can choose a `cube`,
+  `cross` or `crop` model with `opaque`, `cutout` or `blend` alpha. Wheat now
+  renders as a staged cross plant, leaves as cutout geometry, and glass as a
+  blend solid that reaches the sorted translucent pass. Version 1 and version 2
+  manifests are rejected with a named error that states the required
+  `format_version = 3`; every shipped fixture, demo and document is v3.
+- **The default art ships as `packs/default`.** The game's procedural art and
+  synthesized sounds are now an ordinary, editable pack that loads first. If
+  the folder is deleted or damaged, the game restores it from an embedded
+  master and prints a notice; valid edits survive a relaunch.
+- **Oak trees and ruins are prefab-backed.** Their authored layout comes from
+  `worldgen/` prefabs instead of hard-coded placement, and ruin chests are
+  filled from decay markers. Placement policy stays in code, and the
+  worldgen/village/demo digests were re-pinned once for this change.
+- **The M019 surface is proven headlessly.** `tests/fixtures/packs/external-v3`
+  is a v3 pack authored from `docs/TEXTURE-PACKS.md` alone; it validates with
+  `11 entries, 0 errors, 0 warnings` and loads through the real registry in
+  `--demo-external-pack`, proving six faces, cross/crop/blend materials, an icon
+  override and a save/reload leg without a window or GPU. `--demo-atlas` writes
+  a deterministic 128x96 atlas PNG (48 built-in layers) with pinned RGBA and PNG
+  digests, so composed block-face layers cannot drift silently.
 
 ## Downloads
 
@@ -53,11 +78,12 @@ are upgraded on the next save.
 | Windows (x86_64) portable | `opencraft-0.3.0-x86_64-pc-windows-msvc.zip` |
 
 The two archives are portable folders: the `opencraft` binary for that
-platform, the shipped `config/` and `worldgen/` trees, and `LICENSE`. Neither
-contains `saves/`, `packs/`, or `settings.toml`, so nothing of yours is
-overwritten. The Windows setup exe installs the same files for the current
-user. These release notes live on the release page rather than inside the
-archives.
+platform, the shipped `config/`, `worldgen/` and `packs/default/` trees, and
+`LICENSE`. Neither contains `saves/`, `settings.toml`, or any user pack outside
+`packs/default/`, so nothing of yours is overwritten; an upgrade refreshes
+`packs/default` in place while your saves and settings are kept. The Windows
+setup exe installs the same files for the current user. These release notes
+live on the release page rather than inside the archives.
 
 ## Linux
 
@@ -114,12 +140,14 @@ the migration rules and the measured cold-load evidence.
 
 ## First run and file layout
 
-`config/` and `worldgen/` ship next to the binary inside the archive and are
-read-only to the game. `saves/` and `settings.toml` are created in the
-current working directory when you first save or change a setting, so run the
-game from a directory you can write to. `packs/` is not created for you — make
-it in the same working directory and put pack folders inside it if you want to
-use texture or content packs.
+`config/`, `worldgen/` and `packs/default/` ship next to the binary inside the
+archive; `config/` and `worldgen/` are read-only to the game, while
+`packs/default/` is the editable master of the shipped art and is restored from
+the embedded copy if it goes missing. `saves/` and `settings.toml` are created
+in the current working directory when you first save or change a setting, so
+run the game from a directory you can write to. Put any additional pack folders
+inside `packs/` in that working directory if you want to use texture or content
+packs.
 
 ## Known caveats
 

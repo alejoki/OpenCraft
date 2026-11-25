@@ -143,6 +143,7 @@ fn generate(pos: ChunkPos, catalog: &VillageCatalog, spawn: (i32, i32)) -> Chunk
             rules: &[],
             villages: Some(catalog),
             spawn_column: Some(spawn),
+            structures: None,
         },
     )
 }
@@ -364,6 +365,7 @@ fn outside_leg_skips_adjacent_cell_border_chunks() {
             rules: &[],
             villages: Some(&catalog),
             spawn_column: Some(spawn),
+            structures: None,
         },
     );
     assert!(
@@ -401,6 +403,7 @@ fn empty_catalog_is_byte_identical() {
                     rules: &[],
                     villages: None,
                     spawn_column: None,
+                    structures: None,
                 },
             );
             let via_empty = generate_chunk_with_context(
@@ -411,6 +414,7 @@ fn empty_catalog_is_byte_identical() {
                     rules: &[],
                     villages: Some(&empty),
                     spawn_column: None,
+                    structures: None,
                 },
             );
             assert!(

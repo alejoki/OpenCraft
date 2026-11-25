@@ -44,6 +44,7 @@ use crate::world::persistence::{
 };
 use crate::world::season::Season;
 use crate::world::session::WorldSession;
+use crate::world::structure::StructureCatalog;
 use crate::world::terrain::{
     biome_at_seeded, find_spawn_column, generate_chunk_seeded, generate_chunk_seeded_with,
     generate_chunk_with_context, terrain_height_at_seeded, Biome, WorldGenContext,
@@ -133,6 +134,71 @@ pub fn presentation_demo_save_data(ore: BlockId, block: BlockId, item_index: u16
         mobs: Vec::new(),
         chunk_edits,
     }
+}
+
+/// Mesh one isolated `block` cell in an otherwise air chunk through a real
+/// face table. Used by the presentation digest's models leg so wheat, leaves
+/// and glass are classified by the production mesher, not by a test stub.
+fn mesh_presentation_block(
+    block: BlockId,
+    faces: &crate::content::faces::BlockFaces,
+) -> crate::mesh::quad::ChunkMesh {
+    let mut chunk = Chunk::new_uniform(BlockId::Air);
+    chunk.set(5, 6, 7, block);
+    let padded = crate::mesh::greedy::PaddedChunk::from_center_only(&chunk);
+    crate::mesh::greedy::mesh_chunk_with(&padded, faces)
+}
+
+/// Parse a minimal v3 `mymod:reed` block through the neutral parser and fold
+/// it into a registry, proving authored `model`/`alpha` survive the whole
+/// neutral authoring path. Returns the resolved `(model, alpha)` tokens, or
+/// `None` when the snippet is rejected or the block does not resolve.
+fn parsed_cross_block_model() -> Option<(String, String)> {
+    use crate::content::spec::PackAsset;
+    use crate::content::{build_registry, ContentRegistry, PackIdentity};
+    use opencraft_content::manifest::PackFormat;
+    use opencraft_content::v3::parse_content;
+
+    let root: toml::Value = toml::from_str(
+        r#"
+[[blocks]]
+id = "mymod:reed"
+textures = { all = "reed.png" }
+hardness = 0.0
+model = "cross"
+alpha = "cutout"
+"#,
+    )
+    .ok()?;
+    let (mut spec, _warnings, diagnostics) = parse_content(&root, PackFormat::V3);
+    if !diagnostics.is_empty() {
+        return None;
+    }
+    spec.assets.insert(
+        "reed.png".to_string(),
+        PackAsset {
+            rgba: vec![0x6C; 1024],
+            source_side: 16,
+        },
+    );
+    let (registry, report) = build_registry(
+        ContentRegistry::builtin(),
+        &[(
+            PackIdentity {
+                folder: "mymod".to_string(),
+                version: None,
+            },
+            spec,
+        )],
+    );
+    if report.errors() != 0 {
+        return None;
+    }
+    let def = registry.block_by_name("mymod:reed")?;
+    Some((
+        def.model.as_str().to_string(),
+        def.alpha.as_str().to_string(),
+    ))
 }
 
 /// Build the deterministic `--demo-presentation` digest.
@@ -560,6 +626,92 @@ pub fn presentation_demo_lines(
         }
     }
 
+    // (f) Model/alpha presentation surface. Wheat must be two crossed planes,
+    // leaves must be cutout faces in the opaque buckets, and glass must be six
+    // blend faces. All three meshes come from the real built-in face table and
+    // a real PaddedChunk. The sorted flag is only true when the pure
+    // translucent ordering proves farthest-first plus the ChunkPos tie-break.
+    {
+        use crate::content::{BlockAlpha, BlockModel};
+        use opencraft_gfx::pipeline::{translucent_draw_order, TranslucentChunk};
+
+        let faces = BlockFaces::builtin();
+        let wheat = mesh_presentation_block(BlockId::WheatStage3, &faces);
+        let leaves = mesh_presentation_block(BlockId::OakLeaves, &faces);
+        let glass = mesh_presentation_block(BlockId::Glass, &faces);
+
+        let wheat_cross = matches!(
+            faces.model(BlockId::WheatStage3),
+            BlockModel::Cross | BlockModel::Crop
+        ) && wheat.total_quads() == 0
+            && wheat.cross_quad_count() == 2
+            && wheat.blend_quad_count() == 0;
+        let leaves_cutout = faces.alpha(BlockId::OakLeaves) == BlockAlpha::Cutout
+            && leaves.total_quads() == 6
+            && leaves.blend_quad_count() == 0
+            && leaves.cross_quad_count() == 0
+            && leaves.buckets.iter().all(|bucket| bucket.len() == 1);
+        let glass_blend = faces.alpha(BlockId::Glass) == BlockAlpha::Blend
+            && glass.total_quads() == 0
+            && glass.blend_quad_count() == 6
+            && glass.cross_quad_count() == 0;
+
+        // Camera inside chunk (0,0,0): chunk (1,0,0) is farther, so it must be
+        // drawn first. Two chunks equidistant from the origin prove the
+        // lexical ChunkPos tie-break.
+        let near = TranslucentChunk {
+            pos: ChunkPos::new(0, 0, 0),
+            has_water: true,
+            has_blend: false,
+        };
+        let far = TranslucentChunk {
+            pos: ChunkPos::new(1, 0, 0),
+            has_water: false,
+            has_blend: true,
+        };
+        let farthest_first =
+            translucent_draw_order([8.0, 8.0, 8.0], &[near, far]) == vec![far.pos, near.pos];
+        let tie_a = TranslucentChunk {
+            pos: ChunkPos::new(0, 0, 1),
+            has_water: false,
+            has_blend: true,
+        };
+        let tie_b = TranslucentChunk {
+            pos: ChunkPos::new(0, 1, 0),
+            has_water: false,
+            has_blend: true,
+        };
+        let tie_break =
+            translucent_draw_order([0.0, 0.0, 0.0], &[tie_b, tie_a]) == vec![tie_a.pos, tie_b.pos];
+        let sorted = farthest_first && tie_break;
+
+        lines.push(format!(
+            "presentation_demo: leg=models wheat_cross={} leaves_cutout={} glass_blend={} sorted={}",
+            wheat_cross, leaves_cutout, glass_blend, sorted,
+        ));
+        if !wheat_cross || !leaves_cutout || !glass_blend || !sorted {
+            failed.get_or_insert("models");
+        }
+    }
+
+    // (g) Neutral parser round trip for authored model/alpha tokens.
+    {
+        let (model, alpha) = match parsed_cross_block_model() {
+            Some(tokens) => tokens,
+            None => {
+                failed.get_or_insert("model_metadata");
+                ("missing".to_string(), "missing".to_string())
+            }
+        };
+        lines.push(format!(
+            "presentation_demo: leg=model name=mymod:reed model={} alpha={}",
+            model, alpha,
+        ));
+        if model != "cross" || alpha != "cutout" {
+            failed.get_or_insert("model_metadata");
+        }
+    }
+
     match failed {
         Some(name) => {
             lines.push(format!("presentation_demo: ok=false failed={name}"));
@@ -570,6 +722,392 @@ pub fn presentation_demo_lines(
             (lines, true)
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Headless external v3 pack digest (`--demo-external-pack`, M019/S05-T02)
+// ---------------------------------------------------------------------------
+
+/// Build the deterministic `--demo-external-pack` digest for an authored v3
+/// pack directory installed outside `packs/`.
+///
+/// The pack is loaded twice through production seams: [`pack::load_pack_from_dir`]
+/// resolves its presentation layers, and [`pack::spec::load_spec_from_dir`]
+/// supplies the authored content that [`build_session_registry`] folds into a
+/// frozen registry. Every proof leg then reads that registry, the real
+/// [`BlockFaces`] table and the production save/load codec — no demo-only
+/// content table is constructed by hand and `settings.pack_stack` is never
+/// touched.
+///
+/// Returns `(lines, ok)`. `ok` is false when the pack directory is missing, an
+/// authored leg cannot be resolved, or the v10 save cannot be reloaded; the
+/// caller exits non-zero on that flag.
+pub fn external_pack_demo_lines(pack_dir: &Path, fixture: Option<&Path>) -> (Vec<String>, bool) {
+    use std::collections::BTreeSet;
+
+    use crate::content::faces::BlockFaces;
+    use crate::content::spec::FaceSource;
+    use crate::content::{BlockAlpha, BlockModel};
+    use crate::pack::presentation::PackPresentation;
+    use crate::world::block::WHEAT_STAGES;
+    use opencraft_gfx::pipeline::{translucent_draw_order, TranslucentChunk};
+
+    let mut lines: Vec<String> = Vec::new();
+    if !pack_dir.is_dir() {
+        lines.push(format!(
+            "external_pack_demo: failed reason=missing-pack dir={}",
+            pack_dir.display(),
+        ));
+        lines.push("external_pack_demo: ok=false".to_string());
+        return (lines, false);
+    }
+
+    let loaded = pack::load_pack_from_dir(pack_dir);
+    let spec = pack::spec::load_spec_from_dir(pack_dir);
+    let folder = spec.folder.clone();
+    let pack_name = loaded.display_name.clone();
+
+    // Count accepted authored entries exactly the way `--validate-pack` does:
+    // every content array plus each authored (not legacy-layer) built-in face.
+    let authored_faces = spec
+        .content
+        .builtin_faces
+        .iter()
+        .flat_map(|entry| entry.faces.iter())
+        .filter(|source| matches!(source, Some(FaceSource::Authored(_))))
+        .count();
+    let entries = spec.content.blocks.len()
+        + spec.content.items.len()
+        + spec.content.tiers.len()
+        + spec.content.tools.len()
+        + spec.content.recipes.len()
+        + spec.content.worldgen.len()
+        + spec.content.block_patches.len()
+        + spec.content.recipe_patches.len()
+        + spec.content.builtin_icons.len()
+        + authored_faces;
+
+    let authored_icon_bytes = spec
+        .content
+        .builtin_icons
+        .get("apple")
+        .and_then(|path| spec.content.assets.get(path))
+        .map(|asset| asset.rgba.clone());
+
+    let specs = vec![spec];
+    let (registry, report) = build_session_registry(&specs);
+    let faces = BlockFaces::from_registry(&registry);
+    let presentation = PackPresentation::build(loaded, specs, &registry);
+
+    let mut failed: Option<&'static str> = None;
+    lines.push(format!(
+        "external_pack_demo: leg=stack pack={folder} name={pack_name} entries={entries} errors={}",
+        report.errors(),
+    ));
+    if report.errors() != 0 {
+        failed.get_or_insert("stack");
+    }
+
+    // (a) Six distinct faces on a built-in block overridden by flat files.
+    let sixface = registry.block_by_name("stone");
+    let mut sixface_ok = false;
+    if let Some(def) = sixface {
+        let mut resolved: BTreeSet<u8> = BTreeSet::new();
+        let mut placeholder = false;
+        for face in 0..6u8 {
+            let layer = faces.layer(def.id, face);
+            resolved.insert(layer);
+            placeholder |= layer == crate::content::PLACEHOLDER_BLOCK_LAYER;
+        }
+        let distinct = resolved.len();
+        sixface_ok = distinct == 6 && !placeholder;
+        lines.push(format!(
+            "external_pack_demo: leg=sixface block={} resolved={distinct} distinct={distinct}",
+            def.name,
+        ));
+    } else {
+        lines.push(
+            "external_pack_demo: leg=sixface block=missing resolved=0 distinct=0".to_string(),
+        );
+    }
+    if !sixface_ok {
+        failed.get_or_insert("sixface");
+    }
+
+    // (b) Cross/cutout plant, meshed through the production face table.
+    let cross = registry.block_by_name("external:reed");
+    let cross_mesh = cross.map(|def| mesh_presentation_block(def.id, &faces));
+    let cross_ok = matches!(
+        (cross, cross_mesh.as_ref()),
+        (Some(def), Some(mesh))
+            if def.model == BlockModel::Cross
+                && def.alpha == BlockAlpha::Cutout
+                && mesh.cross_quad_count() == 2
+                && mesh.blend_quad_count() == 0
+    );
+    match cross {
+        Some(def) => lines.push(format!(
+            "external_pack_demo: leg=model name={} model={} alpha={}",
+            def.name,
+            def.model.as_str(),
+            def.alpha.as_str(),
+        )),
+        None => lines.push(
+            "external_pack_demo: leg=model name=missing model=cross alpha=cutout".to_string(),
+        ),
+    }
+    if !cross_ok {
+        failed.get_or_insert("model");
+    }
+
+    // (c) Crop/cutout block. The stage count comes from the loaded gameplay
+    // stage table, not from a demo constant.
+    let stages = WHEAT_STAGES
+        .iter()
+        .filter(|id| registry.block(**id).is_some())
+        .count();
+    let crop = registry.block_by_name("external:wheat");
+    let crop_mesh = crop.map(|def| mesh_presentation_block(def.id, &faces));
+    let crop_ok = matches!(
+        (crop, crop_mesh.as_ref()),
+        (Some(def), Some(mesh))
+            if def.model == BlockModel::Crop
+                && def.alpha == BlockAlpha::Cutout
+                && stages > 0
+                && mesh.cross_quad_count() == 2
+                && mesh.blend_quad_count() == 0
+    );
+    match crop {
+        Some(def) => lines.push(format!(
+            "external_pack_demo: leg=crop name={} model={} alpha={} stages={stages}",
+            def.name,
+            def.model.as_str(),
+            def.alpha.as_str(),
+        )),
+        None => lines.push(format!(
+            "external_pack_demo: leg=crop name=missing model=crop alpha=cutout stages={stages}",
+        )),
+    }
+    if !crop_ok {
+        failed.get_or_insert("crop");
+    }
+
+    // (d) Blend cube reaches the translucent bucket, ordered farthest-first.
+    let blend = registry.block_by_name("external:frosted_glass");
+    let blend_mesh = blend.map(|def| mesh_presentation_block(def.id, &faces));
+    let near = TranslucentChunk {
+        pos: ChunkPos::new(0, 0, 0),
+        has_water: true,
+        has_blend: false,
+    };
+    let far = TranslucentChunk {
+        pos: ChunkPos::new(1, 0, 0),
+        has_water: false,
+        has_blend: true,
+    };
+    let farthest_first =
+        translucent_draw_order([8.0, 8.0, 8.0], &[near, far]) == vec![far.pos, near.pos];
+    let tie_a = TranslucentChunk {
+        pos: ChunkPos::new(0, 0, 1),
+        has_water: false,
+        has_blend: true,
+    };
+    let tie_b = TranslucentChunk {
+        pos: ChunkPos::new(0, 1, 0),
+        has_water: false,
+        has_blend: true,
+    };
+    let tie_break =
+        translucent_draw_order([0.0, 0.0, 0.0], &[tie_b, tie_a]) == vec![tie_a.pos, tie_b.pos];
+    let sorted = farthest_first && tie_break;
+    let blend_ok = matches!(
+        (blend, blend_mesh.as_ref()),
+        (Some(def), Some(mesh))
+            if def.model == BlockModel::Cube
+                && def.alpha == BlockAlpha::Blend
+                && mesh.blend_quad_count() == 6
+                && mesh.cross_quad_count() == 0
+    ) && sorted;
+    match blend {
+        Some(def) => lines.push(format!(
+            "external_pack_demo: leg=blend name={} model={} alpha={} sorted={sorted}",
+            def.name,
+            def.model.as_str(),
+            def.alpha.as_str(),
+        )),
+        None => lines.push(format!(
+            "external_pack_demo: leg=blend name=missing model=cube alpha=blend sorted={sorted}",
+        )),
+    }
+    if !blend_ok {
+        failed.get_or_insert("blend");
+    }
+
+    // (e) Built-in sprite override survives the presentation merge.
+    let icon_name = "apple";
+    let builtin = names::builtin_item_sprite_id_by_name(icon_name).is_some();
+    let visible = presentation.builtin_icons.get(icon_name);
+    let icon_match = match (visible, authored_icon_bytes.as_ref()) {
+        (Some(bytes), Some(authored)) => bytes.as_slice() == authored.as_slice(),
+        _ => false,
+    };
+    lines.push(format!(
+        "external_pack_demo: leg=icon name={icon_name} builtin={builtin} match={icon_match}"
+    ));
+    if !builtin || !icon_match {
+        failed.get_or_insert("icon");
+    }
+
+    // (f) Write a v10 save with the authored blocks and reload it against the
+    // same frozen registry. v10 gains no fields: the pack identity and digest
+    // it already carries resolve every external block name.
+    let mut chunk_edits = ChunkEditMap::default();
+    let mut saved_ids: Vec<BlockId> = Vec::new();
+    for def in [cross, crop, blend].into_iter().flatten() {
+        let pos = IVec3::new(2 + saved_ids.len() as i32 * 2, 20, 2);
+        let (chunk_pos, (lx, ly, lz)) = world_to_chunk_and_local(pos.x, pos.y, pos.z);
+        chunk_edits.insert_block(chunk_pos, linear_index(lx, ly, lz) as u16, def.id);
+        saved_ids.push(def.id);
+    }
+    let save_entries = chunk_edits
+        .values()
+        .map(crate::world::edit_store::EditSection::len)
+        .sum::<usize>();
+    let save_data = WorldSaveData {
+        seed: PRESENTATION_DEMO_SEED,
+        time_of_day: DEFAULT_TIME_OF_DAY,
+        day_index: 0,
+        season_length_days: crate::world::season::DEFAULT_SEASON_LENGTH_DAYS,
+        mode: GameMode::Creative,
+        player: SavedPlayerState {
+            position: [4.5, 24.0, 4.5],
+            yaw: 0.0,
+            pitch: -0.4,
+            fly_mode: true,
+            selected_slot: 0,
+            render_distance: 16,
+            inventory: Inventory::empty(),
+            player_grid: CraftingGrid::new(GridKind::Player),
+            table_grid: CraftingGrid::new(GridKind::Table),
+            survival: SurvivalState::full(),
+        },
+        chests: Default::default(),
+        mobs: Vec::new(),
+        chunk_edits,
+    };
+
+    let (save_path, remove_fixture) = match fixture {
+        Some(path) => (path.to_path_buf(), false),
+        None => (
+            std::env::temp_dir().join(format!(
+                "opencraft-external-pack-demo-{}.mcvx",
+                std::process::id()
+            )),
+            true,
+        ),
+    };
+    let saved = save_world_to_path_with(&save_path, &save_data, registry.as_ref());
+    lines.push(format!(
+        "external_pack_demo: leg=save path={} entries={save_entries} ok={}",
+        save_path.display(),
+        saved.is_ok(),
+    ));
+
+    let mut reload_ok = false;
+    if saved.is_ok() {
+        match load_world_from_path_with(&save_path, registry.as_ref()) {
+            Ok(loaded) => {
+                let names_ok = saved_ids.iter().all(|id| {
+                    loaded
+                        .registry
+                        .block(*id)
+                        .map(|def| !def.placeholder)
+                        .unwrap_or(false)
+                });
+                reload_ok = loaded.unresolved == 0
+                    && names_ok
+                    && loaded.data.chunk_edits == save_data.chunk_edits;
+            }
+            Err(_) => reload_ok = false,
+        }
+    }
+    lines.push(format!("external_pack_demo: leg=reload ok={reload_ok}"));
+    if !reload_ok {
+        failed.get_or_insert("save_reload");
+    }
+    if remove_fixture {
+        let _ = std::fs::remove_file(&save_path);
+    }
+
+    match failed {
+        Some(name) => {
+            lines.push(format!("external_pack_demo: ok=false failed={name}"));
+            (lines, false)
+        }
+        None => {
+            lines.push("external_pack_demo: ok=true".to_string());
+            (lines, true)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Headless deterministic atlas artifact (`--demo-atlas`, M019/S05-T03)
+// ---------------------------------------------------------------------------
+
+/// File name written below the `--demo-atlas` output directory.
+pub const ATLAS_DEMO_FILE: &str = "atlas.png";
+
+/// Build and write the deterministic `--demo-atlas` artifact.
+///
+/// The sheet comes from the same CPU composer the live renderer uploads:
+/// [`generate_all_texture_layers_rgba`] -> [`pinned_atlas_layers`] ->
+/// [`compose_atlas_rgba`], then the shared PNG writer. No GPU state, settings
+/// file, pack stack, window or network is touched, and the output directory is
+/// the only write. The pinned selection excludes the reserved placeholder band
+/// (see [`pinned_atlas_layers`]) and deliberately composes the machine- and
+/// user-config-independent built-in base layers only; pack layers would make
+/// the artifact depend on the local pack stack.
+///
+/// Returns `(lines, ok)`. `ok` is false only when the output directory or file
+/// cannot be written; the caller exits non-zero on that flag.
+pub fn atlas_demo_lines(out_dir: &Path) -> (Vec<String>, bool) {
+    use crate::pack::defaults::{atlas_digest, atlas_png_digest, encode_rgba_png_dims};
+    use crate::render::texture::{compose_atlas_rgba, pinned_atlas_layers, ATLAS_COLUMNS};
+
+    let base = crate::render::texture::generate_all_texture_layers_rgba();
+    let layers = pinned_atlas_layers(&base, &[]);
+    let sheet = compose_atlas_rgba(&layers, ATLAS_COLUMNS);
+    let png = encode_rgba_png_dims(sheet.width, sheet.height, &sheet.rgba);
+    let path = out_dir.join(ATLAS_DEMO_FILE);
+
+    if let Err(error) = std::fs::create_dir_all(out_dir).and_then(|()| std::fs::write(&path, &png))
+    {
+        return (
+            vec![
+                format!("atlas: failed reason={error}"),
+                "atlas_demo: ok=false".to_string(),
+            ],
+            false,
+        );
+    }
+
+    let digest = atlas_digest(&sheet.rgba);
+    let png_digest = atlas_png_digest(&png);
+    (
+        vec![
+            format!(
+                "atlas: path={} width={} height={} layers={} bytes={} digest=0x{digest:016x} png=0x{png_digest:016x}",
+                path.display(),
+                sheet.width,
+                sheet.height,
+                sheet.tiles,
+                png.len(),
+            ),
+            "atlas_demo: ok=true".to_string(),
+        ],
+        true,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1555,6 +2093,21 @@ pub fn village_demo_generate(
     catalog: &VillageCatalog,
     spawn: (i32, i32),
 ) -> Chunk {
+    village_demo_generate_structures(pos, seed, catalog, spawn, None)
+}
+
+/// The same seam, with an optional explicit structure catalog.
+///
+/// `None` selects the compile-time builtin master exactly like production, so
+/// the `structures` demo leg can compare builtin generation against a runtime
+/// catalog loaded from the same `worldgen/` root.
+fn village_demo_generate_structures(
+    pos: ChunkPos,
+    seed: u32,
+    catalog: &VillageCatalog,
+    spawn: (i32, i32),
+    structures: Option<&StructureCatalog>,
+) -> Chunk {
     generate_chunk_with_context(
         pos,
         seed,
@@ -1563,6 +2116,7 @@ pub fn village_demo_generate(
             rules: &[],
             villages: Some(catalog),
             spawn_column: Some(spawn),
+            structures,
         },
     )
 }
@@ -1625,6 +2179,13 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
     for diagnostic in &diagnostics {
         lines.push(format!("village_demo: warning {diagnostic}"));
     }
+
+    // The structure catalog shares the same root and its diagnostics follow
+    // the village warnings, so one launch reports every rejected file.
+    let (structure_catalog, structure_diagnostics) = StructureCatalog::load_sorted(root);
+    for diagnostic in &structure_diagnostics {
+        lines.push(format!("village_demo: warning {diagnostic}"));
+    }
     let (reloaded, reloaded_diagnostics) = VillageCatalog::load_sorted(root);
     let prefab_count = catalog.prefabs().names().count();
     let catalog_consistent = catalog.len() == catalog.names().count()
@@ -1660,6 +2221,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
             rules: &[],
             villages: None,
             spawn_column: Some(spawn),
+            structures: None,
         },
     );
     let context_ok = village_demo_chunks_equal(&legacy_sample, &default_sample);
@@ -1799,6 +2361,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                     rules: &[],
                     villages: Some(&empty_catalog),
                     spawn_column: Some(spawn),
+                    structures: None,
                 },
             );
             let via_none = generate_chunk_with_context(
@@ -1809,6 +2372,7 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
                     rules: &[],
                     villages: None,
                     spawn_column: Some(spawn),
+                    structures: None,
                 },
             );
             village_demo_chunks_equal(&legacy, &via_empty)
@@ -1989,7 +2553,46 @@ pub fn village_demo_lines(root: &Path) -> (Vec<String>, bool) {
         ));
     }
 
-    // (k) Session leg: a real `WorldSession` on the pinned production seed must
+    // (k) Structures leg: the checked-in `worldgen/structures/` files must
+    // reproduce the compile-time builtin master over the demo window. A broken
+    // structure file is rejected by the fail-soft loader (one warning above)
+    // and the per-name builtin fallback keeps generation identical. With no
+    // `worldgen/` root the effective catalog is still the complete builtin
+    // master, so `prefabs=11 missing=0 identical=true` while villages stay at
+    // `prefabs=0` — the same fail-soft asymmetry the catalog legs describe.
+    let structures_window = match &chosen {
+        Some(plan) => village_demo_window(&plan.bounds),
+        None => vec![
+            ChunkPos::new(0, 0, 0),
+            ChunkPos::new(0, 1, 0),
+            ChunkPos::new(0, 2, 0),
+            ChunkPos::new(0, 3, 0),
+        ],
+    };
+    let structures_identical = structures_window.iter().all(|&pos| {
+        let builtin =
+            village_demo_generate_structures(pos, VILLAGE_DEMO_SEED, &catalog, spawn, None);
+        let runtime = village_demo_generate_structures(
+            pos,
+            VILLAGE_DEMO_SEED,
+            &catalog,
+            spawn,
+            Some(&structure_catalog),
+        );
+        village_demo_chunks_equal(&builtin, &runtime)
+    });
+    let structures_missing = structure_catalog.missing_required().len();
+    lines.push(format!(
+        "village_demo: leg=structures prefabs={} missing={} fingerprint=0x{:016x} identical={structures_identical}",
+        structure_catalog.len(),
+        structures_missing,
+        structure_catalog.fingerprint(),
+    ));
+    if structures_missing != 0 || !structures_identical {
+        failed.get_or_insert("structures");
+    }
+
+    // (l) Session leg: a real `WorldSession` on the pinned production seed must
     // stream the village through `WorldManager::update_streaming` (the same
     // dispatch a playing client uses) and reproduce the plan block for block.
     // The session is never saved, so no file or directory is created.
@@ -2567,13 +3170,13 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         "palette: leg=entries builtin_blocks={builtin_blocks} builtin_items={builtin_items} builtin_tools={builtin_tools} pack_blocks={pack_blocks} pack_items={pack_items} pack_tools={pack_tools} total={total}"
     ));
     fail_if!(
-        builtin_blocks != 14
+        builtin_blocks != 15
             || builtin_items != 11
             || builtin_tools != 16
             || pack_blocks != 2
             || pack_items != 2
             || pack_tools != 2
-            || total != 47,
+            || total != 48,
         "entries"
     );
 
@@ -2630,7 +3233,7 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         "palette: leg=filter query=builtin matched={}",
         builtin_matches.len()
     ));
-    fail_if!(builtin_matches.len() != 41, "filter");
+    fail_if!(builtin_matches.len() != 42, "filter");
 
     // (d) Grant legs: a fresh Creative player, one authored full stack per
     // identity, granted through the real production path. Every grant writes
@@ -2769,7 +3372,7 @@ pub fn palette_demo_lines(registry: &Arc<ContentRegistry>) -> (Vec<String>, bool
         placeholder_entries.len()
     ));
     fail_if!(
-        placeholder_entries.len() != 47 || ghosts_listed,
+        placeholder_entries.len() != 48 || ghosts_listed,
         "placeholder"
     );
 

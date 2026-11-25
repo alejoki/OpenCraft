@@ -2,7 +2,7 @@
 //!
 //! The config watcher has a compile-time list of six files; the pack watcher
 //! has a dynamic list built from the frozen [`PackPresentation`]: every stack
-//! manifest, the 25 block and 13 mob fixed names, one already-allocated v2
+//! manifest, the 26 block and 13 mob fixed names, one already-allocated v2
 //! block-face asset per frozen slot, and one authored `[builtin_icons]` PNG
 //! per override name. Nothing here touches the GPU, decodes a PNG, or reads
 //! the filesystem: callers feed in fingerprints and react to the settled
@@ -30,7 +30,7 @@ const MANIFEST_FILE: &str = "pack.toml";
 
 /// What a watched pack file feeds.
 ///
-/// `BaseLayer` uses the fixed texture-array index (`0..=24`, `32..=44`).
+/// `BaseLayer` uses the fixed texture-array index (`0..=25`, `32..=44`).
 /// `Asset` uses the frozen pack-layer slot, whose GPU layer is
 /// `PACK_LAYER_BASE + slot`. `BuiltinIcon` names the pinned procedural item
 /// sprite layer and never consumes block-layer allocation.
@@ -328,7 +328,8 @@ mod tests {
 
     use crate::content::registry::{build_registry, PackIdentity};
     use crate::content::spec::{
-        BlockEntry, BlockTextures, PackAsset, PackContentSpec, RecipeEntry, RecipePatch,
+        BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset, PackContentSpec, RecipeEntry,
+        RecipePatch,
     };
     use crate::content::ContentRegistry;
     use crate::pack::manifest;
@@ -352,6 +353,7 @@ mod tests {
             content: PackContentSpec::default(),
             diagnostics: Vec::new(),
             warnings: Vec::new(),
+            rejected: None,
         }
     }
 
@@ -376,6 +378,8 @@ mod tests {
                 drop: None,
                 tool: None,
                 stack_limit: 64,
+                model: BlockModel::Cube,
+                alpha: BlockAlpha::Opaque,
             });
         }
         for (index, path) in used.iter().chain(unused.iter()).enumerate() {
@@ -389,7 +393,7 @@ mod tests {
         }
 
         let mut spec = blank_spec(folder);
-        spec.format_version = manifest::PackFormat::V2;
+        spec.format_version = manifest::PackFormat::V3;
         spec.content = content.clone();
 
         let identity = PackIdentity {
@@ -444,7 +448,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_pack_watches_manifest_and_all_thirty_eight_fixed_names() {
+    fn v1_pack_watches_manifest_and_all_thirty_nine_fixed_names() {
         let root = tempfile::tempdir().unwrap();
         let folder = "v1";
         fs::create_dir_all(root.path().join(folder)).unwrap();
@@ -456,7 +460,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 25 + 13);
+        assert_eq!(watch.entry_count(), 1 + 26 + 13);
         assert_eq!(watch.entries().len(), watch.entry_count());
         assert!(watch.entry(watch.entry_count()).is_none());
 
@@ -466,7 +470,7 @@ mod tests {
         assert_eq!(manifest.display, "packs/v1/pack.toml");
         assert_eq!(manifest.path, root.path().join("v1").join("pack.toml"));
 
-        let expected_layers: Vec<u8> = (0..25u8).chain(32..=44).collect();
+        let expected_layers: Vec<u8> = (0..26u8).chain(32..=44).collect();
         assert_eq!(base_layer_indices(&watch), expected_layers);
 
         let stone = watch
@@ -521,7 +525,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 38 + 2);
+        assert_eq!(watch.entry_count(), 1 + 39 + 2);
         let assets = asset_entries(&watch);
         assert_eq!(assets.len(), 2);
         assert_eq!(assets[0].kind, PackFileKind::Asset { slot: 0 });
@@ -567,7 +571,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 38 + 1);
+        assert_eq!(watch.entry_count(), 1 + 39 + 1);
         let assets = asset_entries(&watch);
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].kind, PackFileKind::Asset { slot: 0 });
@@ -603,7 +607,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 38 + 2);
+        assert_eq!(watch.entry_count(), 1 + 39 + 2);
         let icons = builtin_icon_entries(&watch);
         assert_eq!(icons.len(), 2, "one entry per authored override name");
         assert_eq!(icons[0].kind, PackFileKind::BuiltinIcon { name: "apple" });
@@ -645,7 +649,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 38 + 1);
+        assert_eq!(watch.entry_count(), 1 + 39 + 1);
         assert!(
             builtin_icon_entries(&watch).is_empty(),
             "a table-less v2 pack adds no sprite entries"
@@ -668,7 +672,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 1 + 38 + 2);
+        assert_eq!(watch.entry_count(), 1 + 39 + 2);
         let icons = builtin_icon_entries(&watch);
         assert_eq!(icons.len(), 2);
         assert_eq!(icons[0].display, "packs/shared/sprite.png");
@@ -691,7 +695,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(watch.entry_count(), 2 + 38);
+        assert_eq!(watch.entry_count(), 2 + 39);
 
         let manifests: Vec<&PackWatchEntry> = watch
             .entries()
@@ -788,6 +792,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 

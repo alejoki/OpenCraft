@@ -16,7 +16,8 @@
 use std::collections::BTreeMap;
 
 use crate::spec::{
-    BlockEntry, BlockPatch, ItemEntry, PackContentSpec, RecipePatch, TierEntry, ToolEntry, ToolKind,
+    BlockAlpha, BlockEntry, BlockModel, BlockPatch, FaceSource, ItemEntry, PackContentSpec,
+    RecipePatch, TierEntry, ToolEntry, ToolKind,
 };
 use crate::vocabulary::MATERIAL_ID_NAMES;
 
@@ -109,6 +110,26 @@ impl Digest {
         }
     }
 
+    fn opt_block_model(&mut self, value: Option<BlockModel>) {
+        match value {
+            None => self.u8(0),
+            Some(model) => {
+                self.u8(1);
+                self.u8(block_model_tag(model));
+            }
+        }
+    }
+
+    fn opt_block_alpha(&mut self, value: Option<BlockAlpha>) {
+        match value {
+            None => self.u8(0),
+            Some(alpha) => {
+                self.u8(1);
+                self.u8(block_alpha_tag(alpha));
+            }
+        }
+    }
+
     fn block(&mut self, block: u16) {
         self.u16(block);
     }
@@ -171,6 +192,24 @@ fn tool_kind_tag(kind: ToolKind) -> u8 {
         ToolKind::Hoe => 3,
         ToolKind::Sword => 4,
         ToolKind::Bow => 5,
+    }
+}
+
+/// Frozen digest tag for a render model (`cube`, `cross`, `crop`).
+fn block_model_tag(model: BlockModel) -> u8 {
+    match model {
+        BlockModel::Cube => 0,
+        BlockModel::Cross => 1,
+        BlockModel::Crop => 2,
+    }
+}
+
+/// Frozen digest tag for an alpha mode (`opaque`, `cutout`, `blend`).
+fn block_alpha_tag(alpha: BlockAlpha) -> u8 {
+    match alpha {
+        BlockAlpha::Opaque => 0,
+        BlockAlpha::Cutout => 1,
+        BlockAlpha::Blend => 2,
     }
 }
 
@@ -389,6 +428,66 @@ pub(super) fn compute_digest(input: &DigestInputs<'_>) -> u64 {
         digest.u8(u8::from(patch.enabled));
     }
 
+    // Authored model/alpha metadata, appended as a separate section after the
+    // block and patch bytes. Default metadata adds zero bytes, so every
+    // pre-model digest and pack pin stays byte-identical; the section exists
+    // only when at least one authored block or patch changes rendering.
+    let non_default_blocks: Vec<(&str, BlockModel, BlockAlpha)> = block_entries
+        .iter()
+        .filter(|(_id, (_folder, entry))| {
+            entry.model != BlockModel::Cube || entry.alpha != BlockAlpha::Opaque
+        })
+        .map(|(id, (_folder, entry))| (*id, entry.model, entry.alpha))
+        .collect();
+    let non_default_patches: Vec<(&str, Option<BlockModel>, Option<BlockAlpha>)> = block_patches
+        .iter()
+        .filter(|(_folder, patch)| {
+            matches!(patch.model, Some(model) if model != BlockModel::Cube)
+                || matches!(patch.alpha, Some(alpha) if alpha != BlockAlpha::Opaque)
+        })
+        .map(|(_folder, patch)| (patch.id.as_str(), patch.model, patch.alpha))
+        .collect();
+    if !non_default_blocks.is_empty() || !non_default_patches.is_empty() {
+        let count = non_default_blocks.len() + non_default_patches.len();
+        digest.u16(u16::try_from(count).unwrap_or(u16::MAX));
+        for (id, model, alpha) in &non_default_blocks {
+            digest.str(id);
+            digest.u8(block_model_tag(*model));
+            digest.u8(block_alpha_tag(*alpha));
+        }
+        for (id, model, alpha) in &non_default_patches {
+            digest.str(id);
+            digest.opt_block_model(*model);
+            digest.opt_block_alpha(*alpha);
+        }
+    }
+
+    // Built-in per-direction face plans. The empty plan hashes nothing, so
+    // every pre-T03 digest (reference/reference+overlay/builtin pins and
+    // engine-reuse-proof) stays byte-identical. `Layer` sources are fixed
+    // base layers, not authored content, so they are not hashed either;
+    // only a new/renamed authored file moves the digest.
+    let authored_face_count = packs
+        .iter()
+        .flat_map(|(_identity, spec)| &spec.builtin_faces)
+        .flat_map(|entry| &entry.faces)
+        .filter(|source| matches!(source, Some(FaceSource::Authored(_))))
+        .count();
+    if authored_face_count > 0 {
+        digest.u16(u16::try_from(authored_face_count).unwrap_or(u16::MAX));
+        for (_identity, spec) in packs {
+            for entry in &spec.builtin_faces {
+                for (face, source) in entry.faces.iter().enumerate() {
+                    if let Some(FaceSource::Authored(path)) = source {
+                        digest.str(&entry.block);
+                        digest.u8(face as u8);
+                        digest.str(path);
+                    }
+                }
+            }
+        }
+    }
+
     digest.finish()
 }
 
@@ -398,13 +497,27 @@ pub(super) fn compute_digest(input: &DigestInputs<'_>) -> u64 {
 /// into texture layers) so the digest and the allocation can never disagree
 /// about which face reads which path.
 pub(super) fn face_texture(textures: &crate::spec::BlockTextures, face: usize) -> Option<&String> {
-    let specific = match face {
-        0 | 1 | 4 | 5 => textures.side.as_ref(),
+    // Frozen face order: 0=+X/east, 1=-X/west, 2=+Y/top, 3=-Y/bottom,
+    // 4=+Z/south, 5=-Z/north.
+    let direction = match face {
+        0 => textures.east.as_ref(),
+        1 => textures.west.as_ref(),
         2 => textures.top.as_ref(),
         3 => textures.bottom.as_ref(),
+        4 => textures.south.as_ref(),
+        5 => textures.north.as_ref(),
         _ => None,
     };
-    specific.or(textures.all.as_ref())
+    if direction.is_some() {
+        return direction;
+    }
+    let side_fallback = matches!(face, 0 | 1 | 4 | 5);
+    if side_fallback {
+        if let Some(side) = textures.side.as_ref() {
+            return Some(side);
+        }
+    }
+    textures.all.as_ref()
 }
 
 #[cfg(test)]
@@ -446,6 +559,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 
@@ -488,6 +603,8 @@ mod tests {
                 drop: None,
                 tool_class: entry.tool,
                 stack_limit: entry.stack_limit,
+                model: entry.model,
+                alpha: entry.alpha,
                 placeholder: false,
             });
         }
@@ -495,7 +612,14 @@ mod tests {
         let tier_entries: BTreeMap<&str, (&str, &TierEntry)> = BTreeMap::new();
         let tool_entries: BTreeMap<&str, (&str, &ToolEntry)> = BTreeMap::new();
         let worldgen_rules: Vec<WorldgenRule> = Vec::new();
-        let block_patches: Vec<(&str, &BlockPatch)> = Vec::new();
+        let block_patches: Vec<(&str, &BlockPatch)> = packs
+            .iter()
+            .flat_map(|(pack, spec)| {
+                spec.block_patches
+                    .iter()
+                    .map(|patch| (pack.folder.as_str(), patch))
+            })
+            .collect();
         let recipe_patches: Vec<(&str, &RecipePatch)> = Vec::new();
         let inputs = DigestInputs {
             packs,
@@ -649,6 +773,8 @@ mod tests {
             drop: None,
             tool_class: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
             placeholder: false,
         }];
         let block_entries = BTreeMap::new();
@@ -882,6 +1008,8 @@ mod tests {
             drop: Some("cobblestone".to_string()),
             tool: Some(ToolKind::Shovel),
             stack_limit: Some(32),
+            model: None,
+            alpha: None,
         };
         let digest = |patch: Option<&BlockPatch>| {
             let block_entries = BTreeMap::new();
@@ -912,6 +1040,212 @@ mod tests {
         };
 
         assert_ne!(digest(None), digest(Some(&patch)));
+    }
+
+    #[test]
+    fn face_texture_resolves_direction_then_side_then_all() {
+        let textures = BlockTextures {
+            all: Some("all.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            side: Some("side.png".to_string()),
+            east: Some("east.png".to_string()),
+            west: Some("west.png".to_string()),
+            south: Some("south.png".to_string()),
+            north: Some("north.png".to_string()),
+        };
+        let face = |index: usize| face_texture(&textures, index).map(String::as_str);
+        assert_eq!(face(0), Some("east.png"), "0=+X/east");
+        assert_eq!(face(1), Some("west.png"), "1=-X/west");
+        assert_eq!(face(2), Some("top.png"), "2=+Y/top");
+        assert_eq!(face(3), Some("bottom.png"), "3=-Y/bottom");
+        assert_eq!(face(4), Some("south.png"), "4=+Z/south");
+        assert_eq!(face(5), Some("north.png"), "5=-Z/north");
+    }
+
+    #[test]
+    fn face_texture_falls_back_to_side_for_the_four_sides_and_all_elsewhere() {
+        let with_side = BlockTextures {
+            all: Some("all.png".to_string()),
+            side: Some("side.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in [0, 1, 4, 5] {
+            assert_eq!(
+                face_texture(&with_side, index).map(String::as_str),
+                Some("side.png"),
+                "face {index} falls back past direction to side"
+            );
+        }
+        for index in [2, 3] {
+            assert_eq!(
+                face_texture(&with_side, index).map(String::as_str),
+                Some("all.png"),
+                "face {index} ignores side and falls back to all"
+            );
+        }
+
+        let all_only = BlockTextures {
+            all: Some("all.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in 0..6 {
+            assert_eq!(
+                face_texture(&all_only, index).map(String::as_str),
+                Some("all.png"),
+                "all alone applies to face {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn face_texture_without_any_authored_key_is_none() {
+        let empty = BlockTextures::default();
+        for index in 0..6 {
+            assert_eq!(face_texture(&empty, index), None, "face {index}");
+        }
+    }
+
+    #[test]
+    fn legacy_four_key_textures_keep_the_historical_face_table() {
+        let textures = BlockTextures {
+            all: Some("all.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            side: Some("side.png".to_string()),
+            ..BlockTextures::default()
+        };
+        for index in 0..6 {
+            let historical = match index {
+                0 | 1 | 4 | 5 => Some("side.png"),
+                2 => Some("top.png"),
+                3 => Some("bottom.png"),
+                _ => None,
+            }
+            .or(Some("all.png"));
+            assert_eq!(
+                face_texture(&textures, index).map(String::as_str),
+                historical,
+                "legacy face {index} resolution must not change"
+            );
+        }
+
+        // The digest only folds in the resolved per-face table, so a pack
+        // authored with the legacy four keys hashes identically to one whose
+        // faces are authored explicitly.
+        let mut legacy = PackContentSpec::default();
+        let mut legacy_entry = block_entry("mymod:legacy", "all.png");
+        legacy_entry.textures = textures;
+        legacy.blocks.push(legacy_entry);
+
+        let mut explicit = PackContentSpec::default();
+        let mut explicit_entry = block_entry("mymod:legacy", "side.png");
+        explicit_entry.textures = BlockTextures {
+            east: Some("side.png".to_string()),
+            west: Some("side.png".to_string()),
+            south: Some("side.png".to_string()),
+            north: Some("side.png".to_string()),
+            top: Some("top.png".to_string()),
+            bottom: Some("bottom.png".to_string()),
+            ..BlockTextures::default()
+        };
+        explicit.blocks.push(explicit_entry);
+
+        assert_eq!(
+            digest_for(&[(identity("p", None), legacy)]),
+            digest_for(&[(identity("p", None), explicit)]),
+            "legacy authoring keeps its historical digest"
+        );
+    }
+
+    #[test]
+    fn renaming_a_directional_face_moves_the_digest() {
+        let mut spec = PackContentSpec::default();
+        let mut entry = block_entry("mymod:cube", "a.png");
+        entry.textures.north = Some("n.png".to_string());
+        spec.blocks.push(entry);
+
+        // face 5 resolves to n.png; 0..=4 resolve to a.png.
+        assert_eq!(
+            face_texture(&spec.blocks[0].textures, 5).map(String::as_str),
+            Some("n.png")
+        );
+        for index in 0..5 {
+            assert_eq!(
+                face_texture(&spec.blocks[0].textures, index).map(String::as_str),
+                Some("a.png"),
+                "face {index}"
+            );
+        }
+
+        let base = digest_for(&[(identity("p", None), spec.clone())]);
+        let mut renamed = spec;
+        renamed.blocks[0].textures.north = Some("n2.png".to_string());
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), renamed)]),
+            "a directional face rename must move the digest"
+        );
+    }
+
+    #[test]
+    fn empty_and_layer_only_builtin_face_plans_keep_the_digest() {
+        let base = PackContentSpec::default();
+        let base_stack = vec![(identity("p", Some("1.0")), base.clone())];
+
+        // An empty plan and a plan built only from existing base layers are
+        // equivalent to no plan at all: neither authors a new face file.
+        let mut layer_only = base.clone();
+        layer_only
+            .builtin_faces
+            .push(crate::spec::BuiltinFaceEntry {
+                block: "stone".to_string(),
+                faces: [
+                    None,
+                    None,
+                    Some(FaceSource::Layer(0)),
+                    Some(FaceSource::Layer(26)),
+                    None,
+                    None,
+                ],
+            });
+        let layer_stack = vec![(identity("p", Some("1.0")), layer_only)];
+
+        assert_eq!(
+            digest_for(&base_stack),
+            digest_for(&layer_stack),
+            "a plan with no authored face must not move the digest"
+        );
+    }
+
+    #[test]
+    fn authored_builtin_face_moves_the_digest() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(crate::spec::BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        let base = digest_for(&[(identity("p", None), spec.clone())]);
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), PackContentSpec::default())]),
+            "an authored built-in face is authored content"
+        );
+
+        let mut renamed = spec;
+        renamed.builtin_faces[0].faces[2] = Some(FaceSource::Authored("stone_top_v2".to_string()));
+        assert_ne!(
+            base,
+            digest_for(&[(identity("p", None), renamed)]),
+            "renaming the authored face file must move the digest"
+        );
     }
 
     #[test]
@@ -970,5 +1304,82 @@ mod tests {
         let mut sweeter = stew.clone();
         sweeter.nutrition = 8;
         assert_ne!(digest(Some(stew)), digest(Some(sweeter)));
+    }
+
+    fn stack(spec: PackContentSpec) -> Vec<(PackIdentity, PackContentSpec)> {
+        vec![(identity("alpha", Some("1.0")), spec)]
+    }
+
+    #[test]
+    fn default_model_and_alpha_metadata_adds_no_digest_bytes() {
+        let mut base = PackContentSpec::default();
+        base.blocks
+            .push(block_entry("mymod:ruby_ore", "ruby_ore.png"));
+
+        // Explicitly authored defaults are still defaults: zero extra bytes.
+        let mut explicit = base.clone();
+        explicit.blocks[0].model = BlockModel::Cube;
+        explicit.blocks[0].alpha = BlockAlpha::Opaque;
+
+        assert_eq!(
+            digest_for(&stack(base.clone())),
+            digest_for(&stack(explicit))
+        );
+        // The baseline itself must not be the empty digest: the pack block is
+        // still hashed exactly as before the metadata section existed.
+        assert_ne!(digest_for(&stack(base)), EMPTY_DIGEST);
+    }
+
+    #[test]
+    fn non_default_model_and_alpha_move_the_digest() {
+        let mut base = PackContentSpec::default();
+        base.blocks
+            .push(block_entry("mymod:ruby_ore", "ruby_ore.png"));
+        let baseline = digest_for(&stack(base.clone()));
+
+        for model in [BlockModel::Cross, BlockModel::Crop] {
+            let mut edited = base.clone();
+            edited.blocks[0].model = model;
+            assert_ne!(baseline, digest_for(&stack(edited)), "model {model:?}");
+        }
+        for alpha in [BlockAlpha::Cutout, BlockAlpha::Blend] {
+            let mut edited = base.clone();
+            edited.blocks[0].alpha = alpha;
+            assert_ne!(baseline, digest_for(&stack(edited)), "alpha {alpha:?}");
+        }
+    }
+
+    #[test]
+    fn non_default_patch_metadata_moves_the_digest() {
+        let base = PackContentSpec::default();
+        let baseline = digest_for(&stack(base.clone()));
+
+        let patch = |model, alpha| BlockPatch {
+            id: "stone".to_string(),
+            model,
+            alpha,
+            ..BlockPatch::default()
+        };
+        for edited in [
+            patch(Some(BlockModel::Cross), None),
+            patch(None, Some(BlockAlpha::Cutout)),
+            patch(None, Some(BlockAlpha::Blend)),
+        ] {
+            let mut spec = base.clone();
+            spec.block_patches.push(edited.clone());
+            assert_ne!(baseline, digest_for(&stack(spec)), "patch {edited:?}");
+        }
+    }
+
+    #[test]
+    fn model_and_alpha_tags_cover_the_frozen_order() {
+        assert_eq!(
+            [BlockModel::Cube, BlockModel::Cross, BlockModel::Crop].map(block_model_tag),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            [BlockAlpha::Opaque, BlockAlpha::Cutout, BlockAlpha::Blend].map(block_alpha_tag),
+            [0, 1, 2]
+        );
     }
 }

@@ -10,7 +10,7 @@ use crate::sky::{self, SkyGeometry, SkyUniform};
 use crate::texture::TextureArraySpec;
 use crate::weather::{self, Precipitation};
 use opencraft_core::camera::{visible_face_mask, Camera, Frustum};
-use opencraft_core::chunk::CHUNK_SIZE;
+use opencraft_core::chunk::{ChunkPos, CHUNK_SIZE};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -118,6 +118,55 @@ pub fn effective_fog(
 /// stays pure and testable without a `wgpu::Device`.
 pub fn weather_draw_visible(precipitation: Precipitation, stage_present: bool) -> bool {
     stage_present && !matches!(precipitation, Precipitation::Clear)
+}
+
+/// One chunk candidate for the sorted translucent stage.
+///
+/// Water and blend geometry share the stage but have separate buffers and
+/// pipelines; this value records only what the pure ordering helper needs,
+/// i.e. which kinds of translucent geometry the chunk actually carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslucentChunk {
+    pub pos: ChunkPos,
+    pub has_water: bool,
+    pub has_blend: bool,
+}
+
+/// Deterministic back-to-front draw order for translucent chunks.
+///
+/// Filters chunks carrying neither water nor blend geometry, then sorts the
+/// rest farthest-first by squared distance from the camera to the chunk
+/// center, breaking exact ties by `(x, y, z)`. Farthest-first is the standard
+/// painter's order for alpha blending: translucency writes no depth, so the
+/// nearest surface must be composited last.
+///
+/// This sorts whole chunks, not individual quads: intra-chunk order stays the
+/// mesher's deterministic emission order. Per-quad sorting would require
+/// rewriting a vertex buffer every frame and is deliberately out of scope.
+/// Pure so headless tests can pin determinism without a `wgpu::Device`.
+pub fn translucent_draw_order(camera_pos: [f32; 3], chunks: &[TranslucentChunk]) -> Vec<ChunkPos> {
+    let cs = CHUNK_SIZE as f32;
+    let half = cs * 0.5;
+    let mut ordered: Vec<(ChunkPos, f32)> = chunks
+        .iter()
+        .filter(|chunk| chunk.has_water || chunk.has_blend)
+        .map(|chunk| {
+            let cx = chunk.pos.x as f32 * cs + half - camera_pos[0];
+            let cy = chunk.pos.y as f32 * cs + half - camera_pos[1];
+            let cz = chunk.pos.z as f32 * cs + half - camera_pos[2];
+            (chunk.pos, cx * cx + cy * cy + cz * cz)
+        })
+        .collect();
+
+    ordered.sort_by(|(a_pos, a_dist), (b_pos, b_dist)| {
+        b_dist
+            .total_cmp(a_dist)
+            .then_with(|| a_pos.x.cmp(&b_pos.x))
+            .then_with(|| a_pos.y.cmp(&b_pos.y))
+            .then_with(|| a_pos.z.cmp(&b_pos.z))
+    });
+
+    ordered.into_iter().map(|(pos, _)| pos).collect()
 }
 
 /// GPU resources for the precipitation stage, built once at renderer
@@ -258,36 +307,60 @@ fn vs_main(
 
     let u_bit = f32(corner & 1u);
     let v_bit = f32((corner >> 1u) & 1u);
-    let u_off = u_bit * qw;
-    let v_off = v_bit * qh;
-    let d_off = select(0.0, 1.0, (face_dir & 1u) == 0u);
+
+    // `face_dir` 6/7 are the two crossed planes of a plant
+    // (model = cross|crop). They share the PackedQuad wire format but are not
+    // cube faces: the four corners sit on the vanilla inset diagonal (0.146
+    // inset) and span the full cell height, UVs are 0..1, and the analytic
+    // backface cull below is skipped because both planes are double-sided.
+    let is_cross = face_dir >= 6u;
 
     var local_pos: vec3<f32>;
     var uv: vec2<f32>;
-    let axis = face_dir >> 1u;
-    if axis == 0u {
-        local_pos = vec3<f32>(qx + d_off, qy + v_off, qz + u_off);
-        uv = vec2<f32>(u_off, qh - v_off);
-    } else if axis == 1u {
-        local_pos = vec3<f32>(qx + u_off, qy + d_off, qz + v_off);
-        uv = vec2<f32>(u_off, v_off);
+    if is_cross {
+        let inset = 0.146;
+        let span = 1.0 - 2.0 * inset;
+        // Plane A runs inset -> inset+span on both X and Z; plane B mirrors X.
+        var base = vec3<f32>(qx + inset, qy, qz + inset);
+        var step_u = vec3<f32>(span, 0.0, span);
+        if face_dir == 7u {
+            base = vec3<f32>(qx + inset + span, qy, qz + inset);
+            step_u = vec3<f32>(-span, 0.0, span);
+        }
+        local_pos = base + step_u * u_bit + vec3<f32>(0.0, v_bit, 0.0);
+        uv = vec2<f32>(u_bit, v_bit);
     } else {
-        local_pos = vec3<f32>(qx + u_off, qy + v_off, qz + d_off);
-        uv = vec2<f32>(u_off, qh - v_off);
+        let u_off = u_bit * qw;
+        let v_off = v_bit * qh;
+        let d_off = select(0.0, 1.0, (face_dir & 1u) == 0u);
+        let axis = face_dir >> 1u;
+        if axis == 0u {
+            local_pos = vec3<f32>(qx + d_off, qy + v_off, qz + u_off);
+            uv = vec2<f32>(u_off, qh - v_off);
+        } else if axis == 1u {
+            local_pos = vec3<f32>(qx + u_off, qy + d_off, qz + v_off);
+            uv = vec2<f32>(u_off, v_off);
+        } else {
+            local_pos = vec3<f32>(qx + u_off, qy + v_off, qz + d_off);
+            uv = vec2<f32>(u_off, qh - v_off);
+        }
     }
 
     let world_pos = chunk.origin.xyz + local_pos;
-    let normal = face_normal(face_dir);
 
     var out: VertexOutput;
-    // Exact planar backface check: cull if camera is on or behind the quad plane
-    if dot(world_pos - camera.camera_pos.xyz, normal) >= 0.0 {
-        out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 0.0);
-        out.uv = vec2<f32>(0.0, 0.0);
-        out.tex_layer = 0u;
-        out.light = 0.0;
-        out.cam_dist = 0.0;
-        return out;
+    // Exact planar backface check for cube faces only: cull if the camera is
+    // on or behind the quad plane. Crossed plants are double-sided.
+    if !is_cross {
+        let normal = face_normal(face_dir);
+        if dot(world_pos - camera.camera_pos.xyz, normal) >= 0.0 {
+            out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 0.0);
+            out.uv = vec2<f32>(0.0, 0.0);
+            out.tex_layer = 0u;
+            out.light = 0.0;
+            out.cam_dist = 0.0;
+            return out;
+        }
     }
 
     var ao_val: u32 = ao00;
@@ -310,9 +383,11 @@ fn vs_main(
     out.tex_layer = tex_layer;
     // Day factor rides in the unused fog_start_end.z slot: keeps CameraUniform
     // at seven vec4s while still dimming lit terrain at night. Cave vertices
-    // stay dark regardless because their light_factor is already ~0.
+    // stay dark regardless because their light_factor is already ~0. Cross
+    // plant planes are unshaded by face direction (sun factor 1.0).
     let day_factor = camera.fog_start_end.z;
-    out.light = face_sun_factor(face_dir) * ao_factor * light_factor * day_factor;
+    let sun_factor = select(face_sun_factor(face_dir), 1.0, is_cross);
+    out.light = sun_factor * ao_factor * light_factor * day_factor;
     out.cam_dist = distance(world_pos, camera.camera_pos.xyz);
     return out;
 }
@@ -320,6 +395,11 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tex_color = textureSample(block_tex, block_sampler, in.uv, i32(in.tex_layer));
+    // Cutout belongs to the opaque draw: a sampled alpha below 0.5 is a hole
+    // (leaves, wheat blades) and must reveal whatever was drawn behind it.
+    if tex_color.a < 0.5 {
+        discard;
+    }
     let lit_rgb = tex_color.rgb * in.light;
     let fog_start = camera.fog_start_end.x;
     let fog_end = camera.fog_start_end.y;
@@ -504,6 +584,199 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // sit as a fixed 65%-opaque sheet over the fogged horizon.
     let final_alpha = base.a * (1.0 - fog);
     return vec4<f32>(final_rgb, final_alpha);
+}
+"#;
+
+/// Alpha-blended cube-face shader (glass).
+///
+/// The vertex stage is the same PackedQuad decode as the voxel shader,
+/// including the `face_dir >= 6` cross branch, so blend geometry can never
+/// drift from the opaque decode. The fragment stage samples the block texture
+/// array, applies the same light and fog math, and returns the **sampled
+/// alpha** instead of a constant 1.0 so glass art controls its own
+/// translucency. No discard: blend is not cutout.
+const BLEND_SHADER_WGSL: &str = r#"
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    fog_color: vec4<f32>,
+    fog_start_end: vec4<f32>,
+};
+
+struct ChunkUniform {
+    origin: vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(0) @binding(1) var block_tex: texture_2d_array<f32>;
+@group(0) @binding(2) var block_sampler: sampler;
+
+@group(1) @binding(0) var<uniform> chunk: ChunkUniform;
+
+struct VertexOutput {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) @interpolate(flat) tex_layer: u32,
+    @location(2) light: f32,
+    @location(3) cam_dist: f32,
+};
+
+fn face_normal(face_dir: u32) -> vec3<f32> {
+    switch face_dir {
+        case 0u: { return vec3<f32>(1.0, 0.0, 0.0); }
+        case 1u: { return vec3<f32>(-1.0, 0.0, 0.0); }
+        case 2u: { return vec3<f32>(0.0, 1.0, 0.0); }
+        case 3u: { return vec3<f32>(0.0, -1.0, 0.0); }
+        case 4u: { return vec3<f32>(0.0, 0.0, 1.0); }
+        default: { return vec3<f32>(0.0, 0.0, -1.0); }
+    }
+}
+
+fn face_sun_factor(face_dir: u32) -> f32 {
+    switch face_dir {
+        case 2u: { return 1.0; }
+        case 0u, 1u: { return 0.82; }
+        case 4u, 5u: { return 0.70; }
+        default: { return 0.50; }
+    }
+}
+
+@vertex
+fn vs_main(
+    @builtin(vertex_index) vid: u32,
+    @location(0) quad_words: vec2<u32>,
+) -> VertexOutput {
+    let w0 = quad_words.x;
+    let w1 = quad_words.y;
+
+    let qx = f32(w0 & 31u);
+    let qy = f32((w0 >> 5u) & 31u);
+    let qz = f32((w0 >> 10u) & 31u);
+    let qw = f32(((w0 >> 15u) & 31u) + 1u);
+    let qh = f32(((w0 >> 20u) & 31u) + 1u);
+    let face_dir = (w0 >> 25u) & 7u;
+
+    let tex_layer = w1 & 255u;
+    let ao_packed = (w1 >> 8u) & 255u;
+    let light_packed = (w1 >> 16u) & 0xFFFFu;
+
+    let ao00 = ao_packed & 3u;
+    let ao10 = (ao_packed >> 2u) & 3u;
+    let ao01 = (ao_packed >> 4u) & 3u;
+    let ao11 = (ao_packed >> 6u) & 3u;
+
+    let l00 = light_packed & 15u;
+    let l10 = (light_packed >> 4u) & 15u;
+    let l01 = (light_packed >> 8u) & 15u;
+    let l11 = (light_packed >> 12u) & 15u;
+
+    let flip_diag = (ao00 + ao11) > (ao10 + ao01);
+    var corner: u32 = 0u;
+    if !flip_diag {
+        switch vid {
+            case 0u: { corner = 0u; }
+            case 1u: { corner = 1u; }
+            case 2u: { corner = 2u; }
+            case 3u: { corner = 2u; }
+            case 4u: { corner = 1u; }
+            default: { corner = 3u; }
+        }
+    } else {
+        switch vid {
+            case 0u: { corner = 0u; }
+            case 1u: { corner = 1u; }
+            case 2u: { corner = 3u; }
+            case 3u: { corner = 0u; }
+            case 4u: { corner = 3u; }
+            default: { corner = 2u; }
+        }
+    }
+
+    let u_bit = f32(corner & 1u);
+    let v_bit = f32((corner >> 1u) & 1u);
+    let is_cross = face_dir >= 6u;
+
+    var local_pos: vec3<f32>;
+    var uv: vec2<f32>;
+    if is_cross {
+        let inset = 0.146;
+        let span = 1.0 - 2.0 * inset;
+        var base = vec3<f32>(qx + inset, qy, qz + inset);
+        var step_u = vec3<f32>(span, 0.0, span);
+        if face_dir == 7u {
+            base = vec3<f32>(qx + inset + span, qy, qz + inset);
+            step_u = vec3<f32>(-span, 0.0, span);
+        }
+        local_pos = base + step_u * u_bit + vec3<f32>(0.0, v_bit, 0.0);
+        uv = vec2<f32>(u_bit, v_bit);
+    } else {
+        let u_off = u_bit * qw;
+        let v_off = v_bit * qh;
+        let d_off = select(0.0, 1.0, (face_dir & 1u) == 0u);
+        let axis = face_dir >> 1u;
+        if axis == 0u {
+            local_pos = vec3<f32>(qx + d_off, qy + v_off, qz + u_off);
+            uv = vec2<f32>(u_off, qh - v_off);
+        } else if axis == 1u {
+            local_pos = vec3<f32>(qx + u_off, qy + d_off, qz + v_off);
+            uv = vec2<f32>(u_off, v_off);
+        } else {
+            local_pos = vec3<f32>(qx + u_off, qy + v_off, qz + d_off);
+            uv = vec2<f32>(u_off, qh - v_off);
+        }
+    }
+
+    let world_pos = chunk.origin.xyz + local_pos;
+
+    var out: VertexOutput;
+    if !is_cross {
+        let normal = face_normal(face_dir);
+        if dot(world_pos - camera.camera_pos.xyz, normal) >= 0.0 {
+            out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 0.0);
+            out.uv = vec2<f32>(0.0, 0.0);
+            out.tex_layer = 0u;
+            out.light = 0.0;
+            out.cam_dist = 0.0;
+            return out;
+        }
+    }
+
+    var ao_val: u32 = ao00;
+    var light_val: u32 = l00;
+    if corner == 1u {
+        ao_val = ao10;
+        light_val = l10;
+    } else if corner == 2u {
+        ao_val = ao01;
+        light_val = l01;
+    } else if corner == 3u {
+        ao_val = ao11;
+        light_val = l11;
+    }
+    let ao_factor = 0.45 + (f32(ao_val) / 3.0) * 0.55;
+    let light_factor = f32(light_val) / 15.0;
+
+    let day_factor = camera.fog_start_end.z;
+    let sun_factor = select(face_sun_factor(face_dir), 1.0, is_cross);
+    out.clip_pos = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.uv = uv;
+    out.tex_layer = tex_layer;
+    out.light = sun_factor * ao_factor * light_factor * day_factor;
+    out.cam_dist = distance(world_pos, camera.camera_pos.xyz);
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let tex_color = textureSample(block_tex, block_sampler, in.uv, i32(in.tex_layer));
+    let lit_rgb = tex_color.rgb * in.light;
+    let fog_start = camera.fog_start_end.x;
+    let fog_end = camera.fog_start_end.y;
+    let fog_t = clamp((in.cam_dist - fog_start) / max(fog_end - fog_start, 1.0), 0.0, 1.0);
+    let final_rgb = mix(lit_rgb, camera.fog_color.rgb, fog_t * fog_t);
+    // Blend owns its alpha: glass art decides translucency (no discard, since
+    // blend is not cutout).
+    return vec4<f32>(final_rgb, tex_color.a);
 }
 "#;
 
@@ -729,6 +1002,10 @@ pub struct VoxelRenderer {
     /// Alpha-blended, depth-write-disabled pipeline for `ChunkMesh::water_quads`.
     /// Drawn inside the main pass strictly after the opaque chunk loop.
     pub water_pipeline: wgpu::RenderPipeline,
+    /// Alpha-blended, depth-write-disabled pipeline for `ChunkMesh::blend_quads`
+    /// (glass), sampled-alpha rather than procedural. Drawn in the sorted
+    /// translucent stage together with water.
+    pub blend_pipeline: wgpu::RenderPipeline,
     pub overlay_pipeline: wgpu::RenderPipeline,
     /// Color-only sky pass pipeline (sun/moon/star billboards).
     pub sky_pipeline: wgpu::RenderPipeline,
@@ -1025,6 +1302,53 @@ impl VoxelRenderer {
                 multiview: None,
             });
 
+        // Blend pass (glass): the water pipeline descriptor shape — alpha
+        // blending, no depth write, LessEqual against the opaque depth buffer,
+        // no hardware culling — but sampling the block texture array and
+        // returning its alpha. Same PackedQuad vertex layout and shader module
+        // group declarations as voxel/water, so it shares the voxel layout.
+        let blend_shader = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("blend_shader"),
+                source: wgpu::ShaderSource::Wgsl(BLEND_SHADER_WGSL.into()),
+            });
+
+        let blend_pipeline = ctx
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("blend_pipeline"),
+                layout: Some(&voxel_layout),
+                vertex: wgpu::VertexState {
+                    module: &blend_shader,
+                    entry_point: "vs_main",
+                    buffers: &[packed_quad_vertex_layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blend_shader,
+                    entry_point: "fs_main",
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: ctx.config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None, // analytic planar backface cull in vs_main
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+            });
+
         let overlay_shader = ctx
             .device
             .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1097,6 +1421,7 @@ impl VoxelRenderer {
             voxel_pipeline,
             mob_pipeline,
             water_pipeline,
+            blend_pipeline,
             overlay_pipeline,
             sky_pipeline,
             camera_buffer,
@@ -1140,8 +1465,8 @@ impl VoxelRenderer {
     /// the three geometry sources plus the two per-frame bundles.
     ///
     // Pass order on the encoder: sky (clears color) -> world (loads color,
-    // clears depth: opaque -> mobs -> water -> weather) -> overlay -> optional
-    // UI (loads color).
+    // clears depth: opaque -> mobs -> cross -> sorted translucent (water +
+    // blend) -> weather) -> overlay -> optional UI (loads color).
     pub fn render_frame(
         &self,
         ctx: &RenderContext,
@@ -1370,21 +1695,22 @@ impl VoxelRenderer {
                 rpass.draw(0..mob_vertices.len() as u32, 0..1);
             }
 
-            // Translucent water stage: strictly AFTER the opaque chunk loop
-            // (so the depth buffer written there occludes water behind
-            // terrain) and BEFORE the overlay block (so the crosshair and
-            // hotbar draw on top). The pipeline writes no depth, so water can
-            // never occlude anything drawn later. Same frustum + face-mask
-            // gating as the opaque loop; chunks without water are skipped
-            // entirely, which makes an absent water stage a no-op. Direct
-            // statements, no closures: wgpu 0.19 RenderPass lifetimes (MEM032).
-            rpass.set_pipeline(&self.water_pipeline);
+            // Crossed-plant stage: strictly AFTER the opaque chunk loop and
+            // the mob batch (so terrain and mobs occlude plants) and BEFORE
+            // the translucent stage (so glass can never overdraw a plant in
+            // front of it). Cross quads reuse the voxel pipeline but have
+            // their own buffer. The opaque face mask is deliberately NOT
+            // reused: a plant inside a chunk can be visible even when none of
+            // the chunk's outer cube faces are, so only the frustum gates the
+            // draw. Direct statements, no closures: wgpu 0.19 RenderPass
+            // lifetimes (MEM032).
+            rpass.set_pipeline(&self.voxel_pipeline);
             rpass.set_bind_group(0, &self.camera_bind_group, &[]);
             for gpu_chunk in store.chunks.values() {
-                let Some(water_buffer) = gpu_chunk.water_vertex_buffer.as_ref() else {
+                let Some(cross_buffer) = gpu_chunk.cross_vertex_buffer.as_ref() else {
                     continue;
                 };
-                if gpu_chunk.water_quad_count == 0 {
+                if gpu_chunk.cross_quad_count == 0 {
                     continue;
                 }
 
@@ -1399,16 +1725,65 @@ impl VoxelRenderer {
                     continue;
                 }
 
-                let face_mask = visible_face_mask(camera.position, min, max);
-                if face_mask == 0 {
+                rpass.set_bind_group(1, &gpu_chunk.bind_group, &[]);
+                rpass.set_vertex_buffer(0, cross_buffer.slice(..));
+                rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.cross_quad_count as u32);
+            }
+
+            // Sorted translucent stage (water + blend): strictly AFTER cross
+            // (plants are in front) and BEFORE weather/overlay. Build one
+            // TranslucentChunk per chunk and draw back-to-front with the pure
+            // deterministic helper, so alpha blending composites the farthest
+            // surface first. Within one chunk water draws before blend; that
+            // intra-chunk order is fixed and per-quad sorting is out of scope
+            // (it would rewrite a vertex buffer every frame). Neither pipeline
+            // writes depth, so translucency never occludes later draws.
+            let translucent_chunks: Vec<TranslucentChunk> = store
+                .chunks
+                .values()
+                .map(|gpu_chunk| TranslucentChunk {
+                    pos: gpu_chunk.pos,
+                    has_water: gpu_chunk.water_vertex_buffer.is_some()
+                        && gpu_chunk.water_quad_count > 0,
+                    has_blend: gpu_chunk.blend_vertex_buffer.is_some()
+                        && gpu_chunk.blend_quad_count > 0,
+                })
+                .collect();
+            let camera_pos = [camera.position.x, camera.position.y, camera.position.z];
+            rpass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for pos in translucent_draw_order(camera_pos, &translucent_chunks) {
+                let Some(gpu_chunk) = store.chunks.get(&pos) else {
+                    continue;
+                };
+
+                let min = Vec3::new(
+                    gpu_chunk.pos.x as f32 * cs,
+                    gpu_chunk.pos.y as f32 * cs,
+                    gpu_chunk.pos.z as f32 * cs,
+                );
+                let max = min + Vec3::splat(cs);
+                if !frustum.intersects_aabb(min, max) {
                     continue;
                 }
 
-                rpass.set_bind_group(1, &gpu_chunk.bind_group, &[]);
-                rpass.set_vertex_buffer(0, water_buffer.slice(..));
-                // Six vertices per instance (PackedQuad step mode), one
-                // instance per water quad in the contiguous water buffer.
-                rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.water_quad_count as u32);
+                if let Some(water_buffer) = gpu_chunk.water_vertex_buffer.as_ref() {
+                    if gpu_chunk.water_quad_count > 0 {
+                        rpass.set_pipeline(&self.water_pipeline);
+                        rpass.set_bind_group(1, &gpu_chunk.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, water_buffer.slice(..));
+                        // Six vertices per instance (PackedQuad step mode).
+                        rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.water_quad_count as u32);
+                    }
+                }
+
+                if let Some(blend_buffer) = gpu_chunk.blend_vertex_buffer.as_ref() {
+                    if gpu_chunk.blend_quad_count > 0 {
+                        rpass.set_pipeline(&self.blend_pipeline);
+                        rpass.set_bind_group(1, &gpu_chunk.bind_group, &[]);
+                        rpass.set_vertex_buffer(0, blend_buffer.slice(..));
+                        rpass.draw(0..QUAD_VERTICES, 0..gpu_chunk.blend_quad_count as u32);
+                    }
+                }
             }
 
             // Precipitation stage: strictly AFTER the water loop (rain and
@@ -1924,35 +2299,120 @@ mod tests {
     }
 
     #[test]
-    fn water_draw_sits_after_the_opaque_loop_and_before_the_overlay() {
+    fn water_draw_sits_in_the_sorted_translucent_stage_before_the_overlay() {
         // Source pin on main_pass stage order: the opaque chunk loop writes the
-        // depth buffer first, the translucent water draw consumes it second,
-        // and the overlay lines draw last. The water block must reuse the same
-        // frustum + face-mask gating and skip absent/empty water buffers.
+        // depth buffer first, the sorted translucent stage consumes it, and
+        // the overlay lines draw last. Water is no longer gated by the opaque
+        // face mask (translucent geometry inside a chunk can be visible even
+        // when its outer faces are not); the frustum and absent/empty buffers
+        // are still skipped.
         let src = include_str!("pipeline.rs");
-        let opaque_loop_at = src
+        let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let opaque_loop_at = code
             .find("for gpu_chunk in store.chunks.values()")
             .expect("opaque chunk loop exists");
-        let water_draw_at = src
+        let transparent_at = code
+            .find("let translucent_chunks: Vec<TranslucentChunk>")
+            .expect("sorted translucent stage exists");
+        let water_draw_at = code
             .find("set_pipeline(&self.water_pipeline)")
             .expect("water draw exists");
-        let overlay_draw_at = src
+        let overlay_draw_at = code
             .find("set_pipeline(&self.overlay_pipeline)")
             .expect("overlay draw exists");
         assert!(
-            opaque_loop_at < water_draw_at && water_draw_at < overlay_draw_at,
-            "stage order must be opaque loop -> water draw -> overlay"
+            opaque_loop_at < transparent_at
+                && transparent_at < water_draw_at
+                && water_draw_at < overlay_draw_at,
+            "stage order must be opaque loop -> translucent stage -> overlay"
         );
 
-        let water_block = &src[water_draw_at..overlay_draw_at];
+        let water_block = &code[transparent_at..overlay_draw_at];
         assert!(water_block.contains("water_vertex_buffer"));
         assert!(water_block.contains("water_quad_count"));
         assert!(water_block.contains("frustum.intersects_aabb"));
-        assert!(water_block.contains("visible_face_mask"));
         assert!(water_block.contains("QUAD_VERTICES"));
+        assert!(
+            water_block.contains("translucent_draw_order(camera_pos"),
+            "the translucent stage must draw through the deterministic helper"
+        );
         assert!(
             water_block.contains("continue"),
             "absent or empty water buffers must be skipped, not drawn"
+        );
+    }
+
+    #[test]
+    fn translucent_draw_order_is_empty_for_empty_or_opaque_only_input() {
+        assert!(translucent_draw_order([0.0; 3], &[]).is_empty());
+        let opaque_only = [TranslucentChunk {
+            pos: ChunkPos::new(0, 0, 0),
+            has_water: false,
+            has_blend: false,
+        }];
+        assert!(
+            translucent_draw_order([0.0; 3], &opaque_only).is_empty(),
+            "a chunk with neither water nor blend must not enter the stage"
+        );
+    }
+
+    #[test]
+    fn translucent_draw_order_sorts_farthest_first_and_is_deterministic() {
+        // Camera inside chunk (0,0,0): the +X distance grows per chunk, so
+        // farthest-first is (2,0,0), (1,0,0), (0,0,0). Water-only and
+        // blend-only chunks are both candidates.
+        let camera = [8.0, 8.0, 8.0];
+        let chunks = [
+            TranslucentChunk {
+                pos: ChunkPos::new(0, 0, 0),
+                has_water: true,
+                has_blend: false,
+            },
+            TranslucentChunk {
+                pos: ChunkPos::new(2, 0, 0),
+                has_water: false,
+                has_blend: true,
+            },
+            TranslucentChunk {
+                pos: ChunkPos::new(1, 0, 0),
+                has_water: true,
+                has_blend: true,
+            },
+        ];
+        let expected = vec![
+            ChunkPos::new(2, 0, 0),
+            ChunkPos::new(1, 0, 0),
+            ChunkPos::new(0, 0, 0),
+        ];
+        assert_eq!(translucent_draw_order(camera, &chunks), expected);
+        assert_eq!(
+            translucent_draw_order(camera, &chunks),
+            translucent_draw_order(camera, &chunks),
+            "the draw order must be stable across repeated frames"
+        );
+    }
+
+    #[test]
+    fn translucent_draw_order_ties_break_by_position_lexicographically() {
+        // (+1,0,0) and (-1,0,0) are equidistant from the camera on the center
+        // line of chunk (0,0,0). The tie-break is ascending (x, y, z), so -1
+        // wins.
+        let camera = [16.0, 16.0, 16.0];
+        let chunks = [
+            TranslucentChunk {
+                pos: ChunkPos::new(1, 0, 0),
+                has_water: false,
+                has_blend: true,
+            },
+            TranslucentChunk {
+                pos: ChunkPos::new(-1, 0, 0),
+                has_water: false,
+                has_blend: true,
+            },
+        ];
+        assert_eq!(
+            translucent_draw_order(camera, &chunks),
+            vec![ChunkPos::new(-1, 0, 0), ChunkPos::new(1, 0, 0)]
         );
     }
 
@@ -2031,11 +2491,12 @@ mod tests {
     }
 
     #[test]
-    fn mob_draw_sits_between_the_opaque_loop_and_the_water_draw() {
-        // Source pin on main_pass stage order: opaque chunks -> mobs -> water.
-        // Terrain depth must occlude mobs, and the opaque mob depth write must
-        // occlude the translucent water drawn after it (D136). Slice off the
-        // test module so the literals below cannot satisfy their own pin.
+    fn mob_draw_sits_between_the_opaque_loop_and_the_cross_draw() {
+        // Source pin on main_pass stage order: opaque chunks -> mobs -> cross
+        // -> translucent. Terrain depth must occlude mobs, and the opaque mob
+        // depth write must occlude the crossed plants drawn after it (D136).
+        // Slice off the test module so the literals below cannot satisfy
+        // their own pin.
         let src = include_str!("pipeline.rs");
         let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
         let opaque_loop_at = code
@@ -2044,15 +2505,20 @@ mod tests {
         let mob_draw_at = code
             .find("set_pipeline(&self.mob_pipeline)")
             .expect("mob draw exists");
+        let cross_draw_at = code
+            .find("// Crossed-plant stage:")
+            .expect("cross draw exists");
         let water_draw_at = code
             .find("set_pipeline(&self.water_pipeline)")
             .expect("water draw exists");
         assert!(
-            opaque_loop_at < mob_draw_at && mob_draw_at < water_draw_at,
-            "stage order must be opaque loop -> mob draw -> water draw"
+            opaque_loop_at < mob_draw_at
+                && mob_draw_at < cross_draw_at
+                && cross_draw_at < water_draw_at,
+            "stage order must be opaque loop -> mob draw -> cross draw -> water"
         );
 
-        let mob_block = &code[mob_draw_at..water_draw_at];
+        let mob_block = &code[mob_draw_at..cross_draw_at];
         assert!(mob_block.contains("mob_vertex_buffer"));
         assert!(mob_block.contains("camera_bind_group"));
         assert!(
@@ -2063,6 +2529,126 @@ mod tests {
             !mob_block.contains("for ") && !mob_block.contains(".iter()"),
             "the mob stage must not loop per mob"
         );
+    }
+
+    #[test]
+    fn voxel_fragment_discards_cutout_alpha() {
+        // Cutout is an alpha-test state of the opaque draw, not a second
+        // pipeline: the fragment stage must discard sub-half samples so
+        // leaves and wheat blades reveal what is behind them.
+        assert!(
+            VOXEL_SHADER_WGSL.contains("if tex_color.a < 0.5 {"),
+            "the voxel fragment stage must alpha-test at 0.5"
+        );
+        assert!(
+            VOXEL_SHADER_WGSL.contains("discard;"),
+            "a sub-half alpha pixel must be discarded, not blended"
+        );
+    }
+
+    #[test]
+    fn voxel_vertex_branch_places_cross_quads_on_the_inset_diagonal() {
+        // face_dir 6/7 are plant planes: inset diagonal, full height, UV 0..1,
+        // no analytic backface cull, and sun factor 1.0.
+        assert!(VOXEL_SHADER_WGSL.contains("let is_cross = face_dir >= 6u;"));
+        assert!(
+            VOXEL_SHADER_WGSL.contains("let inset = 0.146;"),
+            "plants use the vanilla 0.146 inset"
+        );
+        assert!(VOXEL_SHADER_WGSL.contains("if face_dir == 7u {"));
+        assert!(VOXEL_SHADER_WGSL.contains("uv = vec2<f32>(u_bit, v_bit);"));
+        assert!(
+            VOXEL_SHADER_WGSL.contains("if !is_cross {"),
+            "the planar backface cull must be skipped for crossed plants"
+        );
+        assert!(
+            VOXEL_SHADER_WGSL.contains("select(face_sun_factor(face_dir), 1.0, is_cross)"),
+            "cross planes are unshaded by face direction"
+        );
+    }
+
+    #[test]
+    fn blend_shader_samples_alpha_and_shares_the_voxel_decode() {
+        // Blend samples the block array (unlike procedural water), returns the
+        // sampled alpha, and carries the same cross branch as the voxel shader
+        // so the decode can never drift.
+        assert!(BLEND_SHADER_WGSL.contains("textureSample(block_tex"));
+        assert!(
+            BLEND_SHADER_WGSL.contains("return vec4<f32>(final_rgb, tex_color.a);"),
+            "blend must return the sampled alpha"
+        );
+        assert!(BLEND_SHADER_WGSL.contains("let is_cross = face_dir >= 6u;"));
+        assert!(BLEND_SHADER_WGSL.contains("let day_factor = camera.fog_start_end.z;"));
+        assert!(
+            !BLEND_SHADER_WGSL.contains("discard;"),
+            "blend is not cutout: glass alpha must survive to the blender"
+        );
+    }
+
+    #[test]
+    fn blend_pipeline_is_alpha_blended_and_does_not_write_depth() {
+        // The blend pipeline is the water descriptor shape: translucent,
+        // no depth write, LessEqual against opaque depth, no hardware culling,
+        // and the shared PackedQuad vertex layout.
+        let src = include_str!("pipeline.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let blend_at = code
+            .find("let blend_shader = ctx")
+            .expect("blend pipeline exists");
+        let overlay_shader_at = code
+            .find("label: Some(\"overlay_shader\")")
+            .expect("overlay shader follows the blend pipeline");
+        assert!(blend_at < overlay_shader_at);
+        let blend_block = &code[blend_at..overlay_shader_at];
+        assert!(blend_block.contains("BLEND_SHADER_WGSL"));
+        assert!(blend_block.contains("label: Some(\"blend_pipeline\")"));
+        assert!(blend_block.contains("blend: Some(wgpu::BlendState::ALPHA_BLENDING)"));
+        assert!(blend_block.contains("depth_write_enabled: false"));
+        assert!(blend_block.contains("depth_compare: wgpu::CompareFunction::LessEqual"));
+        assert!(blend_block.contains("cull_mode: None"));
+        assert!(
+            blend_block.contains("packed_quad_vertex_layout()"),
+            "blend must share the PackedQuad vertex layout"
+        );
+    }
+
+    #[test]
+    fn main_pass_draws_cross_before_sorted_translucent_before_overlay() {
+        // Source pin on main_pass stage order: cross draw -> deterministic
+        // translucent loop -> overlay. Cross must precede translucency so glass
+        // never overdraws a plant in front of it; the translucent loop must go
+        // through the pure ordering helper rather than raw map iteration.
+        let src = include_str!("pipeline.rs");
+        let code = &src[..src.find("#[cfg(test)]").expect("test module marker")];
+        let cross_at = code
+            .find("// Crossed-plant stage:")
+            .expect("cross draw exists");
+        let transparent_at = code
+            .find("let translucent_chunks: Vec<TranslucentChunk>")
+            .expect("sorted translucent draw exists");
+        let overlay_at = code
+            .find("set_pipeline(&self.overlay_pipeline)")
+            .expect("overlay draw exists");
+        assert!(
+            cross_at < transparent_at && transparent_at < overlay_at,
+            "stage order must be cross -> sorted translucent -> overlay"
+        );
+
+        let cross_block = &code[cross_at..transparent_at];
+        assert!(cross_block.contains("cross_quad_count"));
+        assert!(cross_block.contains("set_pipeline(&self.voxel_pipeline)"));
+        assert!(cross_block.contains("frustum.intersects_aabb"));
+        assert!(
+            !cross_block.contains("visible_face_mask"),
+            "the opaque face mask must not gate the cross stage"
+        );
+
+        let transparent_block = &code[transparent_at..overlay_at];
+        assert!(transparent_block.contains("water_vertex_buffer"));
+        assert!(transparent_block.contains("blend_vertex_buffer"));
+        assert!(transparent_block.contains("translucent_draw_order(camera_pos"));
+        assert!(transparent_block.contains("set_pipeline(&self.water_pipeline)"));
+        assert!(transparent_block.contains("set_pipeline(&self.blend_pipeline)"));
     }
 
     #[test]

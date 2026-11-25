@@ -54,18 +54,51 @@ pub fn read_manifest_text(path: &Path) -> Result<String, String> {
 
 /// Pack format declared by `format_version`.
 ///
-/// Absent or `1` is the original texture-only format; `2` enables the content
-/// arrays; anything newer is preserved so the loader can warn once and keep
-/// the pack's textures and sounds usable.
+/// Absent or `1` is the original texture-only format; `2` enabled the first
+/// content arrays; `3` is the current six-face content format and the only one
+/// this build accepts. Anything newer is preserved as [`PackFormat::Future`] so
+/// the content gate can name the exact version it rejects.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PackFormat {
     /// Original texture/sound-only pack format.
     #[default]
     V1,
-    /// Content-array format parsed by the game's v2 content parser.
+    /// Content-array format parsed by the game's v3 content parser.
     V2,
+    /// Current content-array format with six-face block resolution.
+    V3,
     /// A format newer than this build understands.
     Future(u32),
+}
+
+impl PackFormat {
+    /// The integer form declared in `format_version`.
+    pub fn number(self) -> u32 {
+        match self {
+            PackFormat::V1 => 1,
+            PackFormat::V2 => 2,
+            PackFormat::V3 => 3,
+            PackFormat::Future(n) => n,
+        }
+    }
+}
+
+/// The single pack-level gate error for a non-v3 format.
+///
+/// Every pack must declare `format_version = 3`; V3 is the only accepted
+/// format. Returns `None` for V3 so callers can treat the gate as a plain
+/// `Option<String>`.
+pub fn format_gate_error(format: PackFormat) -> Option<String> {
+    match format {
+        PackFormat::V3 => None,
+        PackFormat::V1 | PackFormat::V2 => Some(format!(
+            "format_version {} is not supported; every pack must declare format_version = 3",
+            format.number()
+        )),
+        PackFormat::Future(n) => Some(format!(
+            "format_version {n} is newer than this build; every pack must declare format_version = 3"
+        )),
+    }
 }
 
 /// Manifest values with no filesystem access and no implicit defaults.
@@ -98,11 +131,11 @@ pub fn parse_manifest(text: &str) -> (PackManifest, Vec<PackWarning>) {
     (manifest, warnings)
 }
 
-/// Parse `pack.toml` once and keep the generic TOML tree for v2 arrays.
+/// Parse `pack.toml` once and keep the generic TOML tree for content arrays.
 ///
-/// v2 content lives in the same file as the manifest. Parsing the root twice
+/// Content lives in the same file as the manifest. Parsing the root twice
 /// would either duplicate warnings or silently accept a second, different
-/// tree; this entry point returns the root so the v2 content parser reuses the
+/// tree; this entry point returns the root so the content parser reuses the
 /// exact tree the manifest fields were read from. The root is `None` when the
 /// text is syntactically invalid (one warning already names `pack.toml`).
 pub fn parse_pack_file(text: &str) -> (PackManifest, Option<toml::Value>, Vec<PackWarning>) {
@@ -150,9 +183,9 @@ pub fn parse_pack_file(text: &str) -> (PackManifest, Option<toml::Value>, Vec<Pa
 
 /// Read `format_version` with one warning for invalid values.
 ///
-/// Absent -> V1 silently. `1` -> V1, `2` -> V2, any larger integer ->
-/// [`PackFormat::Future`]. Zero, negative, or non-integer values warn once and
-/// fall back to V1 so the rest of the pack still loads.
+/// Absent -> V1 silently. `1` -> V1, `2` -> V2, `3` -> V3, any larger integer
+/// -> [`PackFormat::Future`]. Zero, negative, or non-integer values warn once
+/// and fall back to V1 so the rest of the pack still loads.
 fn read_format_version(root: &toml::Value, warnings: &mut Vec<PackWarning>) -> PackFormat {
     let Some(value) = root.get("format_version") else {
         return PackFormat::V1;
@@ -179,11 +212,12 @@ fn read_format_version(root: &toml::Value, warnings: &mut Vec<PackWarning>) -> P
     match integer {
         1 => PackFormat::V1,
         2 => PackFormat::V2,
-        3.. => PackFormat::Future(integer.min(i64::from(u32::MAX)) as u32),
+        3 => PackFormat::V3,
+        4.. => PackFormat::Future(integer.min(i64::from(u32::MAX)) as u32),
         _ => {
             warn(
                 warnings,
-                format!("`format_version` must be 1 or 2, found {integer}"),
+                format!("`format_version` must be 1, 2 or 3, found {integer}"),
             );
             PackFormat::V1
         }
@@ -400,7 +434,7 @@ anything = "goes"
     }
 
     #[test]
-    fn format_version_one_and_two_are_recognised() {
+    fn format_version_one_two_and_three_are_recognised() {
         let (v1, warnings) = parse_manifest("format_version = 1\n");
         assert_eq!(v1.format_version, PackFormat::V1);
         assert!(warnings.is_empty());
@@ -411,17 +445,40 @@ anything = "goes"
         assert_eq!(v2.version.as_deref(), Some("1.0.0"));
         assert_eq!(v2.name.as_deref(), Some("P"));
         assert!(warnings.is_empty());
+
+        let (v3, warnings) = parse_manifest("format_version = 3\nname = \"P\"\n");
+        assert_eq!(v3.format_version, PackFormat::V3);
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn future_format_version_is_preserved_without_warning() {
-        let (manifest, warnings) = parse_manifest("format_version = 3\nname = \"P\"\n");
-        assert_eq!(manifest.format_version, PackFormat::Future(3));
+        let (manifest, warnings) = parse_manifest("format_version = 4\nname = \"P\"\n");
+        assert_eq!(manifest.format_version, PackFormat::Future(4));
         assert_eq!(manifest.name.as_deref(), Some("P"));
         assert!(
             warnings.is_empty(),
             "the version gate warns later, not the manifest: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn format_gate_error_names_the_single_supported_version() {
+        assert_eq!(PackFormat::V3.number(), 3);
+        assert_eq!(PackFormat::Future(9).number(), 9);
+        assert_eq!(format_gate_error(PackFormat::V3), None);
+
+        let v1 = format_gate_error(PackFormat::V1).expect("v1 is rejected");
+        assert!(v1.contains("format_version 1 is not supported"));
+        assert!(v1.contains("format_version = 3"));
+
+        let v2 = format_gate_error(PackFormat::V2).expect("v2 is rejected");
+        assert!(v2.contains("format_version 2 is not supported"));
+        assert!(v2.contains("format_version = 3"));
+
+        let future = format_gate_error(PackFormat::Future(7)).expect("future is rejected");
+        assert!(future.contains("format_version 7 is newer than this build"));
+        assert!(future.contains("format_version = 3"));
     }
 
     #[test]

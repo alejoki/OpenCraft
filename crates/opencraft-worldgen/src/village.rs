@@ -2467,6 +2467,7 @@ junction = ["test_hub"]
                     direction: *direction,
                 })
                 .collect(),
+            markers: Vec::new(),
         }
     }
 

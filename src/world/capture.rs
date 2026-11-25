@@ -297,6 +297,8 @@ pub fn extract_prefab(
                 if !block.is_builtin() {
                     return Err(CaptureError::UnsupportedBlock { pos, block });
                 }
+                // A `LootChest` cell stays an ordinary grid block: capture never
+                // synthesizes a `[[markers]]` entry from it.
                 blocks.push(PrefabBlock {
                     position: [
                         (x - region.min.x) as u32,
@@ -315,6 +317,7 @@ pub fn extract_prefab(
         size,
         blocks,
         sockets,
+        markers: Vec::new(),
     })
 }
 
@@ -843,7 +846,10 @@ mod tests {
         );
 
         // SocketMarker and Modded neighbours are solid, so they close a side.
-        for block in [BlockId::SocketMarker, BlockId::Modded(24)] {
+        for block in [
+            BlockId::SocketMarker,
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
+        ] {
             let mut world = resident_world(&region, BlockId::Air);
             set(&mut world, marker + IVec3::new(0, 0, 1), block);
             assert_eq!(
@@ -926,12 +932,16 @@ mod tests {
         );
 
         let mut world = resident_world(&region, BlockId::Stone);
-        set(&mut world, IVec3::new(2, 41, 2), BlockId::Modded(24));
+        set(
+            &mut world,
+            IVec3::new(2, 41, 2),
+            BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
+        );
         assert_eq!(
             extract_prefab("house", &world, region),
             Err(CaptureError::UnsupportedBlock {
                 pos: IVec3::new(2, 41, 2),
-                block: BlockId::Modded(24),
+                block: BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
             })
         );
     }
@@ -1018,6 +1028,7 @@ mod tests {
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         let existing = prefabs.join("renamed.toml");
         fs::write(&existing, declared.to_toml_string()).expect("write renamed prefab");
@@ -1057,6 +1068,7 @@ mod tests {
                 block: BlockId::Stone.to_raw(),
             }],
             sockets: Vec::new(),
+            markers: Vec::new(),
         };
         fs::write(prefabs.join("renamed.toml"), declared.to_toml_string())
             .expect("write renamed prefab");
@@ -1212,9 +1224,9 @@ mod tests {
             (
                 CaptureError::UnsupportedBlock {
                     pos: IVec3::new(0, 0, 0),
-                    block: BlockId::Modded(24),
+                    block: BlockId::Modded(crate::world::block::BUILTIN_BLOCK_COUNT),
                 },
-                "block modded:24 at [0, 0, 0] is not supported",
+                "block modded:25 at [0, 0, 0] is not supported",
             ),
             (
                 CaptureError::AlreadyExists {

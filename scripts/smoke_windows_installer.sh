@@ -6,8 +6,8 @@
 # Runs under Git Bash on Windows after scripts/build_windows_installer.sh has
 # produced dist/opencraft-<version>-x86_64-pc-windows-msvc-setup.exe. It
 # performs one silent per-user install into dist/install-smoke, proves the
-# installed tree carries the binary, config/, worldgen/, LICENSE and the
-# uninstaller, then runs the headless --demo-ui seam from the installed
+# installed tree carries the binary, config/, worldgen/, packs/default, LICENSE
+# and the uninstaller, then runs the headless --demo-ui seam from the installed
 # directory (the same three-line ok=true contract package_release.sh uses):
 #
 #   --demo-ui   exit 0, exactly 3 lines, last ends ok=true
@@ -58,7 +58,7 @@ if [[ "$rc" -ne 0 ]]; then
     fail "silent install exited $rc (expected 0)"
 fi
 
-for required in opencraft.exe config/combat.toml worldgen/villages/plains.toml LICENSE unins000.exe; do
+for required in opencraft.exe config/combat.toml worldgen/villages/plains.toml packs/default/pack.toml LICENSE unins000.exe; do
     [[ -f "$INSTALL_DIR/$required" ]] ||
         fail "installed tree is missing $required"
 done

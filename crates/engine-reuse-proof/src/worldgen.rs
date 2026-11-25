@@ -249,6 +249,7 @@ fn terrain_facts(catalog: &VillageCatalog, village_chunk: ChunkPos) -> TerrainFa
         rules: &[],
         villages: Some(catalog),
         spawn_column: Some(find_spawn_column(SEED)),
+        structures: None,
     };
     let buffers = [
         generate_chunk_seeded(ChunkPos::new(0, -1, 0), 1337, Season::Summer),

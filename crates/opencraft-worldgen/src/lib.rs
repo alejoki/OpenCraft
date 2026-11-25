@@ -20,6 +20,7 @@ pub mod prefab;
 pub mod ruin;
 pub mod season;
 pub mod spawn;
+pub mod structure;
 pub mod terrain;
 pub mod tree;
 pub mod village;

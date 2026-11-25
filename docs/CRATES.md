@@ -248,7 +248,7 @@ harnesses on the assembled tree.
 
 | Signal | Assembled-tree result |
 | --- | --- |
-| `engine-reuse-proof` | Exactly 22 deterministic lines. The terrain line is `worldgen.terrain=chunks=4,uniform=1,non_air=53951,digest=0xa13b53f3403b98bf` and the final line is `worldgen.village_plan=cell=-6,-7,prefabs=2,links=1,roads=4`. |
+| `engine-reuse-proof` | Exactly 22 deterministic lines. The terrain line is `worldgen.terrain=chunks=4,uniform=1,non_air=53962,digest=0x82d150a679497058` and the final line is `worldgen.village_plan=cell=-6,-7,prefabs=2,links=1,roads=4`. |
 | Cold load, 10M edits / 20,000 chunks | Recorded v9 storage+session p50 319.630 ms, frozen target 159.815 ms; same-run v9 350.182 ms vs v10 51.520 ms p50 (6.797x, 32.2% of target). Both directions report checksum `0xd3ef88bdc7ae0ebc`; migration is byte-identical with zero unresolved names. |
 | Cold-load guardrails | First-area 95.638 ms against a 164.987 ms limit; full verify 52.287 ms against a 164.813 ms limit. |
 | Autosave budget | 1M frame p95 0.095 ms against the 16.6 ms gate; 10M stress frame p95 0.259 ms (report-only). |

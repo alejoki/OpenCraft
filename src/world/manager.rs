@@ -16,6 +16,8 @@ use crate::world::season::Season;
 use crate::world::terrain::{generate_chunk_with_context, WorldGenContext, DEFAULT_WORLD_SEED};
 use crate::world::village::VillageCatalog;
 
+use opencraft_worldgen::structure::StructureCatalog;
+
 pub const MIN_CHUNK_Y: i32 = -1;
 pub const MAX_CHUNK_Y: i32 = 4;
 
@@ -101,6 +103,12 @@ pub struct WorldManager {
     /// and `worldgen_rules`: every generation job clones a pointer, never the
     /// catalog. `None` reproduces the pre-M015 generator exactly.
     village_catalog: Option<Arc<VillageCatalog>>,
+    /// Accepted structure catalog generation reads oak and ruin prefabs from,
+    /// when the session installed one. `None` is the compile-time builtin
+    /// master: every headless path and every pre-M019 world keeps generating
+    /// identical trees and ruins. Shared behind `Arc` for the same reason as
+    /// `village_catalog` (one pointer clone per job, never a catalog copy).
+    structure_catalog: Option<Arc<StructureCatalog>>,
     /// World column of the projected spawn, cached once by the session.
     ///
     /// The village planner needs it to reject plans inside
@@ -195,11 +203,13 @@ fn gen_context<'a>(
     rules: &'a [WorldgenRule],
     villages: Option<&'a VillageCatalog>,
     spawn_column: Option<(i32, i32)>,
+    structures: Option<&'a StructureCatalog>,
 ) -> WorldGenContext<'a> {
     WorldGenContext {
         rules,
         villages,
         spawn_column,
+        structures,
     }
 }
 
@@ -567,6 +577,7 @@ impl WorldManager {
             block_faces: BlockFaces::builtin(),
             worldgen_rules: Arc::from([]),
             village_catalog: None,
+            structure_catalog: None,
             village_spawn_column: None,
         }
     }
@@ -625,6 +636,25 @@ impl WorldManager {
     #[inline]
     pub fn village_catalog(&self) -> Option<&Arc<VillageCatalog>> {
         self.village_catalog.as_ref()
+    }
+
+    /// Replaces the accepted structure catalog used by every subsequent
+    /// generation.
+    ///
+    /// Installed once at session construction and re-installed at every
+    /// create/load swap, next to [`Self::set_village_catalog`]. A season
+    /// rollover regenerates ruins and oaks from this catalog, so a missing
+    /// install would silently fall back to the builtin master. `None` restores
+    /// the builtin path exactly.
+    pub fn set_structure_catalog(&mut self, catalog: Option<Arc<StructureCatalog>>) {
+        self.structure_catalog = catalog;
+    }
+
+    /// The structure catalog this manager generates against, if one was
+    /// installed. `None` means the builtin master.
+    #[inline]
+    pub fn structure_catalog(&self) -> Option<&Arc<StructureCatalog>> {
+        self.structure_catalog.as_ref()
     }
 
     /// The cached world spawn column generation plans villages against.
@@ -1272,13 +1302,19 @@ impl WorldManager {
             // silently erase authored ore and every village.
             let rules = Arc::clone(&self.worldgen_rules);
             let catalog = self.village_catalog.clone();
+            let structures = self.structure_catalog.clone();
             let spawn = self.village_spawn_column;
             rayon::spawn(move || {
                 let chunk = generate_chunk_with_context(
                     pos,
                     seed,
                     target,
-                    &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                    &gen_context(
+                        rules.as_ref(),
+                        catalog.as_deref(),
+                        spawn,
+                        structures.as_deref(),
+                    ),
                 );
                 let _ = tx.send((pos, chunk));
             });
@@ -1507,6 +1543,7 @@ impl WorldManager {
         // `None` and an empty rule slice, matching the legacy seam.
         let rules = Arc::clone(&self.worldgen_rules);
         let catalog = self.village_catalog.clone();
+        let structures = self.structure_catalog.clone();
         let spawn = self.village_spawn_column;
         'spiral: for &(dx, dz) in &self.spiral_offsets {
             if self.pending_gen.len() >= PENDING_GEN_CAP || dispatched_gen >= 32 {
@@ -1521,12 +1558,18 @@ impl WorldManager {
                     let tx = self.gen_tx.clone();
                     let rules = Arc::clone(&rules);
                     let catalog = catalog.clone();
+                    let structures = structures.clone();
                     rayon::spawn(move || {
                         let chunk = generate_chunk_with_context(
                             pos,
                             seed,
                             gen_season,
-                            &gen_context(rules.as_ref(), catalog.as_deref(), spawn),
+                            &gen_context(
+                                rules.as_ref(),
+                                catalog.as_deref(),
+                                spawn,
+                                structures.as_deref(),
+                            ),
                         );
                         let _ = tx.send((pos, chunk));
                     });
@@ -1591,9 +1634,9 @@ impl WorldManager {
             let faces = Arc::clone(&self.block_faces);
             rayon::spawn(move || {
                 let padded = build_padded_from_snapshot(&snapshot);
-                // Water must be included so a water-bearing (or water-only)
-                // chunk is still meshed; only a fully empty volume skips.
-                let mesh = if !padded.has_any_solid && !padded.has_any_liquid {
+                // Every non-Air cell (solid, water, glass, cross plants) is
+                // renderable geometry; only a fully empty volume skips.
+                let mesh = if !padded.has_any_render {
                     None
                 } else {
                     Some(mesh_chunk_with(&padded, &faces))
@@ -3049,7 +3092,7 @@ mod tests {
     /// A face table built from a one-block pack stack: `mymod:ruby_block`
     /// occupies the first modded raw id and every face is layer 48.
     fn pack_faces() -> Arc<crate::content::faces::BlockFaces> {
-        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::spec::{BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset};
         use crate::content::{build_registry, ContentRegistry, PackContentSpec, PackIdentity};
 
         let mut spec = PackContentSpec::default();
@@ -3071,6 +3114,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         let (registry, report) = build_registry(
             ContentRegistry::builtin(),
@@ -3137,7 +3183,7 @@ mod tests {
     }
 
     /// A chunk whose only content is water must still be dispatched through
-    /// the mesher: the `!has_any_solid` fast skip used to drop it silently.
+    /// the mesher: a solidity-only fast skip used to drop it silently.
     #[test]
     fn test_water_only_chunk_is_dispatched_and_meshes_water_quads() {
         let _heavy = lock_heavy_streaming();
@@ -4335,7 +4381,7 @@ mod tests {
         }
     }
 
-    /// The helper both dispatch sites share must carry all three context fields
+    /// The helper both dispatch sites share must carry all four context fields
     /// unchanged (and the empty context must be genuinely empty).
     #[test]
     fn gen_context_carries_catalog_spawn_and_rules() {
@@ -4350,18 +4396,73 @@ mod tests {
         }];
         let spawn = (12, -34);
 
-        let ctx = gen_context(&rules, Some(&catalog), Some(spawn));
+        // A distinct runtime catalog, built from the builtin master's own
+        // prefabs: equal content, separate allocation, so pointer identity
+        // proves the context carries the handle rather than a copy.
+        let builtin = StructureCatalog::builtin();
+        let structures = StructureCatalog::from_prefabs(
+            builtin
+                .names()
+                .filter_map(|name| builtin.get(name).cloned())
+                .collect(),
+        );
+        assert_eq!(
+            &structures, builtin,
+            "the clone must stay semantically equal"
+        );
+
+        let ctx = gen_context(&rules, Some(&catalog), Some(spawn), Some(&structures));
         assert_eq!(ctx.rules.len(), 1);
         assert!(
             matches!(ctx.villages, Some(installed) if std::ptr::eq(installed, &catalog)),
             "the catalog pointer must be carried, not a copy"
         );
         assert_eq!(ctx.spawn_column, Some(spawn));
+        assert!(
+            matches!(ctx.structures, Some(installed) if std::ptr::eq(installed, &structures)),
+            "the structure catalog pointer must be carried, not a copy"
+        );
 
-        let empty = gen_context(&[], None, None);
+        let empty = gen_context(&[], None, None, None);
         assert!(empty.rules.is_empty());
         assert!(empty.villages.is_none());
         assert_eq!(empty.spawn_column, None);
+        assert!(
+            empty.structures.is_none(),
+            "a headless context falls through to the builtin master"
+        );
+    }
+
+    /// The manager must carry an installed structure catalog into every
+    /// generation job and drop it back to the builtin master path on `None`.
+    /// Generation itself is proven by the terrain-level tests; this pins the
+    /// manager field that feeds them.
+    #[test]
+    fn manager_carries_the_installed_structure_catalog() {
+        let mut mgr = WorldManager::with_seed_and_edits(4, 1337, ChunkEditMap::default());
+        assert!(
+            mgr.structure_catalog().is_none(),
+            "a new manager starts on the builtin master path"
+        );
+
+        let builtin = StructureCatalog::builtin();
+        let installed = Arc::new(StructureCatalog::from_prefabs(
+            builtin
+                .names()
+                .filter_map(|name| builtin.get(name).cloned())
+                .collect(),
+        ));
+        mgr.set_structure_catalog(Some(Arc::clone(&installed)));
+        assert!(
+            matches!(mgr.structure_catalog(), Some(current) if Arc::ptr_eq(current, &installed)),
+            "the manager must store the installed handle, not a copy"
+        );
+
+        mgr.set_structure_catalog(None);
+        assert!(
+            mgr.structure_catalog().is_none(),
+            "clearing the catalog returns generation to the builtin master"
+        );
     }
 
     /// With the catalog installed, every plan cell this chunk owns must land in
@@ -4371,7 +4472,7 @@ mod tests {
         let catalog = checked_in_village_catalog();
         let plan = seed_14_village(&catalog);
         let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let ctx = gen_context(&[], Some(&catalog), Some(spawn));
+        let ctx = gen_context(&[], Some(&catalog), Some(spawn), None);
         let cs = CHUNK_SIZE as i32;
         let mut measured_chunks = 0usize;
         let mut measured_cells = 0usize;
@@ -4424,8 +4525,13 @@ mod tests {
         assert!(!plan_cells.is_empty());
 
         let real_spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let suppressed = gen_context(&[], Some(&catalog), Some((plan.anchor[0], plan.anchor[1])));
-        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn));
+        let suppressed = gen_context(
+            &[],
+            Some(&catalog),
+            Some((plan.anchor[0], plan.anchor[1])),
+            None,
+        );
+        let with_village = gen_context(&[], Some(&catalog), Some(real_spawn), None);
         let legacy = generate_chunk_seeded(pos, VILLAGE_MANAGER_SEED, Season::Summer);
         let rejected =
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &suppressed);
@@ -4466,7 +4572,7 @@ mod tests {
         let plan_cells = plan.cells_for_chunk(pos);
         assert!(!plan_cells.is_empty());
 
-        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn));
+        let summer_ctx = gen_context(&[], Some(catalog.as_ref()), Some(spawn), None);
         let summer_chunk =
             generate_chunk_with_context(pos, VILLAGE_MANAGER_SEED, Season::Summer, &summer_ctx);
         for cell in &plan_cells {
@@ -4521,7 +4627,7 @@ mod tests {
     #[test]
     fn none_catalog_generation_is_byte_identical_to_the_legacy_seam() {
         let spawn = find_spawn_column(VILLAGE_MANAGER_SEED);
-        let ctx = gen_context(&[], None, Some(spawn));
+        let ctx = gen_context(&[], None, Some(spawn), None);
         for pos in [
             ChunkPos::new(-6, 0, 3),
             ChunkPos::new(0, 0, 0),

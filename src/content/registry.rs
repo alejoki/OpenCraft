@@ -121,6 +121,8 @@ pub(crate) fn block_from_catalog(row: NeutralBlockDef) -> BlockDef {
         drop: row.drop.map(item_ref_from_catalog),
         tool_class: row.tool_class,
         stack_limit: row.stack_limit,
+        model: row.model,
+        alpha: row.alpha,
         placeholder: row.placeholder,
     }
 }
@@ -272,6 +274,8 @@ fn block_to_catalog(def: &BlockDef) -> NeutralBlockDef {
         drop: def.drop.map(item_ref_to_catalog),
         tool_class: def.tool_class,
         stack_limit: def.stack_limit,
+        model: def.model,
+        alpha: def.alpha,
         placeholder: def.placeholder,
     }
 }
@@ -380,8 +384,8 @@ fn biome_from_tag(tag: opencraft_content::catalog::BiomeTag) -> Biome {
 mod tests {
     use super::*;
     use crate::content::spec::{
-        BlockEntry, BlockPatch, BlockTextures, ItemEntry, RecipeEntry, TierEntry, ToolEntry,
-        WorldgenEntry, WorldgenKind,
+        BlockAlpha, BlockEntry, BlockModel, BlockPatch, BlockTextures, ItemEntry, RecipeEntry,
+        TierEntry, ToolEntry, WorldgenEntry, WorldgenKind,
     };
     use crate::content::EMPTY_DIGEST;
     use crate::player::inventory::{Material, ToolKind};
@@ -413,6 +417,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 
@@ -468,6 +474,8 @@ mod tests {
             drop: Some("mymod:ruby".to_string()),
             tool: Some(ToolKind::Pickaxe),
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert("ruby_ore.png".to_string(), asset(0x11));
         spec.items.push(item_entry("mymod:ruby", "ruby.png"));
@@ -497,6 +505,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: None,
+            model: None,
+            alpha: None,
         });
         spec.worldgen.push(WorldgenEntry {
             kind: WorldgenKind::Ore {
@@ -595,6 +605,8 @@ mod tests {
             drop: Some("mymod:missing".to_string()),
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         spec.assets.insert("ore.png".to_string(), asset(0x11));
         spec.recipe_patches.push(crate::content::spec::RecipePatch {
@@ -663,6 +675,71 @@ mod tests {
     }
 
     #[test]
+    fn model_and_alpha_round_trip_through_the_game_adapter() {
+        let mut spec = PackContentSpec::default();
+        spec.assets.insert(
+            "fern.png".to_string(),
+            crate::content::spec::PackAsset {
+                rgba: vec![0x33; 1024],
+                source_side: 16,
+            },
+        );
+        spec.blocks.push(BlockEntry {
+            id: "mymod:fern".to_string(),
+            display_name: None,
+            textures: BlockTextures {
+                all: Some("fern.png".to_string()),
+                ..BlockTextures::default()
+            },
+            hardness: 0.2,
+            drop: None,
+            tool: None,
+            stack_limit: 64,
+            model: BlockModel::Cross,
+            alpha: BlockAlpha::Cutout,
+        });
+
+        let (registry, report) =
+            build_registry(ContentRegistry::builtin(), &[(identity("mymod"), spec)]);
+        assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+
+        // Built-ins keep the classes their BlockId accessors report.
+        let wheat = registry
+            .block(BlockId::WheatStage0)
+            .expect("wheat is built in");
+        assert_eq!(
+            (wheat.model, wheat.alpha),
+            (BlockModel::Crop, BlockAlpha::Cutout),
+            "wheat must stay a cutout crop"
+        );
+        let leaves = registry
+            .block(BlockId::OakLeaves)
+            .expect("leaves are built in");
+        assert_eq!(
+            (leaves.model, leaves.alpha),
+            (BlockModel::Cube, BlockAlpha::Cutout),
+            "leaves must stay a cutout cube"
+        );
+        let glass = registry.block(BlockId::Glass).expect("glass is built in");
+        assert_eq!(
+            (glass.model, glass.alpha),
+            (BlockModel::Cube, BlockAlpha::Blend),
+            "glass must stay a blended cube"
+        );
+
+        // A pack row survives game -> neutral -> game field for field.
+        let fern = registry
+            .block(BlockId::Modded(BUILTIN_BLOCK_COUNT))
+            .expect("the pack block is allocated");
+        assert_eq!(
+            (fern.model, fern.alpha),
+            (BlockModel::Cross, BlockAlpha::Cutout)
+        );
+        assert_eq!(block_to_catalog(fern).model, BlockModel::Cross);
+        assert_eq!(block_to_catalog(fern).alpha, BlockAlpha::Cutout);
+    }
+
+    #[test]
     fn game_digest_matches_the_neutral_catalog_for_a_representative_pack() {
         let packs = [representative_pack()];
 
@@ -707,7 +784,7 @@ mod tests {
         let block = registry
             .block_by_name("mymod:ruby_ore")
             .expect("the pack block is registered");
-        assert_eq!(block.id, BlockId::Modded(24));
+        assert_eq!(block.id, BlockId::Modded(BUILTIN_BLOCK_COUNT));
         assert_eq!(block.faces, [48; 6]);
         assert_eq!(block.drop, Some(ItemRef::Item(0)));
         assert_eq!(block.tool_class, Some(ToolKind::Pickaxe));

@@ -7,7 +7,7 @@
 //! [`BlockId`], [`ItemId`], [`Material`], [`ToolTier`] or [`RecipeId`].
 //!
 //! Every table is index-aligned to the declaration order of its Rust enum
-//! (or, for blocks, the frozen raw id order `0..=23`). Built-in names are
+//! (or, for blocks, the frozen raw id order `0..=24`). Built-in names are
 //! unqualified: they never contain a `:` namespace separator.
 
 use crate::player::inventory::{ItemId, Material, RecipeId, ToolKind, ToolKindTiers, ToolTier};
@@ -124,6 +124,24 @@ pub fn builtin_item_id_by_name(name: &str) -> Option<ItemId> {
 #[allow(dead_code)] // Consumed by the S07 parser and presentation layers.
 pub fn builtin_item_sprite_id_by_name(name: &str) -> Option<ItemId> {
     sprite_identity(builtin_item_id_by_name(name)?)
+}
+
+/// Canonical short name for a built-in item identity that owns a sprite.
+///
+/// This is the exact inverse of [`builtin_item_sprite_id_by_name`] for every
+/// entry of the pinned item sprite table: materials resolve through
+/// [`builtin_material_id_name`] and constructible tools (the wood-only bow
+/// included) through [`builtin_tool_id_name`]. Blocks, registry items, forged
+/// tool pairs and unconstructible bow ties return `None`.
+#[allow(dead_code)] // Consumed by the S02 default-pack exporter.
+pub fn builtin_sprite_name_for(id: ItemId) -> Option<&'static str> {
+    match id {
+        ItemId::Material(material) => Some(builtin_material_id_name(material)),
+        ItemId::Tool { kind, tier } if kind.allowed_tiers().contains(&tier) => {
+            builtin_tool_id_name(kind, tier)
+        }
+        _ => None,
+    }
 }
 
 /// Canonical short name for a built-in material/tool sprite identity.
@@ -330,6 +348,7 @@ mod tests {
             "chest",
             "loot_chest",
             "socket_marker",
+            "glass",
         ];
         assert_eq!(expected, BLOCK_ID_NAMES);
         for name in BLOCK_ID_NAMES {
@@ -565,6 +584,36 @@ mod tests {
         for name in TOOL_ID_NAMES {
             assert_eq!(builtin_item_sprite_name(name), Some(name));
         }
+    }
+
+    #[test]
+    fn builtin_sprite_name_for_is_the_exact_inverse_of_the_sprite_lookup() {
+        use crate::ui::item_icon::item_sprite_table;
+
+        let mut checked = 0;
+        for (id, _layer) in item_sprite_table() {
+            let name = builtin_sprite_name_for(*id)
+                .unwrap_or_else(|| panic!("table identity {id:?} has no canonical name"));
+            assert_eq!(
+                builtin_item_sprite_id_by_name(name),
+                Some(*id),
+                "name {name:?} must round-trip back to {id:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 27, "every pinned table entry is covered");
+
+        // Identities outside the table have no canonical sprite name.
+        assert_eq!(builtin_sprite_name_for(ItemId::Block(BlockId::Stone)), None);
+        assert_eq!(builtin_sprite_name_for(ItemId::Item(0)), None);
+        assert_eq!(builtin_sprite_name_for(ItemId::ModTool(0)), None);
+        assert_eq!(
+            builtin_sprite_name_for(ItemId::Tool {
+                kind: ToolKind::Bow,
+                tier: ToolTier::Stone,
+            }),
+            None
+        );
     }
 
     #[test]

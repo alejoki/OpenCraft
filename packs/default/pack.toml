@@ -1,0 +1,37 @@
+format_version = 3
+name = "Default"
+description = "The shipped reference presentation exported from the built-in procedural art."
+version = "1.0.0"
+
+[builtin_icons]
+apple = "icons/apple.png"
+arrow = "icons/arrow.png"
+bone = "icons/bone.png"
+bread = "icons/bread.png"
+iron_axe = "icons/iron_axe.png"
+iron_hoe = "icons/iron_hoe.png"
+iron_pickaxe = "icons/iron_pickaxe.png"
+iron_shovel = "icons/iron_shovel.png"
+iron_sword = "icons/iron_sword.png"
+leather = "icons/leather.png"
+raw_beef = "icons/raw_beef.png"
+raw_porkchop = "icons/raw_porkchop.png"
+rotten_flesh = "icons/rotten_flesh.png"
+stick = "icons/stick.png"
+stone_axe = "icons/stone_axe.png"
+stone_hoe = "icons/stone_hoe.png"
+stone_pickaxe = "icons/stone_pickaxe.png"
+stone_shovel = "icons/stone_shovel.png"
+stone_sword = "icons/stone_sword.png"
+wheat = "icons/wheat.png"
+wheat_seeds = "icons/wheat_seeds.png"
+wood_axe = "icons/wood_axe.png"
+wood_bow = "icons/wood_bow.png"
+wood_hoe = "icons/wood_hoe.png"
+wood_pickaxe = "icons/wood_pickaxe.png"
+wood_shovel = "icons/wood_shovel.png"
+wood_sword = "icons/wood_sword.png"
+
+[menu]
+# Fully transparent RGBA: the shipped presentation applies no menu tint.
+overlay_tint = [0, 0, 0, 0]

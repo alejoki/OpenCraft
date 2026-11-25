@@ -24,6 +24,7 @@ pub mod prefab;
 pub mod season;
 pub mod session;
 pub mod spawning;
+pub mod structure;
 pub mod terrain;
 pub mod village;
 pub mod vista;

@@ -5,7 +5,7 @@
 # test harness and no screenshot automation:
 #
 #   Scenario 0 (doc reader-test): the fenced `toml` block under
-#   `## Format v2` in docs/TEXTURE-PACKS.md must still author every Format v2
+#   `## Format v3` in docs/TEXTURE-PACKS.md must still author every Format v3
 #   array (blocks, items, tiers, tools, recipes, block_patches,
 #   recipe_patches), and the whole document must still name worldgen, both
 #   reference packs, `--validate-pack` and the content/save section. This is
@@ -28,10 +28,14 @@
 #   Scenario 4 (bounded launches): with both good packs selected,
 #   `timeout 10 "$BIN"` exits 124 with no panic; after adding the broken pack
 #   to the stack the game still launches the same way. Throughout both legs the
-#   copied pack tree and settings.toml stay byte-identical.
+#   copied pack tree and settings.toml stay byte-identical. The fixture also
+#   seeds a complete `packs/default`, so the startup restore is a strict no-op
+#   and the tree comparison covers present bytes only.
 #
 # Everything runs in a mktemp working directory. The crate root's packs/,
-# settings.toml and saves/ are never touched. Judge every scenario by this
+# settings.toml and saves/ are never touched. Only the shipped `default` pack
+# legitimately lives in the repository packs/ tree; checked-in test packs must
+# never leak into it. Judge every scenario by this
 # script's own exit code; a child 124 is expected only for the bounded
 # launches (MEM377). This script is self-contained on purpose: it must not
 # delegate to validate_pack_smoke.sh, and it must never run `cargo test`.
@@ -127,10 +131,14 @@ fail() {
 mkdir -p "$TEMP_DIR/packs" || fail "cannot create packs/ in the temp dir"
 cp -R "$CRATE_PACK" "$TEMP_DIR/packs/mymod-ruby" || fail "cannot copy the checked-in reference pack"
 cp -R "$CRATE_OVERLAY" "$TEMP_DIR/packs/ruby-overlay" || fail "cannot copy the texture-only overlay"
+# Seed the complete shipped default so production startup's restore is a strict
+# no-op; the tree comparison below then describes present bytes only.
+cp -R "$CRATE_ROOT/packs/default" "$TEMP_DIR/packs/default" ||
+    fail "cannot seed the shipped packs/default"
 
 mkdir -p "$TEMP_DIR/packs/broken" || fail "cannot create packs/broken"
 cat >"$TEMP_DIR/packs/broken/pack.toml" <<'EOF'
-format_version = 2
+format_version = 3
 
 [[blocks]]
 id = "broken:missing_art"
@@ -151,7 +159,8 @@ stack = ["mymod-ruby", "ruby-overlay"]
 EOF
 
 # Snapshot the authored pack tree and both settings variants so the launch legs
-# can prove the game is read-only on packs/ and settings.toml.
+# can prove the game never rewrites present pack bytes (the shipped default is
+# already complete, so the restore writes nothing) or settings.toml.
 EXPECTED="$TEMP_DIR/expected"
 mkdir -p "$EXPECTED" || fail "cannot create expected/ dir"
 cp "$TEMP_DIR/settings.toml" "$EXPECTED/settings-good.toml" ||
@@ -198,15 +207,15 @@ LAUNCH_BROKEN_OUT="$TEMP_DIR/launch-broken.out"
 # Scenario 0: the authoring docs are an executable reader-test.
 # ---------------------------------------------------------------------------
 DOC_BLOCK="$(awk '
-    /^## Format v2$/ { in_section = 1; next }
+    /^## Format v3$/ { in_section = 1; next }
     in_section && /^```toml$/ { in_block = 1; next }
     in_block && /^```$/ { exit }
     in_block { print }
-' "$DOC")" || fail "cannot read the Format v2 TOML block from $DOC"
-[[ -n "$DOC_BLOCK" ]] || fail "docs reader-test: no fenced toml block under '## Format v2'"
+' "$DOC")" || fail "cannot read the Format v3 TOML block from $DOC"
+[[ -n "$DOC_BLOCK" ]] || fail "docs reader-test: no fenced toml block under '## Format v3'"
 
 for needle in \
-    'format_version = 2' \
+    'format_version = 3' \
     '[[blocks]]' \
     '[[items]]' \
     '[[tiers]]' \
@@ -215,12 +224,16 @@ for needle in \
     '[[block_patches]]' \
     '[[recipe_patches]]'; do
     grep -Fq -- "$needle" <<<"$DOC_BLOCK" ||
-        fail "docs reader-test: Format v2 TOML block is missing '$needle'"
+        fail "docs reader-test: Format v3 TOML block is missing '$needle'"
 done
 
 for needle in \
     '[[worldgen]]' \
     '## Declarative worldgen' \
+    '## Block models and alpha' \
+    'model = "cross"' \
+    'alpha = "cutout"' \
+    'alpha = "blend"' \
     'tests/fixtures/packs/mymod-ruby' \
     'tests/fixtures/packs/ruby-overlay' \
     '--validate-pack' \
@@ -357,10 +370,10 @@ cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED/settings-broken.toml" ||
     fail "the broken-stack settings.toml was rewritten during the launch leg"
 compare_pack_tree "$TEMP_DIR/packs" "$EXPECTED/packs"
 
-echo "MODDING SMOKE PASS [profile=$PROFILE]: doc reader-test (Format v2 TOML + worldgen + both reference packs + --validate-pack), clean mymod-ruby 12/0/0, clean ruby-overlay 0/0/0, broken exit=1 with error+valid sibling, missing exit=1, good-stack launch exit=124 and broken-pack launch exit=124 with no panic, packs/settings byte-identical"
+echo "MODDING SMOKE PASS [profile=$PROFILE]: doc reader-test (Format v3 TOML + worldgen + both reference packs + --validate-pack), clean mymod-ruby 12/0/0, clean ruby-overlay 0/0/0, broken exit=1 with error+valid sibling, missing exit=1, good-stack launch exit=124 and broken-pack launch exit=124 with no panic, packs/settings byte-identical"
 echo "MODDING SMOKE EVIDENCE: clean mymod-ruby exit=$CLEAN_RC summary=12-entries-0-errors-0-warnings"
 echo "MODDING SMOKE EVIDENCE: clean ruby-overlay exit=$OVERLAY_RC summary=0-entries-0-errors-0-warnings"
 echo "MODDING SMOKE EVIDENCE: broken exit=$BROKEN_RC error=block-broken:missing_art valid-sibling=ok non-zero-errors=true"
 echo "MODDING SMOKE EVIDENCE: missing exit=$MISSING_RC error=pack-ghost"
-echo "MODDING SMOKE EVIDENCE: launches good-stack=$LAUNCH_GOOD_RC broken-pack=$LAUNCH_BROKEN_RC panic=none pack-and-settings-byte-identical"
+echo "MODDING SMOKE EVIDENCE: launches good-stack=$LAUNCH_GOOD_RC broken-pack=$LAUNCH_BROKEN_RC panic=none present-pack-and-settings-byte-identical (shipped-default restore is a no-op)"
 exit 0

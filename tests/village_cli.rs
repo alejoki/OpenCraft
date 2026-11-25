@@ -27,7 +27,7 @@ const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 /// Measured from a real `cargo run -- --demo-village` and independently pinned
 /// in `src/main.rs`'s `village_demo_pins_the_checked_in_reference_village_line_set`.
 /// Never derive these from the code under test.
-const CLEAN_LINES: [&str; 12] = [
+const CLEAN_LINES: [&str; 13] = [
     "village_demo: leg=catalog prefabs=3 villages=1 diagnostics=0 fingerprint=0x5c2b550240d34cfb",
     "village_demo: leg=context rules=0 villages=1",
     "village_demo: leg=site cell=6,-6 anchor=1654,-1383 definition=plains prefabs=13 socket_links=12 roads=48 unmatched=22",
@@ -38,6 +38,7 @@ const CLEAN_LINES: [&str; 12] = [
     "village_demo: leg=empty_catalog identical=true",
     "village_demo: leg=outside identical=true",
     "village_demo: leg=fit foundations=true no_overlap=true no_orphan_road=true sockets_linked=true",
+    "village_demo: leg=structures prefabs=11 missing=0 fingerprint=0xb5e741fd23a82fd4 identical=true",
     "village_demo: leg=session cell=-1,0 spawn=0,0 chunks=6 cells=2962 identical=true",
     "village_demo: ok=true",
 ];
@@ -292,6 +293,41 @@ fn broken_hub_prefab_warns_and_fails_site() {
         lines.last().map(String::as_str),
         Some("village_demo: ok=false failed=site"),
         "{}",
+        report(&output)
+    );
+    assert_no_startup_state(dir.path());
+    assert_eq!(snapshot_tree(&worldgen), before, "{}", report(&output));
+}
+
+#[test]
+fn broken_structure_file_warns_once_and_falls_back_to_the_builtin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let worldgen = copy_worldgen(dir.path());
+    replace_once(
+        &worldgen.join("structures/oak_t4_l0.toml"),
+        "format = 1",
+        "format = [",
+    );
+    let before = snapshot_tree(&worldgen);
+
+    let output = run_in(dir.path(), &["--demo-village"]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", report(&output));
+    let lines = stdout_lines(&output);
+    assert_eq!(
+        warning_lines(&lines),
+        vec!["village_demo: warning worldgen/structures/oak_t4_l0.toml: invalid TOML"],
+        "{}",
+        report(&output)
+    );
+    let digest_lines: Vec<&String> = lines
+        .iter()
+        .filter(|line| !line.starts_with("village_demo: warning "))
+        .collect();
+    assert_eq!(
+        digest_lines,
+        CLEAN_LINES.iter().collect::<Vec<_>>(),
+        "a rejected structure file must fall back to the builtin line for line\n{}",
         report(&output)
     );
     assert_no_startup_state(dir.path());

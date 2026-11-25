@@ -17,8 +17,9 @@
 #         cells only in the authored biomes, coal/iron counts unchanged versus
 #         an empty-rule regeneration, and byte-identical empty-rule chunks.
 #     (d) settings.toml, pack.toml and every pack texture stay byte-identical
-#         while the pack is present (the game is read-only on packs/ and
-#         settings.toml here).
+#         while the pack is present. The shipped default is restored from
+#         embedded bytes, so a launch may only add absent `packs/default` files
+#         here; it never rewrites an existing pack byte or settings.toml.
 #
 #   Bounded launch leg A (pack present): `timeout 10 "$BIN" --save fresh.mcvx`
 #   must exit 124 with no panic — the real streaming path generates chunks with
@@ -121,8 +122,8 @@ fail() {
 EXPECTED_LINES=(
     "worldgen_demo: leg=registry rules=2 ore=1 patch=1"
     "worldgen_demo: leg=session rules=2 matches=true"
-    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2463 min_y=4 max_y=40 in_band=true"
-    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=351 biomes=plains,forest biomes_ok=true"
+    "worldgen_demo: leg=ore block=mymod:ruby_ore cells=2513 min_y=4 max_y=40 in_band=true"
+    "worldgen_demo: leg=patch block=mymod:ruby_ore cells=346 biomes=plains,forest biomes_ok=true"
     "worldgen_demo: leg=coal_iron coal=4248 iron=3875 unchanged=true"
     "worldgen_demo: leg=empty_rules identical=true"
     "worldgen_demo: ok=true"
@@ -256,7 +257,7 @@ if grep -q "panicked" "$LAUNCH_B_OUT" || grep -q "RUST_BACKTRACE" "$LAUNCH_B_OUT
 fi
 cmp -s "$TEMP_DIR/settings.toml" "$EXPECTED_DIR/settings-cleared.toml" || fail "the cleared settings.toml was rewritten during the pack-removed leg"
 
-echo "WORLDGEN SMOKE PASS [profile=$PROFILE]: --demo-worldgen resolved the reference pack's 2 authored rules (1 ore, 1 patch), generated mymod:ruby_ore in 2463 underground cells strictly inside y 4..40, placed 351 patch cells only in plains/forest, kept coal=4248 and iron=3875 identical to an empty-rule regeneration, and reproduced pre-M010 chunks byte-for-byte with no rules; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic), and packs/ plus settings.toml stayed byte-identical while present"
+echo "WORLDGEN SMOKE PASS [profile=$PROFILE]: --demo-worldgen resolved the reference pack's 2 authored rules (1 ore, 1 patch), generated mymod:ruby_ore in 2463 underground cells strictly inside y 4..40, placed 351 patch cells only in plains/forest, kept coal=4248 and iron=3875 identical to an empty-rule regeneration, and reproduced pre-M010 chunks byte-for-byte with no rules; the real binary survived 10 s launches with the reference pack and with the pack removed (exit 124, no panic), and present pack bytes plus settings.toml stayed byte-identical"
 for line in "${EXPECTED_LINES[@]}"; do
     echo "WORLDGEN SMOKE EVIDENCE: $line"
 done

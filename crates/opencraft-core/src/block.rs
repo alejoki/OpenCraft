@@ -4,6 +4,10 @@
 //! pathfinding has to know a game block identity.
 
 /// What a sampled voxel cell is.
+///
+/// `Plant` is the non-colliding but *targetable* classification used by crops
+/// and other cross-model vegetation: a ray or a mob eye must be able to select
+/// it, while movement and meshing treat it as passable rather than a cube.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BlockKind {
     /// Passable, non-liquid cell (air and any other empty cell).
@@ -12,9 +16,12 @@ pub enum BlockKind {
     Solid,
     /// Passable liquid volume.
     Liquid,
+    /// Passable, non-colliding plant that a reach ray may still target.
+    Plant,
 }
 
 impl BlockKind {
+    /// Whether this cell blocks movement and opaque meshing.
     #[inline]
     pub const fn is_solid(self) -> bool {
         matches!(self, BlockKind::Solid)
@@ -23,6 +30,15 @@ impl BlockKind {
     #[inline]
     pub const fn is_liquid(self) -> bool {
         matches!(self, BlockKind::Liquid)
+    }
+
+    /// Whether a reach ray stops on this cell.
+    ///
+    /// Solids and plants are targetable; empty and liquid cells are passable,
+    /// so a ray travels through them.
+    #[inline]
+    pub const fn is_targetable(self) -> bool {
+        matches!(self, BlockKind::Solid | BlockKind::Plant)
     }
 }
 
@@ -66,6 +82,21 @@ mod tests {
 
         assert!(!BlockKind::Empty.is_solid());
         assert!(!BlockKind::Empty.is_liquid());
+
+        assert!(!BlockKind::Plant.is_solid());
+        assert!(!BlockKind::Plant.is_liquid());
+    }
+
+    #[test]
+    fn only_solid_and_plant_are_targetable() {
+        assert!(BlockKind::Solid.is_targetable());
+        assert!(BlockKind::Plant.is_targetable());
+        assert!(!BlockKind::Empty.is_targetable());
+        assert!(!BlockKind::Liquid.is_targetable());
+
+        // A plant is passable but targetable: the two predicates are distinct.
+        assert!(!BlockKind::Plant.is_solid());
+        assert!(BlockKind::Plant.is_targetable());
     }
 
     #[test]

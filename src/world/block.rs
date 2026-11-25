@@ -3,7 +3,7 @@ use opencraft_core::block::{BlockKind, BlockQuery};
 /// Stable block identity for built-in terrain plus registry-local modded
 /// content.
 ///
-/// Built-in variants keep explicit discriminants `0..=23`, which are the
+/// Built-in variants keep explicit discriminants `0..=24`, which are the
 /// frozen save-vocabulary raw ids decoded by [`BlockId::from_u8`].
 ///
 /// `#[repr(u8)]` is required: Rust rejects explicit discriminants on an enum
@@ -55,6 +55,13 @@ pub enum BlockId {
     /// and village-plot passes resolve it to a structural socket; this id is
     /// only the authored marker identity.
     SocketMarker = 23,
+    /// Built-in glass: a solid, carryable, light-transparent pane.
+    ///
+    /// Glass collides like a solid block but passes sky light, so it is the
+    /// first id whose [`BlockId::is_solid`] and [`BlockId::is_light_opaque`]
+    /// answers disagree. Appended after the frozen save vocabulary, so no
+    /// earlier raw id moves.
+    Glass = 24,
     /// Registry-local modded block identity.
     ///
     /// The payload is a dense registry index with the invariant
@@ -65,9 +72,9 @@ pub enum BlockId {
     Modded(u16),
 }
 
-/// Number of built-in block ids: `0..=23` are the frozen save vocabulary and
+/// Number of built-in block ids: `0..=24` are the frozen save vocabulary and
 /// every modded registry index starts here.
-pub const BUILTIN_BLOCK_COUNT: u16 = 24;
+pub const BUILTIN_BLOCK_COUNT: u16 = 25;
 
 /// The four wheat growth stages in ascending order, index-aligned with
 /// [`BlockId::wheat_stage`].
@@ -79,25 +86,61 @@ pub const WHEAT_STAGES: [BlockId; 4] = [
 ];
 
 impl BlockId {
-    /// Whether this block blocks movement, sight lines, and light.
+    /// Whether this block blocks movement and opaque meshing.
     ///
-    /// Air and water are the passable, transparent ids: both are skipped by
-    /// collision, raycast hits, opaque meshing, and sky-light occlusion.
+    /// Air, water and the four wheat growth stages are passable: plants are
+    /// non-colliding so the player can walk through a crop row. Glass is
+    /// solid but light-transparent; use [`Self::is_light_opaque`] for the
+    /// opacity question.
     #[inline]
     pub const fn is_solid(self) -> bool {
-        !matches!(self, BlockId::Air | BlockId::Water)
+        !matches!(
+            self,
+            BlockId::Air
+                | BlockId::Water
+                | BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3
+        )
     }
 
     /// Neutral kind of this block for engine crates that must not know block
-    /// identity: air is empty, water is liquid, and every other built-in and
-    /// modded id is solid.
+    /// identity: air is empty, water is liquid, wheat is a non-colliding
+    /// plant, and every other built-in and modded id is solid.
     #[inline]
     pub const fn kind(self) -> BlockKind {
         match self {
             BlockId::Air => BlockKind::Empty,
             BlockId::Water => BlockKind::Liquid,
+            BlockId::WheatStage0
+            | BlockId::WheatStage1
+            | BlockId::WheatStage2
+            | BlockId::WheatStage3 => BlockKind::Plant,
             _ => BlockKind::Solid,
         }
+    }
+
+    /// Whether this block is a non-colliding plant (any wheat growth stage).
+    #[inline]
+    pub const fn is_plant(self) -> bool {
+        matches!(
+            self,
+            BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3
+        )
+    }
+
+    /// Whether this block stops sky light and sight lines.
+    ///
+    /// Every solid id except [`BlockId::Glass`]: glass keeps collision but a
+    /// window pane must pass sky light, while leaves and terrain still
+    /// occlude. Plants are non-solid, so they never block light.
+    #[inline]
+    pub const fn is_light_opaque(self) -> bool {
+        self.is_solid() && !matches!(self, BlockId::Glass)
     }
 
     /// Whether this block is a liquid volume rather than a solid block.
@@ -197,7 +240,7 @@ impl BlockId {
     }
 
     /// The stable raw identity of this block: the built-in discriminant for
-    /// `0..=23`, or the registry index for [`BlockId::Modded`].
+    /// `0..=24`, or the registry index for [`BlockId::Modded`].
     ///
     /// Total over every representable value, so it is the storage and
     /// comparison identity used by dense chunks, meshes and the registry.
@@ -227,6 +270,7 @@ impl BlockId {
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
             BlockId::SocketMarker => 23,
+            BlockId::Glass => 24,
             BlockId::Modded(raw) => {
                 debug_assert!(raw >= BUILTIN_BLOCK_COUNT);
                 raw
@@ -236,7 +280,7 @@ impl BlockId {
 
     /// Inverse of [`BlockId::to_raw`], total over every `u16`.
     ///
-    /// Raw values `0..=23` decode to their built-in variant; anything else is
+    /// Raw values `0..=24` decode to their built-in variant; anything else is
     /// a registry-local [`BlockId::Modded`] index.
     pub const fn from_raw(raw: u16) -> Self {
         match raw {
@@ -264,6 +308,7 @@ impl BlockId {
             21 => BlockId::Chest,
             22 => BlockId::LootChest,
             23 => BlockId::SocketMarker,
+            24 => BlockId::Glass,
             _ => BlockId::Modded(raw),
         }
     }
@@ -279,7 +324,7 @@ impl BlockId {
         }
     }
 
-    /// Whether this is one of the frozen built-in ids `0..=23`.
+    /// Whether this is one of the frozen built-in ids `0..=24`.
     pub const fn is_builtin(self) -> bool {
         !matches!(self, BlockId::Modded(_))
     }
@@ -311,6 +356,7 @@ impl BlockId {
             21 => Some(BlockId::Chest),
             22 => Some(BlockId::LootChest),
             23 => Some(BlockId::SocketMarker),
+            24 => Some(BlockId::Glass),
             _ => None,
         }
     }
@@ -365,12 +411,14 @@ impl BlockId {
             BlockId::WheatStage3 => 20,
             BlockId::Chest => 21,
             BlockId::LootChest => 22,
-            // Socket-marker art is its own built-in procedural layer (25).
-            BlockId::SocketMarker => 25,
-            // First reserved block placeholder layer (26..=31 are reserved,
+            // Socket-marker art is its own built-in procedural layer (26).
+            BlockId::SocketMarker => 26,
+            // Built-in glass pane art (layer 25).
+            BlockId::Glass => 25,
+            // First reserved block placeholder layer (27..=31 are reserved,
             // see `src/render/texture.rs`). Modded content gets real art when
             // the registry owns the texture vocabulary.
-            BlockId::Modded(_) => 26,
+            BlockId::Modded(_) => 27,
         }
     }
 
@@ -400,6 +448,7 @@ impl BlockId {
             BlockId::Chest => "Chest",
             BlockId::LootChest => "Loot Chest",
             BlockId::SocketMarker => "Socket Marker",
+            BlockId::Glass => "Glass",
             BlockId::Modded(_) => "Modded Block",
         }
     }
@@ -439,10 +488,47 @@ impl BlockId {
             // The authored marker breaks quickly so re-placing a socket is
             // cheap; it still follows the ordinary break path.
             BlockId::SocketMarker => Some(0.3),
+            // Glass breaks like a light pane: faster than planks, slower than
+            // a wheat stalk.
+            BlockId::Glass => Some(0.4),
             // Fail closed until the registry answers hardness in S04: a
             // modded block is unbreakable rather than silently defaulting to
             // a built-in timing.
             BlockId::Modded(_) => None,
+        }
+    }
+
+    /// Authored render model for this block.
+    ///
+    /// Built-in wheat stages are crop plants (staged cross quads); every
+    /// other built-in id is a cube until a pack overrides it.
+    #[inline]
+    pub const fn model(self) -> opencraft_content::spec::BlockModel {
+        use opencraft_content::spec::BlockModel;
+        match self {
+            BlockId::WheatStage0
+            | BlockId::WheatStage1
+            | BlockId::WheatStage2
+            | BlockId::WheatStage3 => BlockModel::Crop,
+            _ => BlockModel::Cube,
+        }
+    }
+
+    /// Authored alpha mode for this block.
+    ///
+    /// Leaves and wheat punch holes in their art (cutout), glass is a
+    /// translucent pane (blend), and every other built-in id is opaque.
+    #[inline]
+    pub const fn alpha(self) -> opencraft_content::spec::BlockAlpha {
+        use opencraft_content::spec::BlockAlpha;
+        match self {
+            BlockId::OakLeaves => BlockAlpha::Cutout,
+            BlockId::Glass => BlockAlpha::Blend,
+            BlockId::WheatStage0
+            | BlockId::WheatStage1
+            | BlockId::WheatStage2
+            | BlockId::WheatStage3 => BlockAlpha::Cutout,
+            _ => BlockAlpha::Opaque,
         }
     }
 
@@ -535,7 +621,8 @@ mod tests {
             );
         }
         assert_eq!(BlockId::from_u8(23), Some(BlockId::SocketMarker));
-        assert_eq!(BlockId::from_u8(24), None);
+        assert_eq!(BlockId::from_u8(24), Some(BlockId::Glass));
+        assert_eq!(BlockId::from_u8(25), None);
         assert_eq!(BlockId::from_u8(99), None);
 
         assert_eq!(BlockId::Water.to_raw(), 15);
@@ -692,19 +779,37 @@ mod tests {
 
     #[test]
     fn test_solid_and_liquid_matrix_over_every_block_id() {
-        // Exactly Air and Water are passable/transparent; Water is the only
-        // liquid. Everything else is a solid, non-liquid block.
+        // Air, Water and the four wheat stages are passable/transparent;
+        // Water is the only liquid and wheat is the only plant. Everything
+        // else is a solid, non-liquid block (Glass included: it collides).
         for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
-            let expected_solid = !matches!(block, BlockId::Air | BlockId::Water);
+            let expected_solid = !matches!(
+                block,
+                BlockId::Air
+                    | BlockId::Water
+                    | BlockId::WheatStage0
+                    | BlockId::WheatStage1
+                    | BlockId::WheatStage2
+                    | BlockId::WheatStage3
+            );
             assert_eq!(block.is_solid(), expected_solid, "{block:?} solidity");
             assert_eq!(
                 block.is_liquid(),
                 block == BlockId::Water,
                 "{block:?} liquid"
             );
+            assert_eq!(
+                block.is_plant(),
+                block.is_wheat_stage(),
+                "{block:?} plant classification drifted"
+            );
             if block.is_liquid() {
                 assert!(!block.is_solid(), "a liquid cannot also be solid");
+            }
+            if block.is_plant() {
+                assert!(!block.is_solid(), "a plant cannot also be solid");
+                assert!(!block.is_liquid(), "a plant cannot also be liquid");
             }
         }
         assert!(!BlockId::Air.is_liquid());
@@ -712,18 +817,27 @@ mod tests {
         assert!(!BlockId::CraftingTable.is_liquid());
         assert!(BlockId::Water.is_liquid());
         assert!(!BlockId::Water.is_solid());
-        // The eight appended ids are solid terrain, not liquids.
+        // The wheat stages are the non-solid plants; the other appended ids
+        // stay solid terrain.
         for block in [
-            BlockId::Farmland,
             BlockId::WheatStage0,
             BlockId::WheatStage1,
             BlockId::WheatStage2,
             BlockId::WheatStage3,
+        ] {
+            assert!(!block.is_solid(), "{block:?} must be a passable plant");
+            assert!(block.is_plant(), "{block:?} must be a plant");
+            assert!(!block.is_liquid(), "{block:?} must not be a liquid");
+        }
+        for block in [
+            BlockId::Farmland,
             BlockId::Chest,
             BlockId::LootChest,
             BlockId::SocketMarker,
+            BlockId::Glass,
         ] {
             assert!(block.is_solid(), "{block:?} must be solid");
+            assert!(!block.is_plant(), "{block:?} must not be a plant");
             assert!(!block.is_liquid(), "{block:?} must not be a liquid");
             assert!(
                 !block.is_table_interactable(),
@@ -738,12 +852,39 @@ mod tests {
     }
 
     #[test]
+    fn light_opacity_is_solid_minus_glass() {
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            assert_eq!(
+                block.is_light_opaque(),
+                block.is_solid() && block != BlockId::Glass,
+                "{block:?} light opacity drifted"
+            );
+        }
+
+        // Glass is the only solid, light-transparent built-in; wheat is
+        // non-solid so it never occludes light either.
+        assert!(BlockId::Glass.is_solid());
+        assert!(!BlockId::Glass.is_light_opaque());
+        assert!(!BlockId::WheatStage3.is_solid());
+        assert!(!BlockId::WheatStage3.is_light_opaque());
+        assert!(BlockId::OakLeaves.is_light_opaque());
+        assert!(BlockId::Stone.is_light_opaque());
+        assert!(!BlockId::Air.is_light_opaque());
+        assert!(!BlockId::Water.is_light_opaque());
+    }
+
+    #[test]
     fn block_kind_maps_every_builtin_and_modded_id() {
         for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
             let block = BlockId::from_u8(id).expect("known block id must decode");
             let expected = match block {
                 BlockId::Air => BlockKind::Empty,
                 BlockId::Water => BlockKind::Liquid,
+                BlockId::WheatStage0
+                | BlockId::WheatStage1
+                | BlockId::WheatStage2
+                | BlockId::WheatStage3 => BlockKind::Plant,
                 _ => BlockKind::Solid,
             };
             assert_eq!(block.kind(), expected, "{block:?} neutral kind drifted");
@@ -758,6 +899,11 @@ mod tests {
                 block.is_liquid(),
                 "{block:?} liquid classification drifted from kind"
             );
+            assert_eq!(
+                block.kind().is_targetable(),
+                block.is_solid() || block.is_plant(),
+                "{block:?} targetability drifted from kind"
+            );
         }
 
         // Modded ids are solid until the registry answers per-block.
@@ -768,7 +914,9 @@ mod tests {
         // Explicit anchors for the passable ids.
         assert_eq!(BlockId::Air.kind(), BlockKind::Empty);
         assert_eq!(BlockId::Water.kind(), BlockKind::Liquid);
+        assert_eq!(BlockId::WheatStage3.kind(), BlockKind::Plant);
         assert_eq!(BlockId::Stone.kind(), BlockKind::Solid);
+        assert_eq!(BlockId::Glass.kind(), BlockKind::Solid);
         assert_eq!(BlockId::SocketMarker.kind(), BlockKind::Solid);
     }
 
@@ -955,7 +1103,7 @@ mod tests {
         // layers, hardness, mined drop) is pinned here so S01's storage and
         // registry refactor cannot silently renumber or re-skin a built-in.
         // The stable snake_case registry name arrives in T04, not here.
-        let contract: [BuiltinContractRow<'_>; 24] = [
+        let contract: [BuiltinContractRow<'_>; 25] = [
             (0, "Air", [0, 0, 0, 0, 0, 0], None, BlockId::Air),
             (1, "Grass", [1, 1, 0, 2, 1, 1], Some(0.5), BlockId::Grass),
             (2, "Dirt", [2; 6], Some(0.45), BlockId::Dirt),
@@ -1018,12 +1166,13 @@ mod tests {
             (
                 23,
                 "Socket Marker",
-                [25; 6],
+                [26; 6],
                 Some(0.3),
                 BlockId::SocketMarker,
             ),
+            (24, "Glass", [25; 6], Some(0.4), BlockId::Glass),
         ];
-        assert_eq!(contract.len(), 24, "built-in block count is frozen at 24");
+        assert_eq!(contract.len(), 25, "built-in block count is frozen at 25");
 
         for (raw, display_name, faces, hardness, drop) in contract {
             let block = BlockId::from_u8(raw as u8)
@@ -1061,7 +1210,8 @@ mod tests {
         // Explicit anchors for both sides of the boundary.
         assert_eq!(BlockId::from_raw(22), BlockId::LootChest);
         assert_eq!(BlockId::from_raw(23), BlockId::SocketMarker);
-        assert_eq!(BlockId::from_raw(24), BlockId::Modded(24));
+        assert_eq!(BlockId::from_raw(24), BlockId::Glass);
+        assert_eq!(BlockId::from_raw(25), BlockId::Modded(25));
         assert_eq!(BlockId::from_raw(u16::MAX), BlockId::Modded(u16::MAX));
     }
 
@@ -1111,7 +1261,7 @@ mod tests {
         // Fail-closed behavior: reserved placeholder art, generic name, no
         // break timing, self drop, and no station interaction.
         for face_dir in 0u8..6 {
-            assert_eq!(modded.face_tex_layer(face_dir), 26);
+            assert_eq!(modded.face_tex_layer(face_dir), 27);
         }
         assert_eq!(modded.name(), "Modded Block");
         assert_eq!(modded.break_duration_secs(), None);
@@ -1122,7 +1272,7 @@ mod tests {
 
     #[test]
     fn builtin_block_count_matches_from_u8() {
-        assert_eq!(BUILTIN_BLOCK_COUNT, 24, "the built-in count is frozen");
+        assert_eq!(BUILTIN_BLOCK_COUNT, 25, "the built-in count is frozen");
         let decodable = (0..=u8::MAX)
             .filter(|&raw| BlockId::from_u8(raw).is_some())
             .count();
@@ -1131,10 +1281,7 @@ mod tests {
             usize::from(BUILTIN_BLOCK_COUNT),
             "from_u8 must accept exactly the built-in ids"
         );
-        assert_eq!(
-            BlockId::from_raw(BUILTIN_BLOCK_COUNT - 1),
-            BlockId::SocketMarker
-        );
+        assert_eq!(BlockId::from_raw(BUILTIN_BLOCK_COUNT - 1), BlockId::Glass);
         assert_eq!(
             BlockId::from_raw(BUILTIN_BLOCK_COUNT),
             BlockId::Modded(BUILTIN_BLOCK_COUNT)
@@ -1151,9 +1298,10 @@ mod tests {
         assert_eq!(BlockId::from_u8(23), Some(marker));
         assert_eq!(marker.builtin_u8(), Some(23));
 
-        // Solid by the production opacity rule: collision, raycast, opaque
-        // meshing, and sky-light occlusion all consume `is_solid`.
+        // Solid and opaque: collision, raycast, opaque meshing, and sky-light
+        // occlusion all classify it as a blocking solid.
         assert!(marker.is_solid());
+        assert!(marker.is_light_opaque());
         assert!(!marker.is_liquid());
         assert!(!marker.is_wheat_stage());
         assert!(!marker.is_table_interactable());
@@ -1169,9 +1317,90 @@ mod tests {
         for face_dir in 0u8..6 {
             assert_eq!(
                 marker.face_tex_layer(face_dir),
-                25,
-                "socket marker face {face_dir} must use layer 25"
+                26,
+                "socket marker face {face_dir} must use layer 26"
             );
         }
+    }
+
+    #[test]
+    fn glass_identity_is_solid_carryable_and_light_transparent() {
+        let glass = BlockId::Glass;
+        assert_eq!(glass.to_raw(), 24);
+        assert_eq!(glass.name(), "Glass");
+        assert!(glass.is_builtin());
+        assert_eq!(BlockId::from_raw(24), glass);
+        assert_eq!(BlockId::from_u8(24), Some(glass));
+        assert_eq!(glass.builtin_u8(), Some(24));
+
+        // Collision and raycast keep working; sky light passes through.
+        assert!(glass.is_solid());
+        assert!(!glass.is_light_opaque());
+        assert_eq!(glass.kind(), BlockKind::Solid);
+        assert!(!glass.is_liquid());
+        assert!(!glass.is_plant());
+        assert!(!glass.is_wheat_stage());
+        assert!(!glass.is_table_interactable());
+        assert!(!glass.is_container_interactable());
+
+        // Carryable and self-dropping with its own pane art on every face.
+        assert!(glass.is_carryable());
+        assert_eq!(glass.mined_drop(), glass);
+        assert_eq!(glass.break_duration_secs(), Some(0.4));
+        for face_dir in 0u8..6 {
+            assert_eq!(
+                glass.face_tex_layer(face_dir),
+                25,
+                "glass face {face_dir} must use layer 25"
+            );
+        }
+    }
+
+    #[test]
+    fn authored_model_and_alpha_match_the_builtin_render_classes() {
+        use opencraft_content::spec::{BlockAlpha, BlockModel};
+
+        for id in 0u8..=(BUILTIN_BLOCK_COUNT - 1) as u8 {
+            let block = BlockId::from_u8(id).expect("known block id must decode");
+            let expected_model = if block.is_wheat_stage() {
+                BlockModel::Crop
+            } else {
+                BlockModel::Cube
+            };
+            let expected_alpha = match block {
+                BlockId::OakLeaves => BlockAlpha::Cutout,
+                BlockId::Glass => BlockAlpha::Blend,
+                block if block.is_wheat_stage() => BlockAlpha::Cutout,
+                _ => BlockAlpha::Opaque,
+            };
+            assert_eq!(
+                block.model(),
+                expected_model,
+                "{block:?} render model drifted"
+            );
+            assert_eq!(
+                block.alpha(),
+                expected_alpha,
+                "{block:?} alpha mode drifted"
+            );
+        }
+
+        // Explicit anchors for the three non-default classes.
+        assert_eq!(BlockId::WheatStage0.model(), BlockModel::Crop);
+        assert_eq!(BlockId::WheatStage3.alpha(), BlockAlpha::Cutout);
+        assert_eq!(BlockId::OakLeaves.model(), BlockModel::Cube);
+        assert_eq!(BlockId::OakLeaves.alpha(), BlockAlpha::Cutout);
+        assert_eq!(BlockId::Glass.model(), BlockModel::Cube);
+        assert_eq!(BlockId::Glass.alpha(), BlockAlpha::Blend);
+        // Modded ids stay on the fail-closed default until the registry
+        // answers per-block in S04.
+        assert_eq!(
+            BlockId::Modded(BUILTIN_BLOCK_COUNT).model(),
+            BlockModel::Cube
+        );
+        assert_eq!(
+            BlockId::Modded(BUILTIN_BLOCK_COUNT).alpha(),
+            BlockAlpha::Opaque
+        );
     }
 }

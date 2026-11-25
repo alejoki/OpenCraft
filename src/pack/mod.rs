@@ -7,7 +7,7 @@
 //! contains exactly [`crate::render::texture::NUM_TEX_LAYERS`] resampled 16x16
 //! RGBA layers plus optional presentation data. The first
 //! [`AUTHORABLE_TEX_LAYERS`] layers are block art from [`LAYER_FILES`], layer
-//! 25 is built-in socket-marker art packs cannot override, layers 26..=31 are
+//! 26 is built-in socket-marker art packs cannot override, layers 27..=31 are
 //! reserved block placeholders, layers 32..=44 are mob part art
 //! from [`MOB_LAYER_FILES`], and layers 45..=47 are reserved spares. Loading
 //! never fails and never panics on bad input; every fallback is reported as a
@@ -20,12 +20,15 @@ use crate::settings::SettingsWarning;
 
 pub mod asset;
 pub mod decode;
+pub mod default_master;
+pub mod defaults;
+pub mod faces;
 pub mod manifest;
 pub mod presentation;
 pub mod resample;
 pub mod sound;
 pub mod spec;
-pub mod v2;
+pub mod v3;
 pub mod validate;
 pub mod watch;
 
@@ -35,14 +38,14 @@ pub use spec::load_stack;
 /// Number of block texture layers a pack may author.
 ///
 /// Index-aligned with the first [`AUTHORABLE_TEX_LAYERS`] entries of
-/// `BlockId::face_tex_layer`/the procedural layer set. Layer 25 is built-in
+/// `BlockId::face_tex_layer`/the procedural layer set. Layer 26 is built-in
 /// socket-marker art packs cannot override, and
-/// 26..[`crate::render::texture::MOB_LAYER_BASE`] are reserved block
+/// 27..[`crate::render::texture::MOB_LAYER_BASE`] are reserved block
 /// placeholders that cannot be overridden either.
-pub const AUTHORABLE_TEX_LAYERS: usize = 25;
+pub const AUTHORABLE_TEX_LAYERS: usize = 26;
 
-/// File names for the 25 authorable block texture layers, index-aligned with
-/// `BlockId::face_tex_layer` (layers 0..25). These names are the authoring
+/// File names for the 26 authorable block texture layers, index-aligned with
+/// `BlockId::face_tex_layer` (layers 0..26). These names are the authoring
 /// contract for packs; do not reorder.
 pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
     "grass_top.png",           // 0
@@ -70,6 +73,7 @@ pub const LAYER_FILES: [&str; AUTHORABLE_TEX_LAYERS] = [
     "loot_chest.png",          // 22
     "crafting_table_top.png",  // 23
     "crafting_table_side.png", // 24
+    "glass.png",               // 25
 ];
 
 /// File names for the 13 authorable mob part layers, index-aligned with
@@ -109,8 +113,8 @@ pub struct PackLogo {
 /// entries of 16x16 RGBA bytes (1024 bytes each), the same format
 /// [`opencraft_gfx::texture::TextureArraySpec`] consumes (see
 /// [`crate::render::texture::BLOCK_ARRAY_SPEC`]). Layers
-/// 0..24 come from [`LAYER_FILES`], layer 25 is built-in socket-marker art
-/// that packs cannot override, 26..31 are reserved block placeholders,
+/// 0..25 come from [`LAYER_FILES`], layer 26 is built-in socket-marker art
+/// that packs cannot override, 27..31 are reserved block placeholders,
 /// 32..44 come from [`MOB_LAYER_FILES`], and 45..47 are reserved spares.
 /// Missing, invalid, and out-of-range files fall back per layer to the
 /// procedural texture and appear in `warnings`.
@@ -131,10 +135,10 @@ pub struct LoadedPack {
 /// layer file that does not exist is silently replaced by its procedural
 /// layer; a file that exists but fails to decode, is non-square, or is outside
 /// 16..=256 pixels falls back the same way and emits one warning naming the
-/// bare file. Layer 25 (built-in socket-marker art) and the reserved layers
-/// 26..=31 and 45..=47 have no file name and are never overridable, so a
+/// bare file. Layer 26 (built-in socket-marker art) and the reserved layers
+/// 27..=31 and 45..=47 have no file name and are never overridable, so a
 /// legacy pack that ships only the original 16 block files simply keeps the
-/// built-in art for layers 16..25 and all mob art. The
+/// built-in art for layers 16..=25 and all mob art. The
 /// optional logo is decoded at native size (failure -> `None` plus a warning).
 /// Unknown files and unknown manifest keys are ignored. Never panics, never
 /// returns `Err`.
@@ -142,13 +146,18 @@ pub fn load_pack_from_dir(dir: &Path) -> LoadedPack {
     spec::resolve_presentation(&[spec::load_spec_from_dir(dir)])
 }
 
-/// Sorted names of the pack directories directly under `packs_root`.
+/// Sorted names of the togglable pack directories directly under `packs_root`.
 ///
 /// Only subdirectories count as packs; regular files (and symlinks that do
 /// not resolve to a directory) are skipped. A missing or unreadable root is
 /// not an error: a fresh install simply has no packs, so the result is empty.
 /// Names that are not valid UTF-8 cannot be addressed as a setting and are
 /// skipped as well.
+///
+/// The shipped [`defaults::DEFAULT_PACK_FOLDER`] is deliberately absent: it is
+/// the implicit first presentation entry restored at production startup, never
+/// a user-togglable Packs row. Hiding it here keeps both the settings stack and
+/// the Packs table free of an entry the player never chose.
 pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(packs_root) else {
         return Vec::new();
@@ -158,6 +167,7 @@ pub fn available_pack_names(packs_root: &Path) -> Vec<String> {
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
         .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|name| name != defaults::DEFAULT_PACK_FOLDER)
         .collect();
     names.sort();
     names
@@ -310,6 +320,7 @@ mod tests {
         read_pack_toml(
             &dir,
             r#"
+format_version = 3
 name = "Test Pack"
 description = "A pack authored in a headless test"
 unknown_key = "ignored"
@@ -409,7 +420,7 @@ whatever = true
     }
 
     #[test]
-    fn missing_manifest_warns_once_and_still_loads() {
+    fn missing_manifest_is_rejected_with_one_warning_naming_the_pack() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "manifestless");
 
@@ -417,7 +428,12 @@ whatever = true
         let procedural = procedural_layers();
 
         assert_eq!(pack.warnings.len(), 1);
-        assert_eq!(pack.warnings[0].field, "pack.toml");
+        assert_eq!(pack.warnings[0].field, "manifestless");
+        assert!(
+            pack.warnings[0].reason.contains("format_version 1"),
+            "the rejection names the missing version: {}",
+            pack.warnings[0].reason
+        );
         assert_eq!(pack.layers, procedural);
         assert_eq!(
             pack.layers.len(),
@@ -431,15 +447,17 @@ whatever = true
     }
 
     #[test]
-    fn syntax_corrupt_manifest_warns_once_and_uses_defaults() {
+    fn syntax_corrupt_manifest_is_rejected_and_never_loads_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "broken-manifest");
         read_pack_toml(&dir, "name = [unterminated\n[[menu");
+        write_png(&dir.join(LAYER_FILES[3]), 16);
 
         let pack = load_pack_from_dir(&dir);
 
         assert_eq!(pack.warnings.len(), 1);
-        assert_eq!(pack.warnings[0].field, "pack.toml");
+        assert_eq!(pack.warnings[0].field, "broken-manifest");
+        assert!(pack.warnings[0].reason.contains("format_version 1"));
         assert_eq!(pack.layers, procedural_layers());
         assert_eq!(pack.logo, None);
         assert_eq!(pack.overlay_tint, None);
@@ -475,7 +493,7 @@ whatever = true
     fn load_pack_by_name_delegates_to_from_dir_for_existing_packs() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "real");
-        read_pack_toml(&dir, "name = \"Real Pack\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Real Pack\"\n");
         write_png(&dir.join(LAYER_FILES[3]), 16);
 
         let by_name = load_pack_by_name(root.path(), "real");
@@ -490,7 +508,7 @@ whatever = true
     fn missing_logo_file_warns_and_keeps_none() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-logo");
-        read_pack_toml(&dir, "[menu]\nlogo = \"absent.png\"\n");
+        read_pack_toml(&dir, "format_version = 3\n[menu]\nlogo = \"absent.png\"\n");
 
         let pack = load_pack_from_dir(&dir);
 
@@ -502,7 +520,7 @@ whatever = true
     fn non_square_logo_keeps_native_size() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "wide-logo");
-        read_pack_toml(&dir, "[menu]\nlogo = \"wide.png\"\n");
+        read_pack_toml(&dir, "format_version = 3\n[menu]\nlogo = \"wide.png\"\n");
         write_png_sized(&dir.join("wide.png"), 32, 16);
 
         let pack = load_pack_from_dir(&dir);
@@ -520,6 +538,8 @@ whatever = true
         for name in ["zeta", "alpha", "middle"] {
             fs::create_dir(root.path().join(name)).unwrap();
         }
+        // The shipped default folder is always implicit and never a row.
+        fs::create_dir(root.path().join(defaults::DEFAULT_PACK_FOLDER)).unwrap();
         // Regular files are not packs.
         fs::write(root.path().join("notes.txt"), b"not a dir").unwrap();
         // A symlink to a file is not a pack either.
@@ -562,9 +582,9 @@ whatever = true
 
     #[test]
     fn layer_file_names_cover_all_block_layers() {
-        assert_eq!(LAYER_FILES.len(), 25);
+        assert_eq!(LAYER_FILES.len(), 26);
         assert_eq!(LAYER_FILES.len(), AUTHORABLE_TEX_LAYERS);
-        assert_eq!(AUTHORABLE_TEX_LAYERS, 25);
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 26);
         assert_eq!(
             &LAYER_FILES[16..],
             &[
@@ -577,22 +597,24 @@ whatever = true
                 "loot_chest.png",
                 "crafting_table_top.png",
                 "crafting_table_side.png",
+                "glass.png",
             ]
         );
         // The original 16 names keep their indices.
         assert_eq!(LAYER_FILES[0], "grass_top.png");
         assert_eq!(LAYER_FILES[15], "iron_ore.png");
-        // The two table layers are the only appended names.
+        // The table layers and glass are the only appended names.
         assert_eq!(LAYER_FILES[22], "loot_chest.png");
         assert_eq!(LAYER_FILES[23], "crafting_table_top.png");
         assert_eq!(LAYER_FILES[24], "crafting_table_side.png");
+        assert_eq!(LAYER_FILES[25], "glass.png");
     }
 
     #[test]
     fn legacy_sixteen_file_pack_keeps_new_and_reserved_layers_built_in() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "legacy16");
-        read_pack_toml(&dir, "name = \"Legacy 16\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Legacy 16\"\n");
         for file in LAYER_FILES.iter().take(16) {
             write_png(&dir.join(file), 16);
         }
@@ -612,7 +634,7 @@ whatever = true
             assert_ne!(*layer, procedural[index]);
         }
 
-        // Built-in marker art (25), the reserved ranges, and all mob art keep
+        // Built-in marker art (26), the reserved ranges, and all mob art keep
         // the built-in pixels: a legacy pack needs no changes.
         for index in 16..AUTHORABLE_TEX_LAYERS {
             assert_procedural_layer(&pack, &procedural, index);
@@ -635,10 +657,10 @@ whatever = true
     }
 
     #[test]
-    fn authoring_all_twenty_five_names_overrides_every_authorable_layer() {
+    fn authoring_all_twenty_six_names_overrides_every_authorable_layer() {
         let root = tempfile::tempdir().unwrap();
-        let dir = pack_dir(&root, "full25");
-        read_pack_toml(&dir, "name = \"Full 25\"\n");
+        let dir = pack_dir(&root, "full26");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Full 26\"\n");
         for file in LAYER_FILES.iter() {
             write_png(&dir.join(file), 32);
         }
@@ -677,7 +699,7 @@ whatever = true
     fn reserved_layer_file_names_are_ignored_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "reserved-names");
-        read_pack_toml(&dir, "name = \"Reserved\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Reserved\"\n");
         // Neither the first nor the last reserved layer can be overridden,
         // and the spare block range stays non-authorable too.
         for file in ["reserved_26.png", "reserved_31.png", "reserved_45.png"] {
@@ -698,7 +720,7 @@ whatever = true
     fn invalid_new_layer_warns_with_bare_file_name_and_falls_back() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-new-layer");
-        read_pack_toml(&dir, "name = \"Bad New Layer\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad New Layer\"\n");
         fs::write(dir.join(LAYER_FILES[16]), b"not a png").unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -720,7 +742,7 @@ whatever = true
     fn oversized_ihdr_layer_warns_and_falls_back() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "hostile");
-        read_pack_toml(&dir, "name = \"Hostile\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Hostile\"\n");
         fs::write(dir.join(LAYER_FILES[3]), png_bomb_bytes(30000, 30000)).unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -739,7 +761,7 @@ whatever = true
     fn crafting_table_files_override_only_their_layers() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "crafting-table");
-        read_pack_toml(&dir, "name = \"Crafting Table\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Crafting Table\"\n");
         write_png(&dir.join("crafting_table_top.png"), 32);
         write_png(&dir.join("crafting_table_side.png"), 64);
 
@@ -758,10 +780,8 @@ whatever = true
         assert_ne!(pack.layers[24], procedural[24]);
         assert_ne!(pack.layers[23], pack.layers[24]);
 
-        // Only the two new names change: 0..=22 and 25..=47 stay built-in.
-        for index in (0..(AUTHORABLE_TEX_LAYERS - 2))
-            .chain(AUTHORABLE_TEX_LAYERS..crate::render::texture::NUM_TEX_LAYERS as usize)
-        {
+        // Only the two table names change: 0..=22 and 25..=47 stay built-in.
+        for index in (0..23usize).chain(25..crate::render::texture::NUM_TEX_LAYERS as usize) {
             assert_procedural_layer(&pack, &procedural, index);
         }
         assert!(pack.warnings.is_empty(), "{:?}", pack.warnings);
@@ -771,7 +791,7 @@ whatever = true
     fn missing_crafting_table_files_keep_procedural_art_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-table-art");
-        read_pack_toml(&dir, "name = \"No Table Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"No Table Art\"\n");
 
         let pack = load_pack_from_dir(&dir);
         let procedural = procedural_layers();
@@ -789,7 +809,7 @@ whatever = true
     fn corrupt_crafting_table_files_warn_once_with_bare_name() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-table-art");
-        read_pack_toml(&dir, "name = \"Bad Table Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Table Art\"\n");
         fs::write(dir.join("crafting_table_top.png"), b"not a png").unwrap();
         fs::write(dir.join("crafting_table_side.png"), b"still not a png").unwrap();
 
@@ -803,6 +823,22 @@ whatever = true
             warning_fields(&pack),
             vec!["crafting_table_top.png", "crafting_table_side.png"]
         );
+    }
+
+    #[test]
+    fn corrupt_glass_file_warns_once_with_bare_name_and_keeps_procedural_art() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = pack_dir(&root, "bad-glass");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Glass\"\n");
+        fs::write(dir.join("glass.png"), b"not a png").unwrap();
+
+        let pack = load_pack_from_dir(&dir);
+        let procedural = procedural_layers();
+
+        // Layer 25 is ordinary authorable art now, so a corrupt file falls
+        // back per-file exactly like every other layer name.
+        assert_procedural_layer(&pack, &procedural, 25);
+        assert_eq!(warning_fields(&pack), vec!["glass.png"]);
     }
 
     #[test]
@@ -822,20 +858,21 @@ whatever = true
         );
 
         // The first 23 block names stay byte-for-byte unchanged; the two
-        // table layers extend the contract at 23 and 24.
-        assert_eq!(AUTHORABLE_TEX_LAYERS, 25);
+        // table layers extend the contract at 23 and 24, and glass at 25.
+        assert_eq!(AUTHORABLE_TEX_LAYERS, 26);
         assert_eq!(LAYER_FILES[0], "grass_top.png");
         assert_eq!(LAYER_FILES[22], "loot_chest.png");
         assert_eq!(LAYER_FILES[23], "crafting_table_top.png");
         assert_eq!(LAYER_FILES[24], "crafting_table_side.png");
+        assert_eq!(LAYER_FILES[25], "glass.png");
 
         assert_eq!(MOB_LAYER_FILES[0], "pig_body.png");
         assert_eq!(MOB_LAYER_FILES[12], "arrow.png");
 
-        // 25 block + 1 built-in marker + 6 reserved + 13 mob + 3 spare = 48.
+        // 26 block + 1 built-in marker + 5 reserved + 13 mob + 3 spare = 48.
         assert_eq!(
             NUM_TEX_LAYERS as usize,
-            AUTHORABLE_TEX_LAYERS + 1 + 6 + MOB_AUTHORABLE_TEX_LAYERS + 3
+            AUTHORABLE_TEX_LAYERS + 1 + 5 + MOB_AUTHORABLE_TEX_LAYERS + 3
         );
     }
 
@@ -843,7 +880,7 @@ whatever = true
     fn mob_pack_overrides_each_part_per_file() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "mob-parts");
-        read_pack_toml(&dir, "name = \"Mob Parts\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Mob Parts\"\n");
 
         // pig_body -> 32, cow_head -> 36, skeleton_leg -> 43.
         let overrides: [(usize, u32); 3] = [(0, 32), (4, 64), (11, 32)];
@@ -898,7 +935,7 @@ whatever = true
     fn missing_mob_file_falls_back_silently() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "no-mob-art");
-        read_pack_toml(&dir, "name = \"No Mob Art\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"No Mob Art\"\n");
         // One block file proves the loader ran; every mob file is absent.
         write_png(&dir.join(LAYER_FILES[0]), 16);
 
@@ -919,7 +956,7 @@ whatever = true
     fn corrupt_mob_file_warns_with_bare_name() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "bad-mob");
-        read_pack_toml(&dir, "name = \"Bad Mob\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Bad Mob\"\n");
         fs::write(dir.join(MOB_LAYER_FILES[4]), b"not a png").unwrap();
 
         let pack = load_pack_from_dir(&dir);
@@ -943,7 +980,7 @@ whatever = true
     fn layer_at_256_boundary_is_accepted() {
         let root = tempfile::tempdir().unwrap();
         let dir = pack_dir(&root, "boundary");
-        read_pack_toml(&dir, "name = \"Boundary\"\n");
+        read_pack_toml(&dir, "format_version = 3\nname = \"Boundary\"\n");
         write_png(&dir.join(LAYER_FILES[0]), 256);
 
         let pack = load_pack_from_dir(&dir);

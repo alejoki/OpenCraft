@@ -72,6 +72,10 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#StageDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\config\*"; DestDir: "{app}\config"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\worldgen\*"; DestDir: "{app}\worldgen"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The shipped editable default pack. `ignoreversion` refreshes this master on
+; upgrade so the installer never leaves a stale copy behind; player saves and
+; settings live outside these paths and persist.
+Source: "{#StageDir}\packs\default\*"; DestDir: "{app}\packs\default"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

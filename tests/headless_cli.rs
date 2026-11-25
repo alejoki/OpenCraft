@@ -306,7 +306,11 @@ fn demo_palette_digest_runs_headlessly() {
 #[test]
 fn validate_pack_warns_on_hostile_inputs_without_panicking() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let hostile = stage_pack(temp.path(), "hostile", b"name = \"Hostile\"\n");
+    let hostile = stage_pack(
+        temp.path(),
+        "hostile",
+        b"format_version = 3\nname = \"Hostile\"\n",
+    );
     std::fs::write(hostile.join("stone.png"), png_bomb_bytes(30000, 30000))
         .expect("write stone.png");
     std::fs::write(hostile.join("dirt.png"), png_bomb_bytes(512, 512)).expect("write dirt.png");
@@ -358,18 +362,27 @@ fn validate_pack_warns_on_hostile_inputs_without_panicking() {
 
     stage_pack(temp.path(), "huge", &vec![b' '; 1_048_577]);
     let output = run_in(temp.path(), &["--validate-pack", "huge"]);
-    assert_eq!(output.status.code(), Some(0), "{}", report(&output));
+    // An oversized manifest cannot be read, so it cannot declare
+    // format_version = 3: the v3-only gate rejects it after one read warning.
+    assert_eq!(output.status.code(), Some(1), "{}", report(&output));
     let lines = stdout_lines(&output);
     assert!(
         lines
             .iter()
             .any(|line| line.starts_with("warning: pack.toml:")),
-        "the oversized manifest falls back with a warning: {}",
+        "the oversized manifest still names its read failure: {}",
+        report(&output)
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.starts_with("error: pack huge:")),
+        "the v3-only gate rejects an unreadable manifest: {}",
         report(&output)
     );
     assert_eq!(
         last_line(&lines),
-        "validate-pack: huge: 0 entries, 0 errors, 1 warnings",
+        "validate-pack: huge: 0 entries, 1 errors, 1 warnings",
         "{}",
         report(&output)
     );
@@ -382,12 +395,12 @@ fn validate_pack_warns_on_hostile_inputs_without_panicking() {
 }
 
 #[test]
-fn validate_pack_fails_on_a_truncated_v2_asset() {
+fn validate_pack_fails_on_a_truncated_asset() {
     let temp = tempfile::tempdir().expect("temp dir");
     let pack = stage_pack(
         temp.path(),
         "broken",
-        br#"format_version = 2
+        br#"format_version = 3
 
 [[blocks]]
 id = "broken:truncated"

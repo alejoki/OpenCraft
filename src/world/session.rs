@@ -52,6 +52,7 @@ use crate::world::season::{season_of, Season};
 use crate::world::spawning::{
     SpawnContext, SpawnReport, SpawnRuntime, SpawnWorld, SPAWN_MAX_RADIUS,
 };
+use crate::world::structure::StructureCatalog;
 use crate::world::terrain::{find_spawn_column, ruin_loot_chest_at, terrain_height_at_seeded};
 use crate::world::village::VillageCatalog;
 
@@ -1192,6 +1193,18 @@ impl WorldSession {
             self.world_spawn.z.floor() as i32,
         );
         self.world.set_village_catalog(catalog, column);
+    }
+
+    /// Install the accepted structure catalog on this session's world.
+    ///
+    /// The structure catalog needs no derived state (unlike the village
+    /// catalog's spawn column), so this is a straight forwarding setter: every
+    /// create/load swap installs it next to [`Self::set_village_catalog`].
+    /// `None` returns generation to the compile-time builtin master; a
+    /// post-construction setter is safe because no chunk is generated before
+    /// the first `update_streaming`.
+    pub fn set_structure_catalog(&mut self, catalog: Option<Arc<StructureCatalog>>) {
+        self.world.set_structure_catalog(catalog);
     }
 
     /// Whether every chunk column that could hold a spawn candidate is
@@ -6320,6 +6333,35 @@ mod tests {
     }
 
     #[test]
+    fn set_structure_catalog_forwards_to_the_world_and_none_stays_none() {
+        let mut session = WorldSession::new_session(
+            14,
+            PathBuf::from("/nonexistent/structure.mcvx"),
+            DEFAULT_SEASON_LENGTH_DAYS,
+        );
+        assert!(
+            session.world.structure_catalog().is_none(),
+            "constructors stay on the builtin master path"
+        );
+
+        let installed = Arc::new(StructureCatalog::builtin().clone());
+        session.set_structure_catalog(Some(Arc::clone(&installed)));
+        assert!(
+            matches!(
+                session.world.structure_catalog(),
+                Some(current) if Arc::ptr_eq(current, &installed)
+            ),
+            "the session must install the exact handle it was given"
+        );
+
+        session.set_structure_catalog(None);
+        assert!(
+            session.world.structure_catalog().is_none(),
+            "clearing forwards None back to the builtin master"
+        );
+    }
+
+    #[test]
     fn the_ambient_gate_stops_spawning_and_reopens_on_a_fresh_window() {
         let mut session = lit_grass_plain_session(52, 2);
         session.clock = GameClock::from_time(NIGHT_TICK);
@@ -8606,7 +8648,7 @@ mod tests {
     /// registry-aware constructor, so mesh jobs resolve authored layers.
     #[test]
     fn registry_constructors_install_the_registry_face_table() {
-        use crate::content::spec::{BlockEntry, BlockTextures, PackAsset};
+        use crate::content::spec::{BlockAlpha, BlockEntry, BlockModel, BlockTextures, PackAsset};
         use crate::content::{build_registry, PackContentSpec, PackIdentity, PACK_LAYER_BASE};
         use crate::world::block::BUILTIN_BLOCK_COUNT;
 
@@ -8629,6 +8671,9 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         });
         let (registry, report) = build_registry(
             ContentRegistry::builtin(),

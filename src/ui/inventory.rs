@@ -624,6 +624,9 @@ fn block_color(block: BlockId) -> [f32; 4] {
         // distinct from every carryable block tint. Unreachable through the
         // item UI because the marker is non-carryable.
         BlockId::SocketMarker => [0.55, 0.20, 0.62, 1.0],
+        // Glass reads as a pale blue pane; the item palette is opaque, so the
+        // tint is the glass frame colour rather than a real alpha surface.
+        BlockId::Glass => [0.72, 0.86, 0.94, 1.0],
         // Neutral checker grey until the registry owns modded block tinting.
         BlockId::Modded(_) => [0.62, 0.62, 0.66, 1.0],
         BlockId::Air | BlockId::Bedrock => [0.16, 0.16, 0.18, 1.0],

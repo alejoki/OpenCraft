@@ -9,7 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::spec::{ContentDiagnostic, PackContentSpec, Severity, WorldgenEntry, WorldgenKind};
+use crate::spec::{
+    face_direction, BlockAlpha, BlockModel, ContentDiagnostic, FaceSource, PackContentSpec,
+    Severity, WorldgenEntry, WorldgenKind,
+};
 use crate::warning::PackWarning;
 
 /// Render stable output lines for one parsed pack.
@@ -69,10 +72,10 @@ pub fn render_lines(
 
     let entries = content_entries(spec);
     for entry in &entries {
-        if failed_entries.contains(entry.as_str()) {
+        if failed_entries.contains(entry.label.as_str()) {
             continue;
         }
-        rendered.insert(format!("ok: {entry}"));
+        rendered.insert(entry.ok_line());
     }
 
     let mut lines: Vec<String> = rendered.into_iter().collect();
@@ -94,41 +97,106 @@ fn diagnostic_line(level: &str, name: &str, diagnostic: &ContentDiagnostic) -> S
     }
 }
 
+/// One accepted authored entry: its stable base label (used for entry
+/// counting and diagnostic matching) plus an optional non-default
+/// model/alpha suffix shown only on the `ok:` line.
+struct ContentEntry {
+    label: String,
+    metadata: Option<String>,
+}
+
+impl ContentEntry {
+    fn plain(label: String) -> ContentEntry {
+        ContentEntry {
+            label,
+            metadata: None,
+        }
+    }
+
+    /// Builds a block/patch entry that appends ` model=... alpha=...` when
+    /// either field is non-default. The base label never changes, so a
+    /// diagnostic still suppresses exactly the same entry.
+    fn with_metadata(label: String, model: BlockModel, alpha: BlockAlpha) -> ContentEntry {
+        let metadata = (model != BlockModel::Cube || alpha != BlockAlpha::Opaque)
+            .then(|| format!("model={} alpha={}", model.as_str(), alpha.as_str()));
+        ContentEntry { label, metadata }
+    }
+
+    fn ok_line(&self) -> String {
+        match &self.metadata {
+            Some(metadata) => format!("ok: {} {metadata}", self.label),
+            None => format!("ok: {}", self.label),
+        }
+    }
+}
+
 /// Stable `<kind> <id>` labels for every accepted authored entry.
 ///
 /// Worldgen rules have no id of their own, so they use the same
 /// `worldgen <kind> <block>` shape the parser puts in diagnostics.
-fn content_entries(spec: &PackContentSpec) -> Vec<String> {
+fn content_entries(spec: &PackContentSpec) -> Vec<ContentEntry> {
     let mut entries = Vec::new();
+    entries.extend(spec.blocks.iter().map(|entry| {
+        ContentEntry::with_metadata(format!("block {}", entry.id), entry.model, entry.alpha)
+    }));
     entries.extend(
-        spec.blocks
+        spec.items
             .iter()
-            .map(|entry| format!("block {}", entry.id)),
+            .map(|entry| ContentEntry::plain(format!("item {}", entry.id))),
     );
-    entries.extend(spec.items.iter().map(|entry| format!("item {}", entry.id)));
-    entries.extend(spec.tiers.iter().map(|entry| format!("tier {}", entry.id)));
-    entries.extend(spec.tools.iter().map(|entry| format!("tool {}", entry.id)));
+    entries.extend(
+        spec.tiers
+            .iter()
+            .map(|entry| ContentEntry::plain(format!("tier {}", entry.id))),
+    );
+    entries.extend(
+        spec.tools
+            .iter()
+            .map(|entry| ContentEntry::plain(format!("tool {}", entry.id))),
+    );
     entries.extend(
         spec.recipes
             .iter()
-            .map(|entry| format!("recipe {}", entry.id)),
+            .map(|entry| ContentEntry::plain(format!("recipe {}", entry.id))),
     );
-    entries.extend(spec.worldgen.iter().map(worldgen_label));
     entries.extend(
-        spec.block_patches
+        spec.worldgen
             .iter()
-            .map(|entry| format!("block_patch {}", entry.id)),
+            .map(|entry| ContentEntry::plain(worldgen_label(entry))),
     );
+    entries.extend(spec.block_patches.iter().map(|entry| {
+        ContentEntry::with_metadata(
+            format!("block_patch {}", entry.id),
+            entry.model.unwrap_or_default(),
+            entry.alpha.unwrap_or_default(),
+        )
+    }));
     entries.extend(
         spec.recipe_patches
             .iter()
-            .map(|entry| format!("recipe_patch {}", entry.id)),
+            .map(|entry| ContentEntry::plain(format!("recipe_patch {}", entry.id))),
     );
     entries.extend(
         spec.builtin_icons
             .keys()
-            .map(|name| format!("builtin_icon {name}")),
+            .map(|name| ContentEntry::plain(format!("builtin_icon {name}"))),
     );
+    // One entry per loader-synthesized authored built-in face. `Layer` faces
+    // reuse an existing base layer and are not authored content entries.
+    entries.extend(spec.builtin_faces.iter().flat_map(|entry| {
+        entry
+            .faces
+            .iter()
+            .enumerate()
+            .filter_map(|(face, source)| match source {
+                Some(FaceSource::Authored(_)) => Some(ContentEntry::plain(format!(
+                    "face {} {}",
+                    entry.block,
+                    face_direction(face).unwrap_or("unknown")
+                ))),
+                Some(FaceSource::Layer(_)) | None => None,
+            })
+    }));
     entries
 }
 
@@ -145,7 +213,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    use crate::spec::{BlockEntry, BlockTextures, ItemEntry};
+    use crate::spec::{BlockEntry, BlockTextures, BuiltinFaceEntry, FaceSource, ItemEntry};
 
     fn block(id: &str) -> BlockEntry {
         BlockEntry {
@@ -156,6 +224,8 @@ mod tests {
             drop: None,
             tool: None,
             stack_limit: 64,
+            model: BlockModel::Cube,
+            alpha: BlockAlpha::Opaque,
         }
     }
 
@@ -302,6 +372,90 @@ mod tests {
     }
 
     #[test]
+    fn authored_builtin_face_renders_an_ok_entry() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("stone_top.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+
+        let (lines, ok) = render_lines("faces", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(text.contains("ok: face stone top"), "{text}");
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: faces: 1 entries, 0 errors, 0 warnings",
+            "one authored face slot is one entry"
+        );
+    }
+
+    #[test]
+    fn layer_builtin_faces_add_no_entries() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: std::array::from_fn(|_| Some(FaceSource::Layer(20))),
+        });
+
+        let (lines, ok) = render_lines("layers", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(!text.contains("ok: face "), "{text}");
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: layers: 0 entries, 0 errors, 0 warnings"
+        );
+    }
+
+    #[test]
+    fn missing_authored_face_suppresses_its_ok_line() {
+        let mut spec = PackContentSpec::default();
+        spec.builtin_faces.push(BuiltinFaceEntry {
+            block: "stone".to_string(),
+            faces: [
+                None,
+                None,
+                Some(FaceSource::Authored("missing.png".to_string())),
+                None,
+                None,
+                None,
+            ],
+        });
+        // The registry build reports the failure under the same stable label
+        // the entry list uses, so the `ok:` line is suppressed.
+        let diagnostics = [diagnostic(
+            Severity::Error,
+            "face stone top",
+            "texture `missing.png` is not a loaded asset",
+        )];
+
+        let (lines, ok) = render_lines("faces", &spec, &diagnostics, &[]);
+        let text = lines.join("\n");
+        assert!(!ok, "{text}");
+        assert!(!text.contains("ok: face stone top"), "{text}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("error: face stone top:"))
+                .count(),
+            1,
+            "{text}"
+        );
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: faces: 1 entries, 1 errors, 0 warnings"
+        );
+    }
+
+    #[test]
     fn builtin_icon_override_counts_as_an_entry() {
         let spec = PackContentSpec {
             builtin_icons: BTreeMap::from([("apple".to_string(), "apple.png".to_string())]),
@@ -315,6 +469,81 @@ mod tests {
         assert_eq!(
             last_line(&lines),
             "validate-pack: icons: 1 entries, 0 errors, 0 warnings"
+        );
+    }
+
+    #[test]
+    fn non_default_model_and_alpha_render_a_suffix() {
+        let mut wheat = block("mymod:wheat");
+        wheat.model = BlockModel::Cross;
+        wheat.alpha = BlockAlpha::Cutout;
+        let mut glass = block("mymod:glass");
+        glass.alpha = BlockAlpha::Blend;
+
+        let spec = PackContentSpec {
+            blocks: vec![wheat, glass, block("mymod:stone")],
+            ..PackContentSpec::default()
+        };
+
+        let (lines, ok) = render_lines("models", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("ok: block mymod:wheat model=cross alpha=cutout"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ok: block mymod:glass model=cube alpha=blend"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ok: block mymod:stone"),
+            "the default block keeps its base line: {text}"
+        );
+        assert!(
+            !text.contains("ok: block mymod:stone model"),
+            "the default block must not gain a suffix: {text}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("model=cube alpha=opaque")),
+            "default metadata must not render: {text}"
+        );
+        assert_eq!(
+            last_line(&lines),
+            "validate-pack: models: 3 entries, 0 errors, 0 warnings"
+        );
+    }
+
+    #[test]
+    fn non_default_block_patch_renders_a_suffix_but_still_matches_its_error() {
+        let mut spec = PackContentSpec::default();
+        spec.block_patches.push(crate::spec::BlockPatch {
+            id: "oak_leaves".to_string(),
+            alpha: Some(BlockAlpha::Cutout),
+            ..crate::spec::BlockPatch::default()
+        });
+        let failed = diagnostic(
+            Severity::Error,
+            "block_patch oak_leaves",
+            "texture fell back",
+        );
+
+        let (lines, ok) = render_lines("patches", &spec, &[failed], &[]);
+        let text = lines.join("\n");
+        assert!(!ok, "{text}");
+        assert!(
+            !text.contains("ok: block_patch oak_leaves"),
+            "the base label still suppresses the ok line: {text}"
+        );
+
+        let (lines, ok) = render_lines("patches", &spec, &[], &[]);
+        let text = lines.join("\n");
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("ok: block_patch oak_leaves model=cube alpha=cutout"),
+            "{text}"
         );
     }
 }

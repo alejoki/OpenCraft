@@ -93,14 +93,24 @@ bash scripts/verify_release_artifacts.sh dist/rehearsal 0.3.0
 `opencraft-<VERSION>-x86_64-unknown-linux-gnu.tar.gz` contains an executable
 `opencraft`, that `opencraft-<VERSION>-x86_64-pc-windows-msvc.zip` contains
 `opencraft.exe`, and that both carry `config/combat.toml`,
-`worldgen/villages/plains.toml` and `LICENSE` at the archive root. It also
-rejects a Windows `opencraft.exe` that still imports `VCRUNTIME140.dll` (D290
-builds the release with a static CRT), and requires
+`worldgen/villages/plains.toml`, `packs/default/pack.toml` and `LICENSE` at the
+archive root. It also rejects a Windows `opencraft.exe` that still imports
+`VCRUNTIME140.dll` (D290 builds the release with a static CRT), and requires
 `opencraft-<VERSION>-x86_64-pc-windows-msvc-setup.exe` to be a PE image whose
 version resource names OpenCraft and the release version. The script runs the
 Linux binary headlessly (`--demo-ui`, `--demo-village`, `--validate-pack`)
-from a scratch directory, and rejects any `packs/`, `saves/` or `settings.toml`
-entry in the Windows zip.
+from a scratch directory. In the Windows zip it rejects `saves/`,
+`settings.toml` and any `packs/` entry other than `packs/default/...`, so a
+user pack or real player state can never ship inside an archive.
+
+Both portable archives and the Windows installer ship `packs/default` — the
+editable master of the game's procedural art and synthesized sounds. Deleting
+or damaging that folder in a checkout is recoverable because the game restores
+it from its embedded copy and loads it as the implicit first pack. The
+archives still refuse `saves/`, `settings.toml` and any user pack outside
+`packs/default/`: those are player state, not shipped content. Installing or
+upgrading with the setup exe refreshes `packs/default` in place, while
+`saves/` and `settings.toml` stay untouched and persist across upgrades.
 
 If the rehearsal is red, fix forward and push again. Do not tag a red
 rehearsal.
@@ -129,6 +139,45 @@ SMOKE_PROFILE=release bash scripts/worldgen_smoke.sh
 
 All nine must exit 0. This is the last chance to notice a release-only
 regression (the release build drops the creator watcher, overlay, and trace).
+
+### M019 closeout rehearsal (external pack, atlas, package)
+
+The M019 surface ships three extra headless seams and one standing smoke.
+Run them on the same commit before tagging:
+
+```bash
+bash scripts/external_pack_smoke.sh
+bash scripts/validate_pack_smoke.sh
+bash scripts/requirements_check.sh
+bash scripts/requirements_check_selftest.sh
+```
+
+`external_pack_smoke.sh` copies only `tests/fixtures/packs/external-v3` into a
+temp `packs/` tree, asserts `--validate-pack external-v3` prints
+`11 entries, 0 errors, 0 warnings`, runs `--demo-external-pack` and checks
+every proof leg plus `external_pack_demo: ok=true`, then writes `--demo-atlas`
+twice and requires the two `atlas.png` files to be byte-identical. It needs no
+window, GPU, `settings.toml` or `saves/`.
+
+The M019 Linux package rehearsal is:
+
+```bash
+cargo build --release --locked
+bash scripts/package_release.sh 0.3.0 x86_64-unknown-linux-gnu
+```
+
+It must leave `dist/opencraft-0.3.0-x86_64-unknown-linux-gnu/packs/default/pack.toml`
+in the staged tree, proving the shipped default pack travels with the archive.
+The registry must carry R001-R103, with R099-R103 owned by M019/S05 and the
+seven-row M019 criterion trace printed by both the checker and the selftest.
+
+**Recorded environment gaps for M019.** This Linux host cannot run the Windows
+installer smoke (`scripts/smoke_windows_installer.sh`), the Inno Setup compile,
+or the full three-asset `scripts/verify_release_artifacts.sh` leg, and no CI run
+was observed during the closeout. Those limbs are proven only by the
+tag-triggered `release.yml` workflow on `ubuntu-latest` and `windows-latest`;
+confirm that run (section 4) before publishing. They are gaps in the local
+record, not claims of observed success.
 
 ## 6. Tag
 

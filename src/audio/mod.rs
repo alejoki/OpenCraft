@@ -333,6 +333,45 @@ impl SoundBuffer {
     }
 }
 
+/// Encode a buffer as a canonical 44-byte-header PCM16 RIFF/WAVE file.
+///
+/// Format is linear PCM (format tag `1`), little-endian signed 16-bit frames
+/// interleaved in the buffer's channel order. Each f32 sample is clamped to
+/// `-1.0..=1.0` and quantized with `(sample * 32767.0).round() as i16`, so the
+/// maximum per-sample error is half a step (`1/65534`). The output is fully
+/// deterministic: the same buffer always yields the same bytes.
+///
+/// The header layout matches the decoder-facing writer proven in
+/// `src/pack/sound.rs` tests, keeping the shipped default pack byte-stable.
+#[allow(dead_code)] // Consumed by the S02 default-pack exporter.
+pub fn encode_pcm16_wav(buffer: &SoundBuffer) -> Vec<u8> {
+    let channels = buffer.channels;
+    let sample_rate = buffer.sample_rate;
+    let block_align = channels * 2;
+    let byte_rate = sample_rate * u32::from(block_align);
+    let data_len = (buffer.samples.len() * 2) as u32;
+
+    let mut out = Vec::with_capacity(44 + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for &sample in &buffer.samples {
+        let quantized = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+        out.extend_from_slice(&quantized.to_le_bytes());
+    }
+    out
+}
+
 /// The nine built-in fallback buffers, indexed by [`SoundSlot::index`].
 pub fn default_buffers() -> [SoundBuffer; SOUND_SLOT_COUNT] {
     [
@@ -528,6 +567,53 @@ mod tests {
                 assert_ne!(
                     buffers[i], buffers[j],
                     "slots {i} and {j} share the same default buffer"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn encode_pcm16_wav_round_trips_through_the_pack_decoder() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let originals = default_buffers();
+        for slot in SoundSlot::ALL {
+            let bytes = encode_pcm16_wav(&originals[slot.index()]);
+            assert_eq!(&bytes[0..4], b"RIFF", "{slot:?} must be a RIFF file");
+            assert_eq!(&bytes[8..12], b"WAVE", "{slot:?} must be a WAVE file");
+            let path = dir.path().join(format!("{}.wav", slot.name()));
+            std::fs::write(&path, &bytes).expect("write wav fixture");
+        }
+
+        let (decoded, warnings) = crate::pack::sound::load_sound_overrides(dir.path());
+        assert!(
+            warnings.is_empty(),
+            "encoder output must decode cleanly: {warnings:?}"
+        );
+
+        // PCM16 quantization error is at most half a step; allow one step of
+        // headroom for the decoder's i16 -> f32 conversion.
+        const TOLERANCE: f32 = 2.0 / 32768.0;
+        for slot in SoundSlot::ALL {
+            let original = &originals[slot.index()];
+            let round = &decoded[slot.index()];
+            assert_eq!(round.channels(), original.channels(), "{slot:?} channels");
+            assert_eq!(
+                round.sample_rate(),
+                original.sample_rate(),
+                "{slot:?} sample rate"
+            );
+            assert_eq!(
+                round.samples().len(),
+                original.samples().len(),
+                "{slot:?} sample count"
+            );
+            for (index, (expected, actual)) in
+                original.samples().iter().zip(round.samples()).enumerate()
+            {
+                let error = (expected - actual).abs();
+                assert!(
+                    error <= TOLERANCE,
+                    "{slot:?} sample {index}: {expected} -> {actual} (error {error})"
                 );
             }
         }

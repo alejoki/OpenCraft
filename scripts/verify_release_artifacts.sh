@@ -10,18 +10,20 @@
 #   opencraft-<version>-x86_64-pc-windows-msvc-setup.exe
 #
 # Linux: extract, require an executable `opencraft` plus `config/combat.toml`,
-# `worldgen/villages/plains.toml` and `LICENSE`, then run three headless
-# seams from the extracted directory with DISPLAY/WAYLAND_DISPLAY removed:
+# `worldgen/villages/plains.toml`, `LICENSE` and `packs/default/pack.toml`, then
+# run three headless seams from the extracted directory with
+# DISPLAY/WAYLAND_DISPLAY removed:
 #   --demo-ui        exit 0, exactly 3 lines, last ends ok=true
-#   --demo-village   exit 0, exactly 12 lines, last = village_demo: ok=true
+#   --demo-village   exit 0, exactly 13 lines, last = village_demo: ok=true
 #   --validate-pack  exit 0, exact 12-entry summary (fixture pack copied into
 #                    a scratch packs/ inside the temp extraction, never into
 #                    the archive)
-# Windows: a python3 zipfile reader requires `opencraft.exe`, the same config
-# and worldgen files, and `LICENSE` at the archive root, and rejects any
-# `packs/`, `saves/`, `settings.toml` entry or wrapper directory. The exe must
-# not import VCRUNTIME140.dll: D290 builds the release with a static CRT so a
-# clean Windows box needs no VC++ redistributable.
+# Windows: a python3 zipfile reader requires `opencraft.exe`, the same config,
+# worldgen and `LICENSE` files, and `packs/default/pack.toml` at the archive
+# root. It rejects `saves/` and `settings.toml`, rejects any file under `packs/`
+# that is not `packs/default/...` (so user packs never ship), and rejects any
+# wrapper directory. The exe must not import VCRUNTIME140.dll: D290 builds the
+# release with a static CRT so a clean Windows box needs no VC++ redistributable.
 # Installer: the setup exe must be a PE image whose version resource names
 # OpenCraft and <version> in UTF-16LE.
 #
@@ -87,7 +89,7 @@ trap cleanup EXIT
 tar -xzf "$LINUX" -C "$LINUX_DIR" || fail "cannot extract $LINUX"
 [[ -f "$LINUX_DIR/opencraft" ]] || fail "linux archive is missing opencraft"
 [[ -x "$LINUX_DIR/opencraft" ]] || fail "linux archive's opencraft is not executable"
-for required in config/combat.toml worldgen/villages/plains.toml LICENSE; do
+for required in config/combat.toml worldgen/villages/plains.toml packs/default/pack.toml LICENSE; do
     [[ -f "$LINUX_DIR/$required" ]] ||
         fail "linux archive is missing $required at the archive root"
 done
@@ -133,7 +135,7 @@ rc="$(run_headless demo-village --demo-village)"
     cat "$LINUX_DIR/demo-village.out" >&2
     fail "linux --demo-village exited $rc (expected 0)"
 }
-check_lines demo-village 12
+check_lines demo-village 13
 [[ "$(tail -n 1 "$LINUX_DIR/demo-village.out")" == "village_demo: ok=true" ]] || {
     cat "$LINUX_DIR/demo-village.out" >&2
     fail "linux --demo-village last line is not 'village_demo: ok=true'"
@@ -161,9 +163,10 @@ required = {
     "opencraft.exe",
     "config/combat.toml",
     "worldgen/villages/plains.toml",
+    "packs/default/pack.toml",
     "LICENSE",
 }
-allowed_top = {"opencraft.exe", "config", "worldgen", "LICENSE"}
+allowed_top = {"opencraft.exe", "config", "worldgen", "packs", "LICENSE"}
 
 try:
     with zipfile.ZipFile(path) as archive:
@@ -186,9 +189,18 @@ try:
             )
             sys.exit(1)
         for name in names:
-            if name.startswith("packs/") or name.startswith("saves/") or name == "settings.toml":
+            if name == "settings.toml" or name == "saves" or name.startswith("saves/"):
                 print(
                     f"verify_release: FAIL windows archive contains player state: {name}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if name == "packs" or (
+                name.startswith("packs/") and not name.startswith("packs/default/")
+            ):
+                print(
+                    "verify_release: FAIL windows archive contains a user pack "
+                    f"(only packs/default/* may ship): {name}",
                     file=sys.stderr,
                 )
                 sys.exit(1)

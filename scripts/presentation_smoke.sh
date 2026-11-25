@@ -4,7 +4,7 @@
 # Proves the M010/S04 presentation surface end to end through the production
 # binary, with no test harness and no screenshot automation:
 #
-#   Digest leg: `"$BIN" --demo-presentation --save fixture.mcvx` (with a v2
+#   Digest leg: `"$BIN" --demo-presentation --save fixture.mcvx` (with a v3
 #   pack whose stack is selected in settings.toml)
 #     (a) exit code 0 — the digest's own `ok` latch. A timeout kill or panic is
 #         an explicit FAILURE.
@@ -32,8 +32,10 @@
 #   panic) — the renderer opens the placeholder world with the reserved
 #   checker faces and the built-in defaults.
 #
-#   Throughout: every pack file and the settings file must stay byte-identical
-#   (the game is read-only on packs/ and settings.toml here).
+#   Throughout: every present pack file and the settings file must stay
+#   byte-identical. The shipped default is restored from embedded bytes, so a
+#   launch may only add absent `packs/default` files here; it never rewrites
+#   an existing pack byte or settings.toml.
 #
 # The pinned digest lines live in two places on purpose: here and in
 # `src/main.rs::presentation_demo_pins_the_authored_line_set`. Update both
@@ -117,16 +119,18 @@ fail() {
 # The contractual digest lines, in their required order. Keep byte-for-byte
 # identical to src/main.rs::presentation_demo_pins_the_authored_line_set.
 EXPECTED_LINES=(
-    "presentation_demo: leg=registry blocks=26 items=1 pack_layers=2 pack_icons=1"
+    "presentation_demo: leg=registry blocks=27 items=1 pack_layers=2 pack_icons=1"
     "presentation_demo: leg=block_array layers=256 builtin_match=true pack_match=true"
     "presentation_demo: leg=item_atlas layers=256 builtin_match=true pack_match=true"
-    "presentation_demo: leg=block name=mymod:ruby_ore id=25 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64"
-    "presentation_demo: leg=block name=mymod:ruby_block id=24 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64"
+    "presentation_demo: leg=block name=mymod:ruby_ore id=26 faces=49,49,49,49,49,49 hardness=3.000 drop=mymod:ruby stack=64"
+    "presentation_demo: leg=block name=mymod:ruby_block id=25 faces=48,48,48,48,48,48 hardness=4.000 drop=mymod:ruby_block stack=64"
     "presentation_demo: leg=item name=mymod:ruby id=0 icon=32 stack=64"
     "presentation_demo: leg=mesh blocks=2 quads=12 layers=48,49"
     "presentation_demo: leg=mine target=mymod:ruby_ore ticks=61 broken=true applied=true drop=mymod:ruby count=1 slot=0 limit=64"
     "presentation_demo: leg=save unresolved=0 ruby_ore=true ruby_block=true ruby_item=true"
-    "presentation_demo: leg=placeholder unresolved=3 face=26 icon=27 break=none mesh=26"
+    "presentation_demo: leg=placeholder unresolved=3 face=27 icon=27 break=none mesh=27"
+    "presentation_demo: leg=models wheat_cross=true leaves_cutout=true glass_blend=true sorted=true"
+    "presentation_demo: leg=model name=mymod:reed model=cross alpha=cutout"
     "presentation_demo: ok=true"
 )
 
@@ -150,7 +154,7 @@ LAUNCH_A_OUT="$TEMP_DIR/launch-a.log"
 LAUNCH_B_OUT="$TEMP_DIR/launch-b.log"
 
 cat >"$PACK_DIR/pack.toml" <<'EOF'
-format_version = 2
+format_version = 3
 name = "Ruby Mod"
 version = "1.0.0"
 
@@ -322,5 +326,5 @@ echo "PRESENTATION SMOKE PASS [profile=$PROFILE]: --demo-presentation printed al
 for line in "${EXPECTED_LINES[@]}"; do
     echo "PRESENTATION SMOKE EVIDENCE: $line"
 done
-echo "PRESENTATION SMOKE EVIDENCE: authored launch exit=124 placeholder launch exit=124 panic=none pack+settings byte-identical"
+echo "PRESENTATION SMOKE EVIDENCE: authored launch exit=124 placeholder launch exit=124 panic=none present pack+settings byte-identical (shipped-default restore only fills absent files)"
 exit 0
